@@ -1,4 +1,5 @@
 # with help from https://github.com/alpacahq/alpaca-trade-api-python
+# https://github.com/alpacahq
 
 import time
 import alpaca_trade_api as tradeapi
