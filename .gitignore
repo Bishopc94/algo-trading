@@ -1,5 +1,4 @@
 # Config
 __pycache__
 .vscode
-examply-scalping/
 src/config-actual.py
