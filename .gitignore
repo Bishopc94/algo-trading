@@ -19,3 +19,10 @@ logs/
 # IDE
 .vscode/
 .idea/
+
+
+# Claude
+.Claude
+
+# Testing Files
+*.csv
