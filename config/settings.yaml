@@ -1,0 +1,146 @@
+alpaca:
+  paper: true
+
+account:
+  starting_capital: 500.0
+  max_position_pct: 0.30
+  max_risk_per_trade_pct: 0.02
+  daily_loss_limit_pct: 0.05
+  max_open_positions: 4
+
+pdt:
+  max_day_trades: 3
+  day_trade_reserve: 1
+  min_conviction_for_day_trade: 0.80
+
+scanner:
+  min_price: 2.00
+  max_price: 50.00
+  min_avg_volume: 500000
+  min_relative_volume: 1.5
+  min_gap_pct: 2.0
+  max_candidates: 20
+
+strategies:
+  mean_reversion:
+    enabled: true
+    rsi_period: 14
+    rsi_oversold: 40
+    rsi_exit: 60
+    atr_stop_multiplier: 1.5
+    atr_tp_multiplier: 3.0
+    hold_type: swing
+    lookback_days: 30
+
+  momentum:
+    enabled: true
+    volume_spike_multiplier: 1.5
+    breakout_lookback: 20
+    atr_stop_multiplier: 1.5
+    atr_tp_multiplier: 3.0
+    hold_type: adaptive
+    min_adr_pct: 2.0
+
+  vwap:
+    enabled: true
+    hold_type: day
+    entry_deviation_pct: 0.5
+    exit_deviation_pct: 0.3
+
+  # ── Options Strategies ──────────────────────────────────
+  credit_put_spread:
+    enabled: true
+    target_delta: 0.30
+    min_dte: 20
+    max_dte: 45
+    max_spread_width: 2.50
+    min_credit_pct: 0.30          # Min credit as % of spread width
+
+  debit_call_spread:
+    enabled: true
+    long_delta: 0.60
+    short_delta: 0.35
+    min_dte: 30
+    max_dte: 60
+    max_debit_pct: 0.60           # Max debit as % of spread width
+
+  long_call:
+    enabled: true
+    target_delta: 0.60
+    min_dte: 20
+    max_dte: 60
+    max_contract_cost: 75.0       # Max $ per contract for $500 account
+    max_iv_percentile: 0.70       # Avoid overpaying for high-IV options
+
+  long_put:
+    enabled: true
+    target_delta: 0.55
+    min_dte: 20
+    max_dte: 60
+    max_contract_cost: 75.0       # Max $ per contract
+    breakdown_lookback: 20
+
+  cash_secured_put:
+    enabled: true
+    target_delta: 0.25
+    min_dte: 20
+    max_dte: 45
+    min_annualized_return: 0.15   # 15% annualized minimum
+    max_stock_price: 5.00         # 100 shares * $5 = $500 max
+
+  momentum_options:
+    enabled: true
+    min_dte: 2
+    max_dte: 20
+    min_delta: 0.15
+    max_delta: 0.45
+    max_contract_cost: 100.0       # Cheap OTM contracts
+    min_relative_volume: 1.5
+    breakout_lookback: 20
+    min_roi_pct: 0.25             # Minimum 25% ROI potential
+
+  covered_call:
+    enabled: true
+    target_delta: 0.30
+    min_dte: 20
+    max_dte: 45
+    min_annualized_return: 0.12   # 12% annualized minimum
+    max_stock_price: 5.00         # Must hold 100 shares
+
+  covered_straddle:
+    enabled: true
+    min_dte: 20
+    max_dte: 45
+    max_stock_price: 5.00         # Must hold 100 shares + secure put
+    min_total_credit_pct: 0.04    # Min total premium as % of stock price
+    max_bb_width: 0.10            # Only in low-volatility environments
+
+sentiment:
+  enabled: true
+  news_lookback_hours: 36         # How far back to scan news
+  news_max_articles: 10           # Max articles per symbol
+  min_conviction_after_mods: 0.35 # Reject trades below this after all modifiers
+  block_on_bearish_news: -0.5     # Block trades if news score below this
+
+options:
+  enabled: true
+  max_options_positions: 3        # Max concurrent options positions
+  max_options_capital_pct: 0.50   # Max 50% of portfolio in options
+  max_single_options_risk_pct: 0.12  # Max 12% of equity risk on any single options trade
+
+risk:
+  stop_loss_pct: 0.03
+  trailing_stop_pct: 0.04
+  take_profit_pct: 0.06
+  position_sizing: fractional
+  kelly_fraction: 0.25
+  max_portfolio_heat_pct: 0.06
+
+schedule:
+  premarket_scan: "09:00"
+  market_open: "09:30"
+  entry_window: "09:35"
+  midday_check: "12:00"
+  power_hour_scan: "15:00"
+  eod_close_day_trades: "15:50"
+  eod_review: "16:05"

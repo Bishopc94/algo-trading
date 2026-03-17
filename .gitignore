@@ -1,0 +1,21 @@
+# Secrets
+config/.env
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# Data
+data/
+logs/
+
+# IDE
+.vscode/
+.idea/
