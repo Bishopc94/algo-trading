@@ -81,6 +81,8 @@ class MomentumOptionsStrategy(BaseOptionsStrategy):
     in the system and should receive the smallest position allocation.
     """
 
+    bias = "adaptive"
+
     def evaluate(
         self,
         underlying: str,
@@ -200,11 +202,11 @@ class MomentumOptionsStrategy(BaseOptionsStrategy):
                 break
 
         if selected is None:
-            # Flexibility: if the cheapest option is up to 1.5x our budget,
-            # still consider it. This prevents missing good setups over a
-            # few dollars.
+            # Small tolerance: if the cheapest option is up to 10% over budget,
+            # still consider it. Prevents missing good setups over a few dollars
+            # without blowing the risk budget.
             cheapest = delta_ok[0]
-            if cheapest["_ask"] * 100 <= max_contract_cost * 1.5:
+            if cheapest["_ask"] * 100 <= max_contract_cost * 1.10:
                 selected = cheapest
             else:
                 return None
@@ -254,7 +256,7 @@ class MomentumOptionsStrategy(BaseOptionsStrategy):
         # ------------------------------------------------------------------
         # 6. Conviction scoring
         # ------------------------------------------------------------------
-        conviction: float = 0.5
+        conviction: float = 0.45
         # Higher volume = more conviction that the move is real.
         if rel_vol > 2.5:
             conviction += 0.15
@@ -262,13 +264,18 @@ class MomentumOptionsStrategy(BaseOptionsStrategy):
             conviction += 0.10
         # Higher potential ROI = more asymmetric payoff.
         if potential_roi > 2.0:
-            conviction += 0.15   # 200%+ ROI potential is very attractive
+            conviction += 0.15
         elif potential_roi > 1.0:
-            conviction += 0.10   # 100%+ ROI potential is good
+            conviction += 0.10
         # Higher delta (closer to ATM) = more responsive to stock movement.
         if delta > 0.35:
             conviction += 0.10
-        conviction = max(0.5, min(1.0, conviction))
+        # Theta decay penalty: very short DTE options lose value fast.
+        # With <7 DTE, the stock must move immediately or it's a loss.
+        dte = selected.get("_dte", 0)
+        if dte < 7:
+            conviction -= 0.10
+        conviction = max(0.40, min(0.85, conviction))
 
         # ------------------------------------------------------------------
         # 7. Build and return the trade signal

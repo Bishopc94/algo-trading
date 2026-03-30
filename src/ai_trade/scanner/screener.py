@@ -65,7 +65,7 @@ from alpaca.trading.enums import AssetClass, AssetStatus
 from alpaca.trading.requests import GetAssetsRequest
 
 from ai_trade.clients import get_data_client, get_trading_client
-from ai_trade.data.historical import fetch_bars, fetch_snapshots
+from ai_trade.data.historical import fetch_snapshots
 from ai_trade.data.indicators import compute_adr
 from ai_trade.monitoring.logger import get_logger
 
@@ -79,6 +79,36 @@ _SNAPSHOT_BATCH_SIZE = 500
 # Only include stocks from major US exchanges.  OTC, pink sheets,
 # and other venues are excluded due to poor liquidity and data quality.
 _VALID_EXCHANGES = {"NYSE", "NASDAQ", "AMEX"}
+
+# ── Scoring weight constants ──────────────────────────────
+# Momentum scan: emphasize gap size, then volume and range
+_MOMENTUM_GAP_WEIGHT = 0.4
+_MOMENTUM_RVOL_WEIGHT = 0.3
+_MOMENTUM_ADR_WEIGHT = 0.3
+_MOMENTUM_ADR_PLACEHOLDER = 10.0
+
+# Options scan: favor liquidity, moderate gap, affordability
+_OPTIONS_VOL_WEIGHT = 0.5
+_OPTIONS_GAP_WEIGHT = 0.3
+_OPTIONS_AFFORD_WEIGHT = 0.2
+_OPTIONS_VOL_CAP = 5.0          # Cap volume score to avoid mega-cap domination
+_OPTIONS_AFFORD_MIDPOINT = 200   # Stocks below this price score higher on affordability
+
+# Mean reversion scan: deeper pullback + higher volume
+_MR_PULLBACK_WEIGHT = 0.6
+_MR_VOL_WEIGHT = 0.4
+_MR_PULLBACK_CAP = 10.0         # Cap pullback score at 10%
+_MR_VOL_NORM = 5_000_000        # Volume normalization divisor
+_MR_VOL_CAP = 3.0
+_MR_MAX_CANDIDATES = 15
+
+# VWAP scan: volume, gap catalyst, relative volume
+_VWAP_VOL_WEIGHT = 0.4
+_VWAP_GAP_WEIGHT = 0.3
+_VWAP_RVOL_WEIGHT = 0.3
+_VWAP_VOL_NORM = 10_000_000
+_VWAP_SCORE_CAP = 3.0
+_VWAP_MAX_CANDIDATES = 10
 
 
 class StockScreener:
@@ -97,6 +127,19 @@ class StockScreener:
         # Cached symbol universe.  Set to None initially; populated on
         # first call to _load_universe() and reused thereafter.
         self._universe: list[str] | None = None
+        # Snapshot cache — shared between scan() and secondary scans
+        # to avoid redundant API calls.  Reset each scan cycle.
+        self._all_snapshots: dict = {}
+        # Track which symbols have options chains (True/False/unknown).
+        # Persists across scans to avoid re-querying known-empty symbols.
+        self._options_chain_cache: dict[str, bool] = {}
+
+    def invalidate_snapshot_cache(self) -> None:
+        """Clear cached snapshots so the next scan fetches fresh data.
+
+        Call this before power hour or any re-scan that needs current prices.
+        """
+        self._all_snapshots = {}
 
     # ── Universe loading ─────────────────────────────────────
 
@@ -105,12 +148,7 @@ class StockScreener:
 
         This call typically returns ~8,000 symbols.  The result is cached
         in self._universe so subsequent scans don't repeat this API call.
-
-        Filtering criteria:
-        - asset_class = US_EQUITY (no crypto, no options)
-        - status = ACTIVE (no delisted or halted securities)
-        - tradable = True (the account can actually trade this asset)
-        - exchange in {NYSE, NASDAQ, AMEX} (major US exchanges only)
+        Retries up to 3 times on transient failures (network, rate limits).
 
         Returns:
             List of ticker symbol strings (e.g. ["AAPL", "MSFT", ...]).
@@ -118,30 +156,68 @@ class StockScreener:
         if self._universe is not None:
             return self._universe
 
-        try:
-            request = GetAssetsRequest(
-                asset_class=AssetClass.US_EQUITY,
-                status=AssetStatus.ACTIVE,
-            )
-            assets = get_trading_client().get_all_assets(filter=request)
+        import time as _time
+        for attempt in range(1, 4):
+            try:
+                request = GetAssetsRequest(
+                    asset_class=AssetClass.US_EQUITY,
+                    status=AssetStatus.ACTIVE,
+                )
+                assets = get_trading_client().get_all_assets(filter=request)
 
-            # PYTHON PATTERN — list comprehension with multiple conditions:
-            # Creates a list of symbols from the assets that are both
-            # tradable AND on a valid exchange.  This is more concise than
-            # a for-loop with if-statements.
-            symbols = [
-                asset.symbol
-                for asset in assets
-                if asset.tradable and asset.exchange in _VALID_EXCHANGES
-            ]
+                symbols = [
+                    asset.symbol
+                    for asset in assets
+                    if asset.tradable and asset.exchange in _VALID_EXCHANGES
+                ]
 
-            self._universe = symbols
-            log.info("universe_loaded", count=len(symbols))
-            return symbols
+                if not symbols:
+                    log.warning("universe_loaded_but_empty",
+                                hint="Alpaca returned 0 tradeable symbols — API issue?")
+                    return []
 
-        except Exception:
-            log.exception("universe_load_failed")
-            return []
+                self._universe = symbols
+                log.info("universe_loaded", count=len(symbols))
+                return symbols
+
+            except Exception as e:
+                if attempt < 3:
+                    wait = 2 ** attempt
+                    log.warning("universe_load_retry", attempt=attempt, wait=wait, error=str(e))
+                    _time.sleep(wait)
+                else:
+                    log.exception("universe_load_failed_after_retries")
+                    return []
+
+        return []  # Unreachable, but satisfies type checker
+
+    # ── Snapshot fetching ─────────────────────────────────────
+
+    def _ensure_snapshots(self) -> dict:
+        """Fetch and cache snapshots if not already available.
+
+        Reuses cached snapshots from a prior scan() call when available.
+        If the cache is empty, fetches fresh snapshots for the full universe.
+
+        Returns:
+            The snapshot dict (also stored in self._all_snapshots).
+        """
+        if self._all_snapshots:
+            return self._all_snapshots
+
+        universe = self._load_universe()
+        if not universe:
+            return {}
+
+        for i in range(0, len(universe), _SNAPSHOT_BATCH_SIZE):
+            batch = universe[i : i + _SNAPSHOT_BATCH_SIZE]
+            try:
+                snapshots = fetch_snapshots(batch)
+                self._all_snapshots.update(snapshots)
+            except Exception:
+                log.exception("snapshot_batch_failed", batch_start=i, batch_size=len(batch))
+
+        return self._all_snapshots
 
     # ── Main scan ────────────────────────────────────────────
 
@@ -170,20 +246,12 @@ class StockScreener:
         min_rvol: float = getattr(self._cfg, "min_relative_volume", 1.5)
         max_candidates: int = getattr(self._cfg, "max_candidates", 20)
 
-        # ── Fetch snapshots in batches ───────────────────────
-        # A "snapshot" is a single point-in-time view of a stock's current
-        # price, volume, and previous day's data.  We fetch these in
-        # batches because Alpaca limits how many symbols can be queried
-        # in a single API call.
+        # Fetch snapshots in batches (also populates the cache for secondary scans)
         all_snapshots: dict = {}
         for i in range(0, len(universe), _SNAPSHOT_BATCH_SIZE):
-            # PYTHON PATTERN — list slicing:
-            # `universe[i : i + 500]` extracts a sub-list of up to 500
-            # elements starting at index i.  This is how we batch the API calls.
             batch = universe[i : i + _SNAPSHOT_BATCH_SIZE]
             try:
                 snapshots = fetch_snapshots(batch)
-                # .update() merges the batch results into the master dict.
                 all_snapshots.update(snapshots)
             except Exception:
                 log.exception(
@@ -194,9 +262,10 @@ class StockScreener:
 
         log.info("snapshots_fetched", total=len(all_snapshots))
 
-        # ── Score each symbol ────────────────────────────────
-        # Track filter funnel counts for diagnostics — helps answer
-        # "why did we only get 5 candidates today?" questions.
+        # Cache snapshots so secondary scans can reuse them
+        self._all_snapshots = all_snapshots
+
+        # Track filter funnel counts for diagnostics
         candidates: list[dict] = []
         filter_counts = {
             "no_snapshot_data": 0,
@@ -209,7 +278,6 @@ class StockScreener:
 
         for symbol, snap in all_snapshots.items():
             try:
-                # Extract price/volume data from the snapshot object.
                 candidate = self._evaluate_snapshot(symbol, snap)
                 if candidate is None:
                     filter_counts["no_snapshot_data"] += 1
@@ -219,33 +287,21 @@ class StockScreener:
                 gap_pct = candidate["gap_pct"]
                 rvol = candidate["relative_volume"]
 
-                # ── Apply filter cascade ─────────────────────
-                # Each filter removes stocks that don't meet our criteria.
-                # The order matters for performance (cheapest checks first).
-
-                # Price filter: avoid penny stocks (< $2) and expensive
-                # stocks (> $50) that require too much capital per share.
                 if not (min_price <= price <= max_price):
                     filter_counts["price_out_of_range"] += 1
                     continue
 
-                # Gap filter: ignore stocks that didn't move overnight.
-                # abs() handles both gap-up and gap-down.
                 if abs(gap_pct) < min_gap_pct:
                     filter_counts["gap_too_small"] += 1
                     continue
 
-                # Relative volume filter: ignore low-activity stocks.
                 if rvol < min_rvol:
                     filter_counts["rvol_too_low"] += 1
                     continue
 
-                # ── Composite score ──────────────────────────
-                # Weighted sum of the three components.  The weights
-                # (0.4, 0.3, 0.3) emphasize gap size slightly more than
-                # volume and range.  The ADR component uses a placeholder
-                # value of 10.0 for now.
-                score = abs(gap_pct) * 0.4 + rvol * 0.3 + 10.0 * 0.3
+                score = (abs(gap_pct) * _MOMENTUM_GAP_WEIGHT
+                         + rvol * _MOMENTUM_RVOL_WEIGHT
+                         + _MOMENTUM_ADR_PLACEHOLDER * _MOMENTUM_ADR_WEIGHT)
                 candidate["score"] = round(score, 4)
                 candidates.append(candidate)
                 filter_counts["passed"] += 1
@@ -254,11 +310,6 @@ class StockScreener:
                 filter_counts["eval_error"] += 1
                 log.debug("symbol_evaluation_failed", symbol=symbol)
 
-        # Sort by score descending (highest score = best candidate)
-        # and take the top N results.
-        # PYTHON PATTERN — key=lambda:
-        # `lambda c: c["score"]` is an anonymous function that extracts
-        # the "score" value from a dict.  It tells sorted() what to sort by.
         candidates.sort(key=lambda c: c["score"], reverse=True)
         results = candidates[:max_candidates]
 
@@ -268,6 +319,190 @@ class StockScreener:
             passed_filters=len(candidates),
             returned=len(results),
             **filter_counts,
+        )
+        return results
+
+    # ── Options universe scan ──────────────────────────────
+
+    def scan_options_universe(self) -> list[dict]:
+        """Scan for liquid, optionable stocks — separate from the micro-cap momentum scan.
+
+        Options require underlying stocks that are:
+        - Priced $10-500 (liquid enough to have listed options)
+        - High average volume (>1M, ensures option chains exist and have liquidity)
+
+        Unlike the momentum scanner, this does NOT require gaps or unusual volume.
+        Options strategies have their own entry criteria.
+
+        Reuses snapshot data from scan() if available, otherwise fetches fresh.
+        """
+        self._ensure_snapshots()
+        if not self._all_snapshots:
+            return []
+
+        # Read options-specific filter params from config
+        opts_cfg = getattr(self._cfg, "options_universe", None)
+        min_price: float = getattr(opts_cfg, "min_price", 10.0) if opts_cfg else 10.0
+        max_price: float = getattr(opts_cfg, "max_price", 500.0) if opts_cfg else 500.0
+        min_avg_volume: float = getattr(opts_cfg, "min_avg_volume", 1_000_000) if opts_cfg else 1_000_000
+        max_candidates: int = getattr(opts_cfg, "max_candidates", 30) if opts_cfg else 30
+
+        candidates: list[dict] = []
+        for symbol, snap in self._all_snapshots.items():
+            if self._options_chain_cache.get(symbol) is False:
+                continue
+
+            try:
+                candidate = self._evaluate_snapshot(symbol, snap)
+                if candidate is None:
+                    continue
+
+                price = candidate["price"]
+                if not (min_price <= price <= max_price):
+                    continue
+
+                avg_vol = _get_avg_volume(snap)
+                if avg_vol < min_avg_volume:
+                    continue
+
+                gap_score = abs(candidate["gap_pct"])
+                vol_score = min(avg_vol / _VWAP_VOL_NORM, _OPTIONS_VOL_CAP)
+                afford_score = max(0, (_OPTIONS_AFFORD_MIDPOINT - price) / _OPTIONS_AFFORD_MIDPOINT)
+                score = (vol_score * _OPTIONS_VOL_WEIGHT
+                         + gap_score * _OPTIONS_GAP_WEIGHT
+                         + afford_score * _OPTIONS_AFFORD_WEIGHT)
+                candidate["score"] = round(score, 4)
+                candidate["avg_volume"] = avg_vol
+                candidates.append(candidate)
+
+            except Exception:
+                log.debug("options_universe_eval_failed", symbol=symbol)
+
+        candidates.sort(key=lambda c: c["score"], reverse=True)
+        results = candidates[:max_candidates]
+
+        log.info(
+            "scan_options_universe_complete",
+            evaluated=len(self._all_snapshots),
+            passed_filters=len(candidates),
+            returned=len(results),
+            symbols=[c["symbol"] for c in results[:10]],
+        )
+        return results
+
+    # ── Mean reversion scan ─────────────────────────────────
+
+    def scan_mean_reversion(self) -> list[dict]:
+        """Scan for oversold pullback candidates suitable for mean reversion.
+
+        Mean reversion needs the OPPOSITE of momentum: stocks that have
+        pulled back (gapped down or dropped) but still have decent volume.
+        These are dip-buying opportunities in otherwise healthy stocks.
+
+        Criteria:
+        - Price $5-200 (tradeable range, slightly broader than momentum)
+        - Gap DOWN at least -1% (selling pressure / pullback)
+        - Average volume > 300K (enough liquidity to trade)
+        """
+        self._ensure_snapshots()
+        if not self._all_snapshots:
+            return []
+
+        candidates: list[dict] = []
+        for symbol, snap in self._all_snapshots.items():
+            try:
+                candidate = self._evaluate_snapshot(symbol, snap)
+                if candidate is None:
+                    continue
+
+                price = candidate["price"]
+                gap_pct = candidate["gap_pct"]
+
+                if not (5.0 <= price <= 200.0):
+                    continue
+
+                avg_vol = _get_avg_volume(snap)
+                if avg_vol < 300_000:
+                    continue
+
+                if gap_pct > -1.0:
+                    continue
+
+                pullback_score = min(abs(gap_pct), _MR_PULLBACK_CAP)
+                vol_score = min(avg_vol / _MR_VOL_NORM, _MR_VOL_CAP)
+                score = pullback_score * _MR_PULLBACK_WEIGHT + vol_score * _MR_VOL_WEIGHT
+                candidate["score"] = round(score, 4)
+                candidate["scan_type"] = "mean_reversion"
+                candidates.append(candidate)
+
+            except Exception:
+                log.debug("mean_reversion_eval_failed", symbol=symbol)
+
+        candidates.sort(key=lambda c: c["score"], reverse=True)
+        results = candidates[:_MR_MAX_CANDIDATES]
+
+        log.info(
+            "scan_mean_reversion_complete",
+            passed_filters=len(candidates),
+            returned=len(results),
+            symbols=[c["symbol"] for c in results[:10]],
+        )
+        return results
+
+    # ── VWAP / liquid intraday scan ───────────────────────────
+
+    def scan_vwap_universe(self) -> list[dict]:
+        """Scan for liquid stocks suitable for VWAP intraday trading.
+
+        VWAP needs stocks with reliable minute-bar data, which means
+        liquid mid/large-caps with consistent intraday volume.
+
+        Criteria:
+        - Price $10-300 (liquid enough for reliable VWAP)
+        - Average volume > 1M (ensures minute bars are populated)
+        - Any gap direction (VWAP works on both gap-up and gap-down stocks)
+        """
+        self._ensure_snapshots()
+        if not self._all_snapshots:
+            return []
+
+        candidates: list[dict] = []
+        for symbol, snap in self._all_snapshots.items():
+            try:
+                candidate = self._evaluate_snapshot(symbol, snap)
+                if candidate is None:
+                    continue
+
+                price = candidate["price"]
+                if not (10.0 <= price <= 300.0):
+                    continue
+
+                avg_vol = _get_avg_volume(snap)
+                if avg_vol < 1_000_000:
+                    continue
+
+                vol_score = min(avg_vol / _VWAP_VOL_NORM, _VWAP_SCORE_CAP)
+                gap_score = abs(candidate["gap_pct"])
+                rvol = candidate["relative_volume"]
+                rvol_score = min(rvol, _VWAP_SCORE_CAP)
+                score = (vol_score * _VWAP_VOL_WEIGHT
+                         + gap_score * _VWAP_GAP_WEIGHT
+                         + rvol_score * _VWAP_RVOL_WEIGHT)
+                candidate["score"] = round(score, 4)
+                candidate["scan_type"] = "vwap"
+                candidates.append(candidate)
+
+            except Exception:
+                log.debug("vwap_eval_failed", symbol=symbol)
+
+        candidates.sort(key=lambda c: c["score"], reverse=True)
+        results = candidates[:_VWAP_MAX_CANDIDATES]
+
+        log.info(
+            "scan_vwap_universe_complete",
+            passed_filters=len(candidates),
+            returned=len(results),
+            symbols=[c["symbol"] for c in results[:10]],
         )
         return results
 
@@ -286,15 +521,6 @@ class StockScreener:
         We prefer latest_trade for the current price (most accurate),
         falling back to daily_bar close if latest_trade isn't available.
 
-        PYTHON PATTERN — @staticmethod:
-            Like in PDTManager, this is a plain function that doesn't need
-            `self`.  It's placed inside the class for organizational clarity.
-
-        PYTHON PATTERN — hasattr():
-            `hasattr(obj, "attr")` checks if an object has a particular
-            attribute.  We use this because the snapshot object's structure
-            varies depending on market state and data availability.
-
         Args:
             symbol: The ticker symbol.
             snap:   Alpaca snapshot object.
@@ -302,8 +528,7 @@ class StockScreener:
         Returns:
             A candidate dict or None if required data is missing.
         """
-        # ── Get current price ────────────────────────────────
-        # Prefer latest_trade (real-time) over daily_bar close (lagged).
+        # Get current price — prefer latest_trade (real-time) over daily_bar close
         price: float | None = None
         if hasattr(snap, "latest_trade") and snap.latest_trade is not None:
             price = float(snap.latest_trade.price)
@@ -313,35 +538,24 @@ class StockScreener:
         if price is None or price <= 0:
             return None
 
-        # ── Get previous close ───────────────────────────────
-        # Required to calculate the gap percentage.
+        # Get previous close — required for gap calculation
         if not hasattr(snap, "previous_daily_bar") or snap.previous_daily_bar is None:
             return None
         prev_close = float(snap.previous_daily_bar.close)
         if prev_close <= 0:
             return None
 
-        # Gap %: how much the stock moved from yesterday's close to now.
-        # Positive = gap up, negative = gap down.
         gap_pct = (price - prev_close) / prev_close * 100.0
 
-        # ── Get current volume ───────────────────────────────
-        # Volume so far today.  Pre-market may only have minute-bar data.
+        # Get current volume — pre-market may only have minute-bar data
         volume: float = 0.0
         if hasattr(snap, "daily_bar") and snap.daily_bar is not None:
             volume = float(snap.daily_bar.volume)
         elif hasattr(snap, "minute_bar") and snap.minute_bar is not None:
             volume = float(snap.minute_bar.volume)
 
-        # ── Calculate relative volume ────────────────────────
-        # RVOL = today's volume / yesterday's volume.
-        # This is an approximation — ideally we'd use a multi-day average,
-        # but the previous daily bar's volume is a reasonable proxy.
-        avg_volume: float = 0.0
-        if hasattr(snap.previous_daily_bar, "volume"):
-            avg_volume = float(snap.previous_daily_bar.volume)
-
-        # Avoid division by zero.
+        # RVOL = today's volume / yesterday's volume
+        avg_volume = _get_avg_volume(snap)
         relative_volume = (volume / avg_volume) if avg_volume > 0 else 0.0
 
         return {
@@ -351,3 +565,16 @@ class StockScreener:
             "gap_pct": round(gap_pct, 2),
             "relative_volume": round(relative_volume, 2),
         }
+
+
+def _get_avg_volume(snap) -> float:
+    """Extract average volume from a snapshot's previous daily bar.
+
+    Used across all scan profiles to filter by liquidity.
+    Returns 0.0 if the data is unavailable.
+    """
+    if (hasattr(snap, "previous_daily_bar")
+            and snap.previous_daily_bar is not None
+            and hasattr(snap.previous_daily_bar, "volume")):
+        return float(snap.previous_daily_bar.volume)
+    return 0.0

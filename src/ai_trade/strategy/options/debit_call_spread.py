@@ -64,6 +64,8 @@ class DebitCallSpreadStrategy(BaseOptionsStrategy):
     overbought), and relative volume above 1.2x normal.
     """
 
+    bias = "bullish"
+
     # ------------------------------------------------------------------
     # evaluate
     # ------------------------------------------------------------------

@@ -80,16 +80,19 @@ class VWAPStrategy(BaseStrategy):
         dip_pct = (dip_low_price - dip_vwap) / dip_vwap if dip_vwap else 0
         reclaim_pct = (close - vwap) / vwap if vwap else 0
 
-        # Base conviction 0.7 — VWAP reclaims have a reasonable edge
-        base_conviction = 0.7
-        # Bonus for deeper dips (more potential upside)
-        dip_adj = min(0.15, abs(dip_pct) * 10)
-        # Bonus for stronger volume on the reclaim bar
+        # Base conviction 0.55 — VWAP reclaims are decent setups but need
+        # volume + dip depth to confirm.  Shallow dips on low volume stay low.
+        base_conviction = 0.55
+        # Bonus for deeper dips (more potential upside).
+        # Require at least 0.5% dip below VWAP to count as real, not noise.
+        dip_adj = min(0.20, abs(dip_pct) * 15) if abs(dip_pct) >= 0.005 else 0.0
+        # Bonus for stronger volume on the reclaim bar — scaled faster so
+        # 3x volume (instead of 4.5x) hits the cap.
         vol_ratio = bar_volume / avg_bar_vol if avg_bar_vol > 0 else 1.0
-        vol_adj = min(0.15, (vol_ratio - 1.5) * 0.05)
+        vol_adj = min(0.15, (vol_ratio - 1.5) * 0.10)
 
         conviction = base_conviction + dip_adj + vol_adj
-        conviction = max(0.5, min(1.0, conviction))
+        conviction = max(0.45, min(0.90, conviction))
 
         entry_price = close
 

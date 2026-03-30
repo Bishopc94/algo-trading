@@ -73,6 +73,8 @@ class LongCallStrategy(BaseOptionsStrategy):
     stringent filters keep the strategy from firing too frequently.
     """
 
+    bias = "bullish"
+
     # ------------------------------------------------------------------
     # evaluate
     # ------------------------------------------------------------------

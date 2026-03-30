@@ -69,8 +69,13 @@ from ai_trade.config import load_config          # Loads settings.yaml into a ty
 from ai_trade.clients import init_clients         # Initializes API clients (Alpaca, etc.)
 from ai_trade.data.historical import fetch_bars_multi  # Fetches OHLCV bars for multiple symbols
 from ai_trade.monitoring.logger import setup_logging, get_logger
+from ai_trade.strategy.bb_squeeze import BBSqueezeStrategy
+from ai_trade.strategy.ema_crossover import EMACrossoverStrategy
+from ai_trade.strategy.macd_divergence import MACDDivergenceStrategy
 from ai_trade.strategy.mean_reversion import MeanReversionStrategy
 from ai_trade.strategy.momentum import MomentumStrategy
+from ai_trade.strategy.orb import ORBStrategy
+from ai_trade.strategy.pullback import PullbackStrategy
 from ai_trade.strategy.vwap import VWAPStrategy
 
 log = get_logger(__name__)  # __name__ is a Python builtin: the current module's import path
@@ -234,6 +239,16 @@ def run_backtest(
         strategies.append(MomentumStrategy(strat_cfg.momentum))
     if strat_cfg.vwap.enabled:
         strategies.append(VWAPStrategy(strat_cfg.vwap))
+    if getattr(strat_cfg, "ema_crossover", None) and strat_cfg.ema_crossover.enabled:
+        strategies.append(EMACrossoverStrategy(strat_cfg.ema_crossover))
+    if getattr(strat_cfg, "macd_divergence", None) and strat_cfg.macd_divergence.enabled:
+        strategies.append(MACDDivergenceStrategy(strat_cfg.macd_divergence))
+    if getattr(strat_cfg, "bb_squeeze", None) and strat_cfg.bb_squeeze.enabled:
+        strategies.append(BBSqueezeStrategy(strat_cfg.bb_squeeze))
+    if getattr(strat_cfg, "orb", None) and strat_cfg.orb.enabled:
+        strategies.append(ORBStrategy(strat_cfg.orb))
+    if getattr(strat_cfg, "pullback", None) and strat_cfg.pullback.enabled:
+        strategies.append(PullbackStrategy(strat_cfg.pullback))
 
     if not strategies:
         print("  No stock strategies enabled in config.")
@@ -276,8 +291,11 @@ def run_backtest(
         opts_cfg = getattr(cfg, "options", None)
         if opts_cfg:
             bt_config.max_options_positions = getattr(opts_cfg, "max_options_positions", 3)
-            bt_config.max_options_capital_pct = getattr(opts_cfg, "max_options_capital_pct", 0.40)
-            bt_config.max_single_options_risk_pct = getattr(opts_cfg, "max_single_options_risk_pct", 0.08)
+            bt_config.max_options_capital_pct = getattr(opts_cfg, "max_options_capital_pct", 0.50)
+            bt_config.max_single_options_risk_pct = getattr(opts_cfg, "max_single_options_risk_pct", 0.12)
+            bt_config.options_profit_target_pct = getattr(opts_cfg, "options_profit_target_pct", 0.50)
+            bt_config.options_loss_limit_pct = getattr(opts_cfg, "options_loss_limit_pct", 2.0)
+            bt_config.options_slippage_pct = getattr(opts_cfg, "options_slippage_pct", 0.003)
 
     # ---------- Fetch market regime data (SPY, QQQ) ----------
     # Market regime analysis uses broad market index data to determine

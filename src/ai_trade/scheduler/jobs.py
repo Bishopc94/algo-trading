@@ -79,6 +79,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING
 from zoneinfo import ZoneInfo
 
+from apscheduler.events import EVENT_JOB_ERROR, EVENT_JOB_MISSED
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 
@@ -117,7 +118,30 @@ def create_scheduler(bot: TradingBot) -> BackgroundScheduler:
     """
     # Create the scheduler with Eastern Time as the default timezone.
     # All CronTrigger times will be interpreted in ET.
-    scheduler = BackgroundScheduler(timezone=ET)
+    # misfire_grace_time=300 means a job can fire up to 5 minutes late
+    # (e.g. if the system clock drifts or a previous job runs long)
+    # rather than being silently skipped.
+    scheduler = BackgroundScheduler(
+        timezone=ET,
+        job_defaults={"misfire_grace_time": 300, "coalesce": True},
+    )
+
+    # Error listener — logs job failures without crashing the scheduler.
+    # Without this, an unhandled exception in a job would be silently
+    # swallowed by APScheduler's default handler.
+    def _job_error_listener(event):
+        if event.exception:
+            log.error(
+                "scheduled_job_failed",
+                job_id=event.job_id,
+                error=str(event.exception),
+                error_type=type(event.exception).__name__,
+            )
+            print(f"  [Scheduler] Job '{event.job_id}' FAILED: {event.exception}")
+        else:
+            log.warning("scheduled_job_missed", job_id=event.job_id)
+
+    scheduler.add_listener(_job_error_listener, EVENT_JOB_ERROR | EVENT_JOB_MISSED)
 
     # Read schedule times from the bot's configuration.
     cfg = bot.cfg.schedule
@@ -176,7 +200,30 @@ def create_scheduler(bot: TradingBot) -> BackgroundScheduler:
         name="Strategy evaluation & trade entry",
     )
 
-    # ── Job 4: Midday check ──────────────────────────────────
+    # ── Job 4: Mid-morning options ────────────────────────────
+    # Dedicated options pass after opening volatility settles (~10:15 AM).
+    # IV is typically inflated at open and normalizes by this time,
+    # giving better premium pricing for options entries.
+    h, m = _parse_time(cfg.mid_morning_options)
+    scheduler.add_job(
+        bot.job_mid_morning_options,
+        CronTrigger(hour=h, minute=m, day_of_week="mon-fri", timezone=ET),
+        id="mid_morning_options",
+        name="Mid-morning options evaluation",
+    )
+
+    # ── Job 5: Late morning ────────────────────────────────────
+    # Second evaluation pass.  Mean reversion dips and VWAP reclaims
+    # often take 1-2 hours to form after market open.
+    h, m = _parse_time(cfg.late_morning)
+    scheduler.add_job(
+        bot.job_late_morning,
+        CronTrigger(hour=h, minute=m, day_of_week="mon-fri", timezone=ET),
+        id="late_morning",
+        name="Late morning evaluation",
+    )
+
+    # ── Job 6: Midday check ──────────────────────────────────
     # Reviews open positions around noon.  May tighten stops, take
     # partial profits, or close underperforming trades.
     h, m = _parse_time(cfg.midday_check)
@@ -201,7 +248,19 @@ def create_scheduler(bot: TradingBot) -> BackgroundScheduler:
         name="Power hour scan",
     )
 
-    # ── Job 6: End-of-day — close day trades ─────────────────
+    # ── Job 9: Options expiry management ──────────────────────
+    # Closes options positions expiring today or tomorrow.  Avoids
+    # assignment risk on short options and gamma/liquidity risk on
+    # all options near expiration.
+    h, m = _parse_time(cfg.options_expiry_check)
+    scheduler.add_job(
+        bot.job_options_expiry_check,
+        CronTrigger(hour=h, minute=m, day_of_week="mon-fri", timezone=ET),
+        id="options_expiry_check",
+        name="Close expiring options",
+    )
+
+    # ── Job 10: End-of-day — close day trades ─────────────────
     # Closes all positions marked as "day" hold_type.  Runs 15 minutes
     # before market close (typically 3:45 PM ET) to ensure fills before
     # the 4:00 PM closing bell.  See execution/order_manager.py for the
@@ -239,6 +298,19 @@ def create_scheduler(bot: TradingBot) -> BackgroundScheduler:
         ),
         id="position_sync",
         name="Sync positions with Alpaca",
+    )
+
+    # ── Job 13: Options position sync (every 5 min during market hours) ──
+    # Reconciles options positions with Alpaca's broker-side state.
+    # Less frequent than stock sync (every minute) since options fills
+    # are rarer but still need timely detection.
+    scheduler.add_job(
+        bot.job_options_position_sync,
+        CronTrigger(
+            hour="9-15", minute="*/5", day_of_week="mon-fri", timezone=ET,
+        ),
+        id="options_position_sync",
+        name="Sync options positions with Alpaca",
     )
 
     log.info("scheduler_configured", job_count=len(scheduler.get_jobs()))

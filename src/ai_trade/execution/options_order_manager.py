@@ -204,14 +204,21 @@ class OptionsOrderManager:
 
             return str(order.id)
 
-        except Exception:
-            log.exception(
-                "spread_order_failed",
-                # getattr with default handles the case where signal might
-                # not have a .symbol attribute (defensive coding).
-                symbol=getattr(signal, "symbol", "unknown"),
-                qty=qty,
-            )
+        except Exception as e:
+            error_msg = str(e).lower()
+            symbol = getattr(signal, "symbol", "unknown")
+            if "insufficient" in error_msg or "buying power" in error_msg:
+                log.error("spread_order_insufficient_funds", symbol=symbol, qty=qty, error=str(e))
+                print(f"    OPTIONS BLOCKED: {symbol} — Insufficient buying power for spread.")
+            elif "forbidden" in error_msg or "403" in error_msg:
+                log.error("spread_order_forbidden", symbol=symbol, error=str(e))
+                print(f"    OPTIONS BLOCKED: {symbol} — Account restriction (403).")
+            elif "not found" in error_msg or "invalid" in error_msg:
+                log.error("spread_order_invalid_contract", symbol=symbol, error=str(e))
+                print(f"    OPTIONS FAILED: {symbol} — Invalid contract or symbol not found.")
+            else:
+                log.exception("spread_order_failed", symbol=symbol, qty=qty)
+                print(f"    OPTIONS FAILED: {symbol} — {str(e)[:100]}")
             return None
 
     def submit_single_leg_order(self, signal, qty: int = 1) -> str | None:
@@ -277,12 +284,18 @@ class OptionsOrderManager:
 
             return str(order.id)
 
-        except Exception:
-            log.exception(
-                "single_leg_order_failed",
-                symbol=getattr(signal, "symbol", "unknown"),
-                qty=qty,
-            )
+        except Exception as e:
+            error_msg = str(e).lower()
+            symbol = getattr(signal, "symbol", "unknown")
+            if "insufficient" in error_msg or "buying power" in error_msg:
+                log.error("single_leg_insufficient_funds", symbol=symbol, qty=qty, error=str(e))
+                print(f"    OPTIONS BLOCKED: {symbol} — Insufficient buying power.")
+            elif "forbidden" in error_msg or "403" in error_msg:
+                log.error("single_leg_forbidden", symbol=symbol, error=str(e))
+                print(f"    OPTIONS BLOCKED: {symbol} — Account restriction (403).")
+            else:
+                log.exception("single_leg_order_failed", symbol=symbol, qty=qty)
+                print(f"    OPTIONS FAILED: {symbol} — {str(e)[:100]}")
             return None
 
     def submit_options_order(self, signal, qty: int = 1) -> str | None:
@@ -292,6 +305,9 @@ class OptionsOrderManager:
         inspects signal.legs and delegates to either submit_spread_order
         (for multi-leg) or submit_single_leg_order (for single-leg).
         """
+        if not signal or not getattr(signal, "legs", None):
+            log.error("options_order_no_legs", symbol=getattr(signal, "symbol", "unknown"))
+            return None
         if len(signal.legs) > 1:
             return self.submit_spread_order(signal, qty=qty)
         return self.submit_single_leg_order(signal, qty=qty)

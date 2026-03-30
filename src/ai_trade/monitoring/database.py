@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import re
 import sqlite3
+import time
 
 # PYTHON PATTERN — @contextmanager:
 # The `contextmanager` decorator lets you write a generator function that
@@ -52,6 +53,15 @@ import sqlite3
 # try-with-resources in Java or using blocks in C#).
 from contextlib import contextmanager
 from pathlib import Path
+
+from ai_trade._version import __version__
+from ai_trade.monitoring.logger import get_logger
+
+_db_log = get_logger(__name__)
+
+# Max retries for database operations that fail due to locking
+_DB_MAX_RETRIES = 3
+_DB_RETRY_DELAY = 0.5  # seconds
 
 # Resolve the database directory: 3 levels up from this file's location
 # (monitoring/ → ai_trade/ → src/ → project root), then into data/.
@@ -87,6 +97,7 @@ CREATE TABLE IF NOT EXISTS trades (
     status          TEXT NOT NULL DEFAULT 'pending',
     buy_order_id    TEXT,
     sell_order_id   TEXT,
+    bot_version     TEXT,
     created_at      TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -138,6 +149,7 @@ CREATE TABLE IF NOT EXISTS options_trades (
     pnl             REAL,
     status          TEXT NOT NULL DEFAULT 'open',
     order_id        TEXT,
+    bot_version     TEXT,
     created_at      TEXT NOT NULL DEFAULT (datetime('now')),
     closed_at       TEXT
 );
@@ -153,6 +165,17 @@ CREATE TABLE IF NOT EXISTS scanner_results (
     score           REAL,
     selected        INTEGER NOT NULL DEFAULT 0
 );
+
+-- Performance indexes for frequent queries
+CREATE INDEX IF NOT EXISTS idx_trades_status ON trades(status);
+CREATE INDEX IF NOT EXISTS idx_trades_symbol ON trades(symbol);
+CREATE INDEX IF NOT EXISTS idx_trades_created_at ON trades(created_at);
+CREATE INDEX IF NOT EXISTS idx_options_trades_status ON options_trades(status);
+CREATE INDEX IF NOT EXISTS idx_options_trades_underlying ON options_trades(underlying);
+CREATE INDEX IF NOT EXISTS idx_daily_snapshots_date ON daily_snapshots(date);
+CREATE INDEX IF NOT EXISTS idx_signals_timestamp ON signals(timestamp);
+CREATE INDEX IF NOT EXISTS idx_signals_symbol ON signals(symbol);
+CREATE INDEX IF NOT EXISTS idx_day_trades_date ON day_trades(trade_date);
 """
 
 
@@ -205,92 +228,131 @@ class Database:
 
         executescript() runs multiple SQL statements separated by semicolons.
         Since we use IF NOT EXISTS, this is safe to run on every startup.
+        If the DB is corrupted, logs the error and re-creates it.
         """
-        with self._conn() as conn:
-            conn.executescript(_SCHEMA)
+        try:
+            with self._conn() as conn:
+                conn.executescript(_SCHEMA)
+        except sqlite3.DatabaseError as e:
+            _db_log.error("schema_init_failed", error=str(e), path=str(self._path))
+            # If the database file is corrupted, back it up and start fresh
+            if "malformed" in str(e).lower() or "corrupt" in str(e).lower():
+                backup = self._path.with_suffix(".db.corrupted")
+                _db_log.warning("database_corrupted_backing_up", backup=str(backup))
+                try:
+                    self._path.rename(backup)
+                except OSError:
+                    pass
+                with self._conn() as conn:
+                    conn.executescript(_SCHEMA)
+            else:
+                raise
+        self._migrate()
+
+    def _migrate(self) -> None:
+        """Apply incremental schema migrations for existing databases."""
+        migrations = [
+            ("trades", "bot_version", "ALTER TABLE trades ADD COLUMN bot_version TEXT"),
+            ("options_trades", "bot_version", "ALTER TABLE options_trades ADD COLUMN bot_version TEXT"),
+        ]
+        try:
+            with self._conn() as conn:
+                for table, column, sql in migrations:
+                    cursor = conn.execute(f"PRAGMA table_info({table})")
+                    columns = [row[1] for row in cursor.fetchall()]
+                    if column not in columns:
+                        conn.execute(sql)
+                        _db_log.info("schema_migrated", table=table, column=column)
+        except Exception as e:
+            _db_log.warning("migration_failed", error=str(e))
 
     @contextmanager
     def _conn(self):
         """Context manager that provides a database connection.
 
-        PYTHON PATTERN — @contextmanager:
-            This decorator turns a generator function into a context manager
-            (usable with `with` statements).  Here's how it works:
-
-            1. Code before `yield` runs when entering the `with` block.
-               → Creates and configures the SQLite connection.
-            2. The `yield conn` provides the connection to the `with` block.
-            3. Code after `yield` (in the `finally` block) runs when exiting,
-               EVEN IF AN EXCEPTION OCCURS.  → Commits and closes.
-
-        Usage:
-            with self._conn() as conn:
-                conn.execute("SELECT ...")  # Connection is open here
-            # Connection is automatically closed here
+        Handles SQLite-specific failure modes:
+        - OperationalError from database locks (retries with backoff)
+        - DiskFull / PermissionError (logged with actionable message)
 
         sqlite3.Row is set as the row_factory so query results can be
         accessed by column name (e.g., row["symbol"]) in addition to
         index (e.g., row[0]).
         """
-        conn = sqlite3.connect(str(self._path))
+        conn = sqlite3.connect(str(self._path), timeout=10)
         # Row factory makes rows behave like dictionaries — much more
         # readable than positional indexing.
         conn.row_factory = sqlite3.Row
         try:
             yield conn
             conn.commit()  # Auto-commit on successful exit
+        except sqlite3.OperationalError as e:
+            error_msg = str(e).lower()
+            if "locked" in error_msg or "busy" in error_msg:
+                _db_log.warning("database_locked", error=str(e), path=str(self._path))
+            elif "disk" in error_msg or "full" in error_msg or "readonly" in error_msg:
+                _db_log.error("database_disk_error", error=str(e), path=str(self._path))
+            raise
         finally:
             conn.close()   # Always close, even if an error occurred
+
+    def _retry_on_lock(self, operation, *args, **kwargs):
+        """Retry a database operation up to _DB_MAX_RETRIES if the DB is locked.
+
+        SQLite uses file-level locking.  If another thread or process holds
+        the lock (e.g. the position sync and a trade insert happen
+        simultaneously), the operation will raise OperationalError.  This
+        method retries with a short delay to handle transient locks.
+        """
+        for attempt in range(1, _DB_MAX_RETRIES + 1):
+            try:
+                return operation(*args, **kwargs)
+            except sqlite3.OperationalError as e:
+                if ("locked" in str(e).lower() or "busy" in str(e).lower()) and attempt < _DB_MAX_RETRIES:
+                    _db_log.warning("db_locked_retrying", attempt=attempt, error=str(e))
+                    time.sleep(_DB_RETRY_DELAY * attempt)
+                else:
+                    raise
 
     def _insert(self, table: str, **kwargs) -> int:
         """Generic safe insert — validates column names, uses parameterized values.
 
-        Builds an INSERT statement dynamically from the provided keyword
-        arguments.  Column names are validated, and values use `?`
-        placeholders (parameterized queries) to prevent SQL injection.
-
-        Example:
-            self._insert("trades", symbol="AAPL", shares=100)
-            → INSERT INTO trades (symbol, shares) VALUES (?, ?)
-              with parameters ["AAPL", 100]
-
-        Args:
-            table: Name of the table to insert into.
-            **kwargs: Column name → value pairs.
+        Retries on database lock errors.  Column names are validated, and
+        values use `?` placeholders (parameterized queries) to prevent
+        SQL injection.
 
         Returns:
             The auto-generated row ID of the inserted record.
         """
-        cols = list(kwargs.keys())
-        _validate_columns(cols)
-        col_str = ", ".join(cols)
-        # Create one `?` placeholder for each value.  SQLite's driver
-        # escapes these safely, preventing SQL injection.
-        placeholders = ", ".join(["?"] * len(cols))
-        with self._conn() as conn:
-            cur = conn.execute(
-                f"INSERT INTO {table} ({col_str}) VALUES ({placeholders})",
-                list(kwargs.values()),
-            )
-            # lastrowid is the AUTOINCREMENT id of the newly inserted row.
-            return cur.lastrowid or 0
+        def _do_insert():
+            cols = list(kwargs.keys())
+            _validate_columns(cols)
+            col_str = ", ".join(cols)
+            placeholders = ", ".join(["?"] * len(cols))
+            with self._conn() as conn:
+                cur = conn.execute(
+                    f"INSERT INTO {table} ({col_str}) VALUES ({placeholders})",
+                    list(kwargs.values()),
+                )
+                return cur.lastrowid or 0
+        return self._retry_on_lock(_do_insert)
 
     def _upsert(self, table: str, **kwargs) -> None:
-        """Generic safe INSERT OR REPLACE.
+        """Generic safe INSERT OR REPLACE — retries on lock.
 
         If a row with the same PRIMARY KEY or UNIQUE constraint already
         exists, it's replaced.  Otherwise, a new row is inserted.
-        Used for daily_snapshots where we want one row per date.
         """
-        cols = list(kwargs.keys())
-        _validate_columns(cols)
-        col_str = ", ".join(cols)
-        placeholders = ", ".join(["?"] * len(cols))
-        with self._conn() as conn:
-            conn.execute(
-                f"INSERT OR REPLACE INTO {table} ({col_str}) VALUES ({placeholders})",
-                list(kwargs.values()),
-            )
+        def _do_upsert():
+            cols = list(kwargs.keys())
+            _validate_columns(cols)
+            col_str = ", ".join(cols)
+            placeholders = ", ".join(["?"] * len(cols))
+            with self._conn() as conn:
+                conn.execute(
+                    f"INSERT OR REPLACE INTO {table} ({col_str}) VALUES ({placeholders})",
+                    list(kwargs.values()),
+                )
+        self._retry_on_lock(_do_upsert)
 
     def _update(self, table: str, row_id: int, **kwargs) -> None:
         """Generic safe update by id — validates column names.
@@ -308,19 +370,22 @@ class Database:
             into a list and appends row_id at the end.  The `*` operator
             inside a list literal "spreads" the iterable's elements.
         """
-        cols = list(kwargs.keys())
-        _validate_columns(cols)
-        sets = ", ".join(f"{k} = ?" for k in cols)
-        with self._conn() as conn:
-            conn.execute(
-                f"UPDATE {table} SET {sets} WHERE id = ?",
-                [*kwargs.values(), row_id],
-            )
+        def _do_update():
+            cols = list(kwargs.keys())
+            _validate_columns(cols)
+            sets = ", ".join(f"{k} = ?" for k in cols)
+            with self._conn() as conn:
+                conn.execute(
+                    f"UPDATE {table} SET {sets} WHERE id = ?",
+                    [*kwargs.values(), row_id],
+                )
+        self._retry_on_lock(_do_update)
 
     # ── Trades ──────────────────────────────────────────────
 
     def insert_trade(self, **kwargs) -> int:
         """Insert a new trade record. Returns the new row ID."""
+        kwargs.setdefault("bot_version", __version__)
         return self._insert("trades", **kwargs)
 
     def update_trade(self, trade_id: int, **kwargs) -> None:
@@ -350,6 +415,15 @@ class Database:
         with self._conn() as conn:
             rows = conn.execute(
                 "SELECT * FROM trades ORDER BY created_at DESC"
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def get_trades_closed_on(self, date: str) -> list[dict]:
+        """Fetch trades closed on a specific date (YYYY-MM-DD)."""
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT * FROM trades WHERE status = 'closed' AND exit_time LIKE ?",
+                (f"{date}%",),
             ).fetchall()
             return [dict(r) for r in rows]
 
@@ -409,19 +483,34 @@ class Database:
 
     # ── Signals ─────────────────────────────────────────────
 
-    def log_signal(self, **kwargs) -> None:
+    def log_signal(self, **kwargs) -> int:
         """Record a generated signal for audit trail purposes.
 
         Every signal the strategies produce is logged here, whether or
         not it was actually acted upon.  The `action_taken` field records
         the outcome (e.g., "executed", "rejected_pdt", "rejected_risk").
+
+        Returns the new signal row ID.
         """
-        self._insert("signals", **kwargs)
+        return self._insert("signals", **kwargs)
+
+    def update_signal_action(self, symbol: str, strategy: str, action: str) -> None:
+        """Update action_taken on the most recent signal for a symbol+strategy."""
+        def _do_update():
+            with self._conn() as conn:
+                conn.execute(
+                    "UPDATE signals SET action_taken = ? "
+                    "WHERE id = (SELECT id FROM signals WHERE symbol = ? AND strategy = ? "
+                    "ORDER BY timestamp DESC LIMIT 1)",
+                    (action, symbol, strategy),
+                )
+        self._retry_on_lock(_do_update)
 
     # ── Options Trades ─────────────────────────────────────
 
     def insert_options_trade(self, **kwargs) -> int:
         """Insert an options trade record. Returns the new row ID."""
+        kwargs.setdefault("bot_version", __version__)
         return self._insert("options_trades", **kwargs)
 
     def update_options_trade(self, trade_id: int, **kwargs) -> None:

@@ -51,7 +51,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
-from ai_trade.clients import get_data_client
+from ai_trade.clients import get_news_client
 from ai_trade.monitoring.logger import get_logger
 
 log = get_logger(__name__)
@@ -346,20 +346,13 @@ class NewsSentimentScanner:
         return results
 
     def _fetch_news(self, symbol: str) -> list:
-        """Fetch recent news articles from Alpaca.
+        """Fetch recent news articles from Alpaca's NewsClient.
 
-        Uses the Alpaca data client's news endpoint.  Falls back to the
-        trading client if the data client doesn't support news (this
-        varies by alpaca-py SDK version).
-
-        PYTHON PATTERN — ImportError handling:
-            The `from alpaca.data.requests import NewsRequest` import is
-            inside the function (not at module top) because this class
-            may not exist in all SDK versions.  If it's missing, we catch
-            ImportError and try the fallback.
+        Uses the dedicated NewsClient (not StockHistoricalDataClient) —
+        news lives on its own API endpoint in alpaca-py.
         """
         try:
-            from alpaca.data.requests import NewsRequest
+            from alpaca.data import NewsRequest
 
             start = datetime.now(ET) - timedelta(hours=self._lookback_hours)
             request = NewsRequest(
@@ -368,34 +361,13 @@ class NewsSentimentScanner:
                 limit=self._max_articles,
                 sort="desc",  # Most recent first
             )
-            client = get_data_client()
-            news = client.get_news(request)
-            # `list(news)` converts the API response (which may be an
-            # iterator or generator) into a concrete list.
-            return list(news) if news else []
-        except ImportError:
-            log.debug("news_api_not_available", reason="NewsRequest not in SDK version")
-            return self._fetch_news_fallback(symbol)
+            client = get_news_client()
+            result = client.get_news(request)
+            # NewsSet is dict-like: result["news"] contains the list of News objects.
+            if hasattr(result, "__getitem__"):
+                articles = result.get("news") if hasattr(result, "get") else result["news"]
+                return list(articles) if articles else []
+            return list(result) if result else []
         except Exception as e:
             log.debug("news_fetch_error", symbol=symbol, error=str(e))
-            return self._fetch_news_fallback(symbol)
-
-    def _fetch_news_fallback(self, symbol: str) -> list:
-        """Fallback: try the trading client's news endpoint.
-
-        Some alpaca-py versions expose news through the trading client
-        instead of (or in addition to) the data client.  This method
-        tries that alternative path.
-
-        Returns an empty list if this also fails — the system degrades
-        gracefully to "no news data" rather than crashing.
-        """
-        try:
-            from ai_trade.clients import get_trading_client
-            client = get_trading_client()
-            # hasattr check: only call get_news if the client has that method.
-            if hasattr(client, "get_news"):
-                return list(client.get_news(symbol=symbol, limit=self._max_articles))
-        except Exception:
-            pass  # Swallow all errors — this is a best-effort fallback.
-        return []
+            return []

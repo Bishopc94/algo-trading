@@ -53,11 +53,13 @@ class SignalAggregator:
         pdt_manager,
         risk_manager,
         position_sizer,
+        weighter=None,
     ) -> None:
         self.strategies = strategies
         self.pdt_manager = pdt_manager
         self.risk_manager = risk_manager
         self.position_sizer = position_sizer
+        self._weighter = weighter
 
     # ------------------------------------------------------------------
 
@@ -68,6 +70,7 @@ class SignalAggregator:
         intraday_bars_dict: dict[str, pd.DataFrame],
         account_equity: float,
         available_cash: float,
+        held_symbols: set[str] | None = None,
     ) -> list[dict]:
         """Run all strategies on all candidates and return a prioritised
         execution queue.
@@ -75,16 +78,30 @@ class SignalAggregator:
         This is the main entry point — called by the TradingBot orchestrator
         during each evaluation window (9:35 AM, 12:00 PM, 3:00 PM).
 
+        Args:
+            held_symbols: Set of ticker symbols already held in open positions.
+                          Signals for these symbols are skipped to prevent
+                          duplicate entries.
+
         Returns:
             A list of ``{"signal": Signal, "shares": int}`` dicts, ordered
             by execution priority.  The caller iterates this list and
             submits orders for each entry.
         """
+        held = held_symbols or set()
+
+        # Recalculate adaptive weights if enough new trades have completed
+        if self._weighter is not None:
+            self._weighter.maybe_recalculate()
 
         all_signals: list[Signal] = []
 
         # ── Step 1: Evaluate every strategy × every candidate ──
         for symbol in candidates:
+            # Skip symbols we already hold — prevents duplicate positions
+            if symbol in held:
+                logger.debug("skip_held_symbol", symbol=symbol)
+                continue
             daily = daily_bars_dict.get(symbol)
             intraday = intraday_bars_dict.get(symbol)
 
@@ -105,6 +122,10 @@ class SignalAggregator:
                     continue
 
                 if sig is not None:
+                    # Apply adaptive strategy weight to conviction
+                    if self._weighter is not None:
+                        w = self._weighter.get_weight(sig.strategy_name)
+                        sig.conviction = max(0.0, min(1.0, sig.conviction * w))
                     all_signals.append(sig)
                     # Log every generated signal to the database for analysis
                     self._log_signal(sig)
@@ -157,15 +178,23 @@ class SignalAggregator:
         # ── Step 6: Build execution queue with resource constraints ──
         execution_queue: list[dict] = []
         remaining_cash = available_cash
-        open_count = 0
+        # Start open_count from existing positions to respect max_positions
+        open_count = len(held) if held else 0
         max_positions: int = getattr(
             self.risk_manager.config, "max_open_positions", 4
         )
 
+        queued_symbols: set[str] = set()
         for sig in ranked:
             # Stop if we're out of cash or at max positions
             if remaining_cash <= 0 or open_count >= max_positions:
                 break
+
+            # Skip duplicate symbols within the same execution queue
+            if sig.symbol in queued_symbols:
+                logger.debug("skip_duplicate_in_queue", symbol=sig.symbol,
+                             strategy=sig.strategy_name)
+                continue
 
             # Calculate position size using the fixed-fractional sizer
             shares = self.position_sizer.calculate_shares(
@@ -207,6 +236,7 @@ class SignalAggregator:
             execution_queue.append({"signal": sig, "shares": shares})
             remaining_cash -= shares * sig.entry_price
             open_count += 1
+            queued_symbols.add(sig.symbol)
 
             logger.info(
                 "trade_queued",

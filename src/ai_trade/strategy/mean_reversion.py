@@ -99,10 +99,12 @@ class MeanReversionStrategy(BaseStrategy):
             return None
 
         # ----- Conviction scoring -----
-        # Linear scale: RSI at threshold (40) → 0.5, RSI at 20 → 1.0
-        # More oversold = higher conviction (rubber band stretched further)
-        conviction = 0.5 + 0.5 * (rsi_oversold - rsi_val) / max(rsi_oversold - 20, 1)
-        conviction = max(0.5, min(1.0, conviction))
+        # Linear scale: RSI at threshold → 0.5, RSI at 20 → 0.85
+        # More oversold = higher conviction (rubber band stretched further).
+        # Capped at 0.85 because extreme RSI (<25) can signal capitulation
+        # rather than a dip — the stock might be crashing, not bouncing.
+        conviction = 0.5 + 0.35 * (rsi_oversold - rsi_val) / max(rsi_oversold - 20, 1)
+        conviction = max(0.5, min(0.85, conviction))
 
         entry_price = close
 

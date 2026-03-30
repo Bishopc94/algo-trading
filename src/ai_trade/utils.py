@@ -24,14 +24,11 @@ def retry_api_call(func, *args, **kwargs):
     If the call fails, waits ``2^attempt`` seconds before retrying.  After
     3 failed attempts the exception is re-raised to the caller.
 
-    This is used to wrap Alpaca API calls that may occasionally fail due to
-    rate limits, network hiccups, or temporary server errors.
+    Rate-limit aware: if Alpaca returns a 429 (rate limited), we respect
+    the Retry-After header or wait longer than the default backoff.
 
-    Example usage::
-
-        # Instead of:   client.get_account()
-        # You can do:   retry_api_call(client.get_account)
-        account = retry_api_call(client.get_account)
+    Non-retryable errors (auth failures, invalid requests) are raised
+    immediately without wasting retry attempts.
 
     Args:
         func:    The callable to execute (e.g. ``client.get_account``).
@@ -44,20 +41,42 @@ def retry_api_call(func, *args, **kwargs):
     Raises:
         The original exception from *func* after all retries are exhausted.
     """
+    func_name = getattr(func, "__name__", str(func))
+
     for attempt in range(1, _MAX_RETRIES + 1):
         try:
             return func(*args, **kwargs)
         except Exception as exc:
-            # On the last attempt, don't retry — propagate the error
-            if attempt == _MAX_RETRIES:
-                log.error("api_call_failed", func=func.__name__, error=str(exc))
+            error_msg = str(exc).lower()
+
+            # Non-retryable errors — fail immediately, don't waste retries
+            if any(kw in error_msg for kw in [
+                "forbidden", "unauthorized", "invalid",
+                "pattern day trading", "insufficient",
+                "not found", "40110000", "40310100",
+            ]):
+                log.error("api_call_non_retryable", func=func_name,
+                          error=str(exc), attempt=attempt)
                 raise
 
-            # Exponential backoff: 2s → 4s → 8s
-            wait = _BACKOFF_BASE ** attempt
+            # On the last attempt, don't retry — propagate the error
+            if attempt == _MAX_RETRIES:
+                log.error("api_call_failed_after_retries", func=func_name,
+                          error=str(exc), attempts=_MAX_RETRIES)
+                raise
+
+            # Rate-limit handling: wait longer for 429s
+            if "429" in error_msg or "rate" in error_msg or "too many" in error_msg:
+                wait = max(30, _BACKOFF_BASE ** attempt * 5)
+                log.warning("api_rate_limited", func=func_name, attempt=attempt,
+                            wait=wait)
+            else:
+                # Standard exponential backoff: 2s → 4s → 8s
+                wait = _BACKOFF_BASE ** attempt
+
             log.warning(
                 "api_retry",
-                func=func.__name__,
+                func=func_name,
                 attempt=attempt,
                 wait=wait,
                 error=str(exc),

@@ -147,13 +147,17 @@ class PositionSizer:
         if signal.entry_price > 0:
             shares = min(shares, math.floor(available_cash / signal.entry_price))
 
-        # ── Floor at 0, but allow at least 1 if affordable ─────
+        # ── Floor at 0, with guarded 1-share minimum ─────────
         # max(0, shares) prevents negative values.  Then, if shares ended
-        # up at 0 but we can actually afford 1 share, we buy 1.  This
-        # keeps small accounts active instead of completely idle.
+        # up at 0 but we can afford at least 1 share AND the single-share
+        # risk is within our risk budget, buy 1.  The risk check prevents
+        # a $50 stock with a $2 stop from consuming $50 when the risk
+        # budget is only $10.
         shares = max(0, shares)
         if shares == 0 and available_cash >= signal.entry_price > 0:
-            shares = 1
+            single_share_risk = risk_per_share  # already computed above
+            if single_share_risk <= risk_amount:
+                shares = 1
 
         logger.debug(
             "position_sized",

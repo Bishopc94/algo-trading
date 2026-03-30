@@ -72,6 +72,8 @@ class CashSecuredPutStrategy(BaseOptionsStrategy):
     in neutral RSI territory near their 50-day moving average.
     """
 
+    bias = "neutral"
+
     # ------------------------------------------------------------------
     # evaluate
     # ------------------------------------------------------------------
@@ -218,19 +220,19 @@ class CashSecuredPutStrategy(BaseOptionsStrategy):
         # ------------------------------------------------------------------
         # 4. Conviction scoring
         # ------------------------------------------------------------------
-        conviction: float = 0.6
+        # Base conviction lowered to 0.50 — CSPs tie up large capital on
+        # a $500 account ($300 for a $3 stock).  Need strong confirmation.
+        conviction: float = 0.50
         # Higher annualized return = more compelling trade.
         if annualized_return > 0.25:
-            conviction += 0.1
+            conviction += 0.10
         # RSI in the 40-50 sweet spot = ideal "neutral" zone.
         if 40 <= rsi <= 50:
-            conviction += 0.1
-        # Positive theta on the short put means time decay works in our
-        # favor (the put loses value over time, which is what we want as
-        # the seller).
+            conviction += 0.10
+        # Positive theta on the short put means time decay works in our favor.
         if selected["_theta"] > 0:
-            conviction += 0.1
-        conviction = max(0.5, min(1.0, conviction))
+            conviction += 0.05
+        conviction = max(0.45, min(0.80, conviction))
 
         # ------------------------------------------------------------------
         # 5. Build and return the trade signal

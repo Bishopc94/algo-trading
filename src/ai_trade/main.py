@@ -40,18 +40,26 @@ import json
 import signal
 import sys
 import time
+import traceback
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import pandas as pd
 from alpaca.data.timeframe import TimeFrame
 
+from ai_trade._version import __version__
 from ai_trade.config import load_config
 from ai_trade.clients import init_clients, get_trading_client, get_account
-from ai_trade.data.historical import fetch_bars, fetch_bars_multi
+from ai_trade.data.historical import fetch_bars_multi
 from ai_trade.data.indicators import add_all
 from ai_trade.monitoring.database import Database
 from ai_trade.monitoring.logger import setup_logging, get_logger
+from ai_trade.monitoring.notifier import (
+    notify_high_conviction_signal,
+    notify_options_order,
+    notify_stock_order,
+    notify_stock_order_failed,
+)
 from ai_trade.monitoring.performance import PerformanceTracker
 from ai_trade.risk.pdt_manager import PDTManager
 from ai_trade.risk.position_sizer import PositionSizer
@@ -59,10 +67,16 @@ from ai_trade.risk.risk_manager import RiskManager
 from ai_trade.execution.order_manager import OrderManager
 from ai_trade.scanner.screener import StockScreener
 from ai_trade.strategy.base import HoldType
+from ai_trade.strategy.bb_squeeze import BBSqueezeStrategy
+from ai_trade.strategy.ema_crossover import EMACrossoverStrategy
+from ai_trade.strategy.macd_divergence import MACDDivergenceStrategy
 from ai_trade.strategy.mean_reversion import MeanReversionStrategy
 from ai_trade.strategy.momentum import MomentumStrategy
+from ai_trade.strategy.orb import ORBStrategy
+from ai_trade.strategy.pullback import PullbackStrategy
 from ai_trade.strategy.vwap import VWAPStrategy
 from ai_trade.strategy.signal import SignalAggregator
+from ai_trade.strategy.weighter import StrategyWeighter
 from ai_trade.scheduler.jobs import create_scheduler
 
 # Options imports
@@ -75,6 +89,7 @@ from ai_trade.strategy.options.long_put import LongPutStrategy
 from ai_trade.strategy.options.cash_secured_put import CashSecuredPutStrategy
 from ai_trade.strategy.options.covered_call import CoveredCallStrategy
 from ai_trade.strategy.options.covered_straddle import CoveredStraddleStrategy
+from ai_trade.strategy.options.momentum_options import MomentumOptionsStrategy
 
 # Sentiment imports
 from ai_trade.sentiment.market_regime import MarketRegimeAnalyzer, MarketRegime
@@ -130,6 +145,23 @@ class TradingBot:
             self.strategies.append(MomentumStrategy(strat_cfg.momentum))
         if strat_cfg.vwap.enabled:
             self.strategies.append(VWAPStrategy(strat_cfg.vwap))
+        if getattr(strat_cfg, "ema_crossover", None) and strat_cfg.ema_crossover.enabled:
+            self.strategies.append(EMACrossoverStrategy(strat_cfg.ema_crossover))
+        if getattr(strat_cfg, "macd_divergence", None) and strat_cfg.macd_divergence.enabled:
+            self.strategies.append(MACDDivergenceStrategy(strat_cfg.macd_divergence))
+        if getattr(strat_cfg, "bb_squeeze", None) and strat_cfg.bb_squeeze.enabled:
+            self.strategies.append(BBSqueezeStrategy(strat_cfg.bb_squeeze))
+        if getattr(strat_cfg, "orb", None) and strat_cfg.orb.enabled:
+            self.strategies.append(ORBStrategy(strat_cfg.orb))
+        if getattr(strat_cfg, "pullback", None) and strat_cfg.pullback.enabled:
+            self.strategies.append(PullbackStrategy(strat_cfg.pullback))
+
+        # Adaptive strategy weighting — adjusts conviction multipliers
+        # based on historical trade performance per strategy.
+        weighter_cfg = getattr(self.cfg, "strategy_weighting", None)
+        self.weighter = None
+        if weighter_cfg and getattr(weighter_cfg, "enabled", False):
+            self.weighter = StrategyWeighter(self.db, weighter_cfg)
 
         # The signal aggregator is the "brain" — it collects signals from
         # all strategies, ranks them, and builds the execution queue.
@@ -138,6 +170,7 @@ class TradingBot:
             pdt_manager=self.pdt,
             risk_manager=self.risk,
             position_sizer=self.sizer,
+            weighter=self.weighter,
         )
 
         # ── Options strategies ──
@@ -158,6 +191,8 @@ class TradingBot:
                 self.options_strategies.append(CoveredCallStrategy(strat_cfg.covered_call))
             if strat_cfg.covered_straddle.enabled:
                 self.options_strategies.append(CoveredStraddleStrategy(strat_cfg.covered_straddle))
+            if getattr(strat_cfg, "momentum_options", None) and strat_cfg.momentum_options.enabled:
+                self.options_strategies.append(MomentumOptionsStrategy(strat_cfg.momentum_options))
 
         # ── Sentiment layer ──
         self.regime_analyzer = MarketRegimeAnalyzer()
@@ -165,7 +200,8 @@ class TradingBot:
         self._market_context = None  # Set at market open by _analyze_market_regime()
 
         # ── State ──
-        self._candidates: list[dict] = []  # Today's scanner candidates
+        self._candidates: list[dict] = []          # Today's stock scanner candidates
+        self._options_candidates: list[dict] = []  # Today's options-eligible candidates
         self._running = False
 
     # ══════════════════════════════════════════════════════════
@@ -179,10 +215,26 @@ class TradingBot:
         the user presses Ctrl+C or the bot is stopped programmatically.
         """
         setup_logging()
-        init_clients(self.cfg)  # Create Alpaca API client singletons
 
-        # Verify we can connect to Alpaca
-        account = get_account()
+        # Initialize Alpaca API clients — retry up to 3 times on transient
+        # network failures.  If this fails, the bot cannot operate at all.
+        try:
+            init_clients(self.cfg)
+        except Exception as e:
+            log.error("client_init_failed", error=str(e))
+            print(f"\n  FATAL: Could not initialize Alpaca clients — {e}")
+            print(f"  Check your API keys in .env and internet connectivity.")
+            sys.exit(1)
+
+        # Verify we can connect to Alpaca and the credentials are valid
+        try:
+            account = get_account()
+        except Exception as e:
+            log.error("account_fetch_failed", error=str(e))
+            print(f"\n  FATAL: Could not connect to Alpaca — {e}")
+            print(f"  Check: API keys valid? Internet connected? Alpaca status page?")
+            sys.exit(1)
+
         log.info(
             "connected",
             equity=float(account.equity),
@@ -192,8 +244,22 @@ class TradingBot:
         )
 
         # Reconcile any positions from a previous run (e.g. if the bot
-        # was restarted mid-day, positions may still be open on Alpaca)
-        self.orders.sync_positions()
+        # was restarted mid-day, positions may still be open on Alpaca).
+        # Non-fatal: if sync fails, we log and continue — positions will
+        # be reconciled on the next scheduled sync.
+        try:
+            self.orders.sync_positions()
+        except Exception as e:
+            log.warning("startup_sync_failed", error=str(e))
+            print(f"  Warning: Position sync failed on startup — {e}")
+
+        # Sync PDT count with Alpaca's server-side count — our local DB
+        # may be stale after a restart or if trades happened outside the bot.
+        # Non-fatal: local DB count is a fallback.
+        try:
+            self.pdt.sync_with_alpaca()
+        except Exception as e:
+            log.warning("startup_pdt_sync_failed", error=str(e))
 
         # Start the APScheduler — it fires cron jobs throughout the day
         self._scheduler = create_scheduler(self)
@@ -206,6 +272,7 @@ class TradingBot:
         options_strat_names = [type(s).__name__ for s in self.options_strategies]
         log.info(
             "bot_started",
+            version=__version__,
             mode=mode,
             current_time_et=now_et.strftime("%Y-%m-%d %H:%M:%S"),
             stock_strategies=stock_strat_names,
@@ -218,7 +285,7 @@ class TradingBot:
                       "entry_window": self.cfg.schedule.entry_window,
                       "midday_check": self.cfg.schedule.midday_check},
         )
-        print(f"\n  AI Trade Bot started [{mode}]")
+        print(f"\n  AI Trade Bot v{__version__} started [{mode}]")
         print(f"  Equity: ${float(account.equity):,.2f} | Cash: ${float(account.cash):,.2f}")
         print(f"  Stock strategies: {len(self.strategies)} | Options strategies: {len(self.options_strategies)}")
         print(f"  Day trades remaining: {self.pdt.day_trades_remaining()}")
@@ -243,7 +310,7 @@ class TradingBot:
         on Alpaca's servers even after the bot shuts down.  This is a key
         safety feature — your stops protect you even if the bot crashes.
         """
-        log.info("bot_stopping")
+        log.info("bot_stopping", version=__version__)
         self._running = False
         if hasattr(self, "_scheduler"):
             self._scheduler.shutdown(wait=False)
@@ -263,45 +330,75 @@ class TradingBot:
         weekday = now_et.weekday()
         if weekday >= 5:  # Saturday=5, Sunday=6
             log.info("catchup_skip", reason="weekend")
+            print(f"\n  [Catchup] Weekend detected — no market activity. Waiting for Monday.")
             return
 
         hour_min = now_et.hour * 60 + now_et.minute
         market_open = 9 * 60 + 30   # 9:30 AM ET
         market_close = 16 * 60       # 4:00 PM ET
 
-        if hour_min < market_open or hour_min >= market_close:
-            log.info("catchup_skip", reason="outside_market_hours",
+        if hour_min < market_open:
+            log.info("catchup_skip", reason="pre_market",
                       current_time=now_et.strftime("%H:%M"))
+            print(f"\n  [Catchup] Market hasn't opened yet ({now_et.strftime('%I:%M %p')} ET)."
+                  f" Waiting for 9:00 AM pre-market scan.")
             return
 
-        open_positions = self.orders.get_open_positions()
+        if hour_min >= market_close:
+            log.info("catchup_skip", reason="after_hours",
+                      current_time=now_et.strftime("%H:%M"))
+            print(f"\n  [Catchup] Market is closed ({now_et.strftime('%I:%M %p')} ET)."
+                  f" Bot will resume at next market open.")
+            return
+
+        try:
+            open_positions = self.orders.get_open_positions()
+        except Exception as e:
+            log.warning("catchup_position_fetch_failed", error=str(e))
+            open_positions = []
         has_positions = len(open_positions) > 0
 
         log.info("catchup_start", current_time=now_et.strftime("%H:%M"),
                   open_positions=len(open_positions))
+        print(f"\n  [Catchup] Bot started mid-session at {now_et.strftime('%I:%M %p')} ET."
+              f" Running missed jobs to get up to speed...")
 
         # Always scan for candidates on startup
         log.info("catchup_running", job="premarket_scan")
+        print(f"  [Catchup] Scanning stock universe for today's candidates...")
         self.job_premarket_scan()
+        print(f"  [Catchup] Scan complete: {len(self._candidates)} candidates found.")
 
         # Always set up market context (regime analysis)
         if self._market_context is None:
             log.info("catchup_running", job="market_open")
+            print(f"  [Catchup] Analyzing market regime (SPY/QQQ/VIX)...")
             self.job_market_open()
+            if self._market_context:
+                regime = self._market_context.regime.value
+                biases = ", ".join(self._market_context.allowed_options_biases) or "none"
+                print(f"  [Catchup] Market regime: {regime.upper()}"
+                      f" | Conviction modifier: {self._market_context.conviction_modifier}x"
+                      f" | Options biases allowed: {biases}")
+            else:
+                print(f"  [Catchup] Market regime analysis failed — using defaults.")
 
         # Only evaluate strategies if we have NO open positions.
         # If we already have positions, we wait for the next scheduled
         # window to avoid doubling down accidentally.
         if not has_positions:
             log.info("catchup_running", job="entry_window", reason="no_open_positions")
+            print(f"  [Catchup] No open positions — running strategy evaluation now...")
             self.job_entry_window()
         else:
             log.info("catchup_skip_entry", reason="has_open_positions",
                       count=len(open_positions))
+            print(f"  [Catchup] {len(open_positions)} open position(s) already held"
+                  f" — skipping evaluation to avoid doubling down."
+                  f" Will re-evaluate at next scheduled window.")
 
         log.info("catchup_complete", scanned=True, evaluated=not has_positions)
-        print(f"  Startup scan complete: {len(self._candidates)} candidates"
-              f" | {'Evaluating strategies...' if not has_positions else f'{len(open_positions)} open positions, waiting for next window'}")
+        print(f"  [Catchup] Done. Scheduler is now running — next jobs will fire on schedule.\n")
 
     # ══════════════════════════════════════════════════════════
     # Scheduled Jobs — called by APScheduler at specific times
@@ -314,17 +411,41 @@ class TradingBot:
         price, gap%, and relative volume.  These candidates are then
         evaluated by all strategies during the entry window.
         """
-        log.info("job_start", job="premarket_scan", time=datetime.now(ET).strftime("%H:%M:%S"))
+        now = datetime.now(ET)
+        log.info("job_start", job="premarket_scan", time=now.strftime("%H:%M:%S"))
+        print(f"\n  [{now.strftime('%I:%M %p')}] Pre-market scan starting...")
         try:
-            self._candidates = self.screener.scan()
+            counts = self._run_full_scan()
             symbols = [c["symbol"] for c in self._candidates]
-            log.info("scan_complete", candidates=len(self._candidates), symbols=symbols[:10])
-            if not self._candidates:
+            log.info("scan_complete",
+                      total=len(self._candidates),
+                      momentum=counts["momentum"],
+                      mean_reversion=counts["mean_reversion"],
+                      vwap=counts["vwap"],
+                      symbols=symbols[:10])
+            if self._candidates:
+                top = ", ".join(symbols[:8])
+                more = f" +{len(symbols)-8} more" if len(symbols) > 8 else ""
+                print(f"  [{now.strftime('%I:%M %p')}] Scan complete: {len(self._candidates)} candidates"
+                      f" (momentum={momentum_count}, mean_rev={len(mr_candidates)}, vwap={len(vwap_candidates)})"
+                      f" — {top}{more}")
+            else:
                 log.warning("scan_returned_zero_candidates",
                              hint="Check scanner filters: min_gap_pct, min_relative_volume, price range")
+                print(f"  [{now.strftime('%I:%M %p')}] Scan complete: 0 candidates found."
+                      f" Check scanner filters if this persists.")
+
+            # Scan a separate, broader universe for options-eligible stocks
+            if self.options_enabled:
+                self._options_candidates = self.screener.scan_options_universe()
+                opt_syms = [c["symbol"] for c in self._options_candidates]
+                print(f"  [{now.strftime('%I:%M %p')}] Options universe: {len(self._options_candidates)} candidates"
+                      f" — {', '.join(opt_syms[:6])}" + (f" +{len(opt_syms)-6} more" if len(opt_syms) > 6 else ""))
         except Exception as e:
             log.error("scan_failed", error=str(e), error_type=type(e).__name__)
             self._candidates = []
+            self._options_candidates = []
+            print(f"  [{now.strftime('%I:%M %p')}] Scan FAILED: {e}")
 
     def job_market_open(self) -> None:
         """9:30 AM ET — Cache starting equity, sync positions, analyze market.
@@ -333,18 +454,30 @@ class TradingBot:
         calculated.  Market regime analysis (SPY/QQQ/VIX) determines
         whether it's safe to take new positions today.
         """
+        now = datetime.now(ET)
         log.info("job_start", job="market_open")
+        print(f"\n  [{now.strftime('%I:%M %p')}] Market open — syncing account and analyzing regime...")
         try:
             account = get_account()
             self.risk.set_starting_equity(float(account.equity))
-            self.orders.sync_positions()
 
-            # Analyze broad market conditions (SPY, QQQ, VIX)
+            try:
+                self.orders.sync_positions()
+            except Exception as e:
+                log.warning("market_open_sync_failed", error=str(e))
+                print(f"  [{now.strftime('%I:%M %p')}] Warning: Position sync failed — {e}")
+
+            # Analyze broad market conditions (SPY, QQQ, VIX).
+            # Non-fatal: if this fails, we trade with default (neutral) settings.
             self._analyze_market_regime()
 
             log.info("market_open", equity=float(account.equity), cash=float(account.cash))
+            print(f"  [{now.strftime('%I:%M %p')}] Account: ${float(account.equity):,.2f} equity"
+                  f" | ${float(account.cash):,.2f} cash")
         except Exception as e:
             log.error("market_open_failed", error=str(e))
+            print(f"  [{now.strftime('%I:%M %p')}] Market open job FAILED: {e}"
+                  f" — will retry on next scheduled job.")
 
     def _analyze_market_regime(self) -> None:
         """Fetch SPY/QQQ/VIX bars and classify the market regime.
@@ -371,19 +504,28 @@ class TradingBot:
             try:
                 vix_data = fetch_bars_multi(["VIX", "VIXY"], TimeFrame.Day, start, end)
                 vix_bars = vix_data.get("VIX") or vix_data.get("VIXY")
-            except Exception:
-                pass
+            except Exception as e:
+                log.debug("vix_fetch_failed", error=str(e))
 
             self._market_context = self.regime_analyzer.analyze(spy_bars, qqq_bars, vix_bars)
             log.info(
                 "market_regime_result",
                 regime=self._market_context.regime.value,
                 allow_new_longs=self._market_context.allow_new_longs,
-                allow_options=self._market_context.allow_options,
+                allowed_options_biases=self._market_context.allowed_options_biases,
                 conviction_modifier=self._market_context.conviction_modifier,
                 position_size_modifier=self._market_context.position_size_modifier,
             )
-            print(f"  Market: {self._market_context}")
+            ctx = self._market_context
+            biases = ", ".join(ctx.allowed_options_biases) if ctx.allowed_options_biases else "none"
+            longs_status = "allowed" if ctx.allow_new_longs else "BLOCKED"
+            print(f"  Market regime: {ctx.regime.value.upper()}"
+                  f" | SPY RSI={ctx.spy_rsi:.1f} ({ctx.spy_trend})"
+                  f" | VIX={ctx.vix_level:.1f} ({ctx.vix_trend})")
+            print(f"  Modifiers: conviction={ctx.conviction_modifier}x"
+                  f" | size={ctx.position_size_modifier}x"
+                  f" | longs={longs_status}"
+                  f" | options biases: {biases}")
 
         except Exception as e:
             log.warning("market_regime_failed", error=str(e))
@@ -394,10 +536,45 @@ class TradingBot:
         This is the primary trading window.  Runs 5 minutes after market
         open to let the initial volatility settle.
         """
+        now = datetime.now(ET)
         log.info("job_start", job="entry_window")
-        self._evaluate_and_trade()
-        if self.options_enabled:
+        print(f"\n  [{now.strftime('%I:%M %p')}] Entry window — evaluating {len(self._candidates or [])} candidates...")
+        self._run_evaluation_cycle()
+
+    def job_mid_morning_options(self) -> None:
+        """10:15 AM ET — Dedicated options evaluation after initial volatility settles.
+
+        IV (implied volatility) is typically inflated at market open and settles
+        by ~10:00 AM.  Running options evaluation here gets better pricing on
+        premiums.  Also picks up any new options candidates that the entry
+        window missed.
+        """
+        if not self.options_enabled:
+            return
+        now = datetime.now(ET)
+        log.info("job_start", job="mid_morning_options")
+        print(f"\n  [{now.strftime('%I:%M %p')}] Mid-morning options pass — IV has settled, evaluating...")
+        try:
+            # Refresh options candidates with current snapshot data
+            self.screener.invalidate_snapshot_cache()
+            self._options_candidates = self.screener.scan_options_universe()
+            print(f"  [{now.strftime('%I:%M %p')}] Options universe: {len(self._options_candidates)} candidates.")
             self._evaluate_options()
+        except Exception as e:
+            log.error("mid_morning_options_failed", error=str(e))
+            print(f"  [{now.strftime('%I:%M %p')}] Mid-morning options FAILED: {e}")
+
+    def job_late_morning(self) -> None:
+        """11:00 AM ET — Second evaluation pass for setups that develop after open.
+
+        Some patterns (mean reversion dips, VWAP reclaims) take 1-2 hours to
+        form.  This pass catches those setups that weren't visible at 9:35.
+        """
+        now = datetime.now(ET)
+        log.info("job_start", job="late_morning")
+        print(f"\n  [{now.strftime('%I:%M %p')}] Late morning pass — checking for new setups...")
+        self.orders.sync_positions()
+        self._run_evaluation_cycle()
 
     def job_midday_check(self) -> None:
         """12:00 PM ET — Re-evaluate positions and check for new swing setups.
@@ -405,11 +582,11 @@ class TradingBot:
         By midday, initial momentum plays have played out and new swing
         opportunities may have emerged.
         """
+        now = datetime.now(ET)
         log.info("job_start", job="midday_check")
+        print(f"\n  [{now.strftime('%I:%M %p')}] Midday check — syncing positions and re-evaluating...")
         self.orders.sync_positions()
-        self._evaluate_and_trade()
-        if self.options_enabled:
-            self._evaluate_options()
+        self._run_evaluation_cycle()
 
     def job_power_hour(self) -> None:
         """3:00 PM ET — Final scan for late momentum plays.
@@ -417,12 +594,86 @@ class TradingBot:
         "Power hour" (3-4 PM) often sees increased volume and momentum
         as institutional traders make their final moves before close.
         """
+        now = datetime.now(ET)
         log.info("job_start", job="power_hour")
+        print(f"\n  [{now.strftime('%I:%M %p')}] Power hour — re-scanning and evaluating...")
         try:
-            self._candidates = self.screener.scan()
+            # Invalidate stale snapshots from the morning scan
+            self.screener.invalidate_snapshot_cache()
+            counts = self._run_full_scan()
+            print(f"  [{now.strftime('%I:%M %p')}] Fresh scan: {len(self._candidates)} candidates"
+                  f" (momentum={counts['momentum']}, mr={counts['mean_reversion']}, vwap={counts['vwap']}).")
             self._evaluate_and_trade()
+            if self.options_enabled:
+                self._options_candidates = self.screener.scan_options_universe()
+                print(f"  [{now.strftime('%I:%M %p')}] Options universe: {len(self._options_candidates)} candidates.")
+                self._evaluate_options()
         except Exception as e:
             log.error("power_hour_failed", error=str(e))
+            print(f"  [{now.strftime('%I:%M %p')}] Power hour FAILED: {e}")
+
+    def job_options_expiry_check(self) -> None:
+        """3:30 PM ET — Close options positions expiring today or tomorrow.
+
+        Options near expiration carry assignment risk (short options) and
+        gamma risk (all options).  Closing them before EOD avoids surprise
+        assignments and illiquid fills.
+        """
+        if not self.options_enabled:
+            return
+        now = datetime.now(ET)
+        log.info("job_start", job="options_expiry_check")
+        print(f"\n  [{now.strftime('%I:%M %p')}] Options expiry check — closing positions expiring soon...")
+        try:
+            closed = self.options_orders.close_expiring_positions(days_until_expiration=1)
+            if closed:
+                print(f"  [{now.strftime('%I:%M %p')}] Closed {len(closed)} expiring option(s): {', '.join(closed)}")
+                # Fetch open options ONCE, then search for each closed symbol
+                open_opts = self.db.get_open_options_trades()
+                for sym in closed:
+                    for t in open_opts:
+                        if sym in str(t.get("legs", "")):
+                            self.db.update_options_trade(
+                                t["id"], status="closed",
+                                exit_time=now.isoformat(),
+                                close_reason="expiry_management",
+                            )
+            else:
+                print(f"  [{now.strftime('%I:%M %p')}] No expiring options to close.")
+        except Exception as e:
+            log.error("options_expiry_check_failed", error=str(e))
+            print(f"  [{now.strftime('%I:%M %p')}] Options expiry check FAILED: {e}")
+
+    def job_options_position_sync(self) -> None:
+        """Every 5 minutes — Sync options positions with Alpaca.
+
+        Options fills can happen at any time (limit orders filling,
+        assignments, exercises).  This periodic sync keeps the local DB
+        accurate without the overhead of per-minute checks.
+        """
+        if not self.options_enabled:
+            return
+        try:
+            broker_positions = self.options_orders.get_options_positions()
+            open_db_trades = self.db.get_open_options_trades()
+
+            # Find DB trades that are no longer in broker positions
+            broker_syms = {pos.symbol for pos in broker_positions}
+            for trade in open_db_trades:
+                trade_legs = trade.get("legs", "")
+                # Check if any leg symbol is still held at the broker
+                still_open = any(sym in trade_legs for sym in broker_syms)
+                if not still_open and trade_legs:
+                    log.info("options_position_closed_externally",
+                             trade_id=trade["id"],
+                             underlying=trade.get("underlying", "?"))
+                    self.db.update_options_trade(
+                        trade["id"], status="closed",
+                        exit_time=datetime.now(ET).isoformat(),
+                        close_reason="filled_or_expired",
+                    )
+        except Exception as e:
+            log.debug("options_position_sync_failed", error=str(e))
 
     def job_eod_close_day_trades(self) -> None:
         """3:50 PM ET — Force-close any open day-trade positions.
@@ -432,12 +683,21 @@ class TradingBot:
         PDT compliance — holding a day trade overnight would still count
         as a day trade but with overnight risk.
         """
+        now = datetime.now(ET)
         log.info("job_start", job="eod_close_day_trades")
+        print(f"\n  [{now.strftime('%I:%M %p')}] EOD — closing any open day-trade positions...")
         try:
             open_trades = self.db.get_open_trades()
+            day_trades = [t for t in open_trades if t.get("hold_type") == "day"]
+            if day_trades:
+                symbols = [t.get("symbol", "?") for t in day_trades]
+                print(f"  [{now.strftime('%I:%M %p')}] Closing {len(day_trades)} day trade(s): {', '.join(symbols)}")
+            else:
+                print(f"  [{now.strftime('%I:%M %p')}] No open day trades to close.")
             self.orders.close_all_day_trades(open_trades)
         except Exception as e:
             log.error("eod_close_failed", error=str(e))
+            print(f"  [{now.strftime('%I:%M %p')}] EOD close FAILED: {e}")
 
     def job_eod_review(self) -> None:
         """4:05 PM ET — Daily P&L summary, save snapshot to database.
@@ -446,20 +706,31 @@ class TradingBot:
         settlement prices.  The snapshot is used for the equity curve
         and performance metrics.
         """
+        now = datetime.now(ET)
         log.info("job_start", job="eod_review")
+        print(f"\n  [{now.strftime('%I:%M %p')}] EOD review — calculating daily P&L...")
         try:
             account = get_account()
             positions = self.orders.get_open_positions()
 
             # Save daily snapshot for the equity curve
             today = datetime.now(ET).strftime("%Y-%m-%d")
+
+            # Calculate today's realized P&L from closed trades
+            realized_pnl = 0.0
+            try:
+                closed_today = self.db.get_trades_closed_on(today)
+                realized_pnl = sum(t.get("pnl", 0) or 0 for t in closed_today)
+            except Exception as e:
+                log.debug("realized_pnl_fetch_failed", error=str(e))
+
             self.db.save_snapshot(
                 date=today,
                 equity=float(account.equity),
                 cash=float(account.cash),
                 open_positions=len(positions),
                 day_trades_used=self.pdt.get_day_trades_used(),
-                realized_pnl=0.0,
+                realized_pnl=realized_pnl,
                 unrealized_pnl=float(account.equity) - float(account.cash) if positions else 0.0,
             )
 
@@ -490,6 +761,36 @@ class TradingBot:
     # Core Logic: Stock evaluation pipeline
     # ══════════════════════════════════════════════════════════
 
+    def _run_full_scan(self) -> dict[str, int]:
+        """Run all scanners and merge candidates into self._candidates.
+
+        Returns a dict with counts per scanner for logging.
+        """
+        momentum_candidates = self.screener.scan()
+        mr_candidates = self.screener.scan_mean_reversion()
+        vwap_candidates = self.screener.scan_vwap_universe()
+
+        seen: dict[str, dict] = {}
+        for c in momentum_candidates + mr_candidates + vwap_candidates:
+            sym = c["symbol"]
+            if sym not in seen or c.get("score", 0) > seen[sym].get("score", 0):
+                seen[sym] = c
+        self._candidates = list(seen.values())
+
+        return {
+            "momentum": len(momentum_candidates),
+            "mean_reversion": len(mr_candidates),
+            "vwap": len(vwap_candidates),
+        }
+
+    def _run_evaluation_cycle(self) -> None:
+        """Run both stock and options evaluation pipelines."""
+        self._evaluate_and_trade()
+        if self.options_enabled:
+            now = datetime.now(ET)
+            print(f"  [{now.strftime('%I:%M %p')}] Evaluating options strategies...")
+            self._evaluate_options()
+
     def _evaluate_and_trade(self) -> None:
         """Run stock strategies on candidates and submit approved trades.
 
@@ -505,7 +806,16 @@ class TradingBot:
         """
         if not self._candidates:
             log.info("no_candidates_to_evaluate")
+            print(f"    No candidates to evaluate.")
             return
+
+        # Refresh Alpaca's PDT count before evaluating — prevents submitting
+        # orders that Alpaca will reject with a 403.
+        # Non-fatal: if sync fails, we use the last known count.
+        try:
+            self.pdt.sync_with_alpaca()
+        except Exception as e:
+            log.warning("pdt_sync_failed_before_eval", error=str(e))
 
         # Gate: market regime check — don't go long into a strong bear market
         ctx = self._market_context
@@ -513,13 +823,24 @@ class TradingBot:
             log.warning("longs_blocked_by_regime", regime=ctx.regime.value,
                         conviction_mod=ctx.conviction_modifier,
                         position_size_mod=ctx.position_size_modifier)
+            print(f"    New longs BLOCKED — market regime is {ctx.regime.value}.")
             return
 
         try:
-            account = get_account()
-            equity = float(account.equity)
-            cash = float(account.cash)
-            open_positions = self.orders.get_open_positions()
+            try:
+                account = get_account()
+                equity = float(account.equity)
+                cash = float(account.cash)
+            except Exception as e:
+                log.error("account_fetch_failed_during_eval", error=str(e))
+                print(f"    ERROR: Could not fetch account info — {e}. Skipping evaluation.")
+                return
+
+            try:
+                open_positions = self.orders.get_open_positions()
+            except Exception as e:
+                log.warning("position_fetch_failed_during_eval", error=str(e))
+                open_positions = []
 
             log.info(
                 "evaluate_start",
@@ -589,6 +910,22 @@ class TradingBot:
             except Exception as e:
                 log.warning("news_scan_failed", error=str(e))
 
+            # Build the set of symbols we already hold to prevent duplicates
+            held_symbols = set()
+            for pos in open_positions:
+                sym = getattr(pos, "symbol", None) or pos.get("symbol") if isinstance(pos, dict) else getattr(pos, "symbol", None)
+                if sym:
+                    held_symbols.add(sym)
+            # Also check DB open trades (catches positions from earlier today)
+            try:
+                db_open = self.db.get_open_trades()
+                for t in db_open:
+                    held_symbols.add(t.get("symbol", ""))
+            except Exception as e:
+                log.debug("db_open_trades_fetch_failed", error=str(e))
+            if held_symbols:
+                log.info("held_symbols_excluded", symbols=list(held_symbols))
+
             # The "brain": collect signals from all strategies, rank them,
             # and build the execution queue
             execution_queue = self.aggregator.collect_and_rank(
@@ -597,6 +934,7 @@ class TradingBot:
                 intraday_bars_dict=intraday_bars,
                 account_equity=equity,
                 available_cash=cash,
+                held_symbols=held_symbols,
             )
 
             if not execution_queue:
@@ -604,6 +942,8 @@ class TradingBot:
                           candidates=len(symbols),
                           bars_with_data=len(bars_ok),
                           pdt_remaining=self.pdt.day_trades_remaining())
+                print(f"    No signals passed filters ({len(symbols)} candidates evaluated,"
+                      f" {self.pdt.day_trades_remaining()} PDT slots left).")
                 return
 
             log.info(
@@ -612,82 +952,143 @@ class TradingBot:
                 symbols=[item["signal"].symbol for item in execution_queue],
                 strategies=[item["signal"].strategy_name for item in execution_queue],
             )
+            for item in execution_queue:
+                s = item["signal"]
+                print(f"    Signal: {s.symbol} ({s.strategy_name}) | conviction={s.conviction:.2f}"
+                      f" | {s.hold_type.value} trade | entry=${s.entry_price:.2f}"
+                      f" | stop=${s.stop_loss_price:.2f} | target=${s.take_profit_price:.2f}")
 
             # Submit orders — apply sentiment modifiers before execution
             for item in execution_queue:
-                sig = item["signal"]
-                shares = item["shares"]
-
-                # Apply market regime modifier to conviction
-                original_conviction = sig.conviction
-                if ctx:
-                    sig.conviction = min(1.0, sig.conviction * ctx.conviction_modifier)
-                    # Also adjust position size by regime (e.g. 0.5x in bear market)
-                    shares = max(1, int(shares * ctx.position_size_modifier))
-
-                # Apply news sentiment modifier to conviction
-                ns = news_sentiment.get(sig.symbol)
-                if ns:
-                    sig.conviction = min(1.0, sig.conviction * ns.conviction_modifier)
-                    # Block trades on very bearish news (unless a catalyst was detected)
-                    if ns.net_score < -0.5 and not ns.catalyst_detected:
-                        log.info(
-                            "trade_blocked_by_news",
-                            symbol=sig.symbol,
-                            net_score=ns.net_score,
-                            headline=ns.top_headline[:80],
-                        )
-                        continue
-
-                # Final conviction gate after all modifiers
-                if sig.conviction < 0.35:
-                    log.info(
-                        "trade_below_min_conviction",
-                        symbol=sig.symbol,
-                        conviction=sig.conviction,
-                        original=original_conviction,
-                    )
-                    continue
-
-                # In dry-run mode, log the signal but don't submit orders
-                if self.dry_run:
-                    news_info = f" | news={ns.net_score:+.2f}" if ns and ns.article_count > 0 else ""
-                    regime_info = f" | regime={ctx.regime.value}" if ctx else ""
-                    log.info(
-                        "dry_run_stock_signal",
-                        symbol=sig.symbol,
-                        strategy=sig.strategy_name,
-                        conviction=sig.conviction,
-                        original_conviction=original_conviction,
-                        hold_type=sig.hold_type.value,
-                        shares=shares,
-                        entry=sig.entry_price,
-                        stop=sig.stop_loss_price,
-                        target=sig.take_profit_price,
-                        regime=ctx.regime.value if ctx else "unknown",
-                        news_score=ns.net_score if ns else 0,
-                    )
-                    continue
-
-                # Submit the bracket order to Alpaca
-                order_id = self.orders.submit_bracket_order(sig, shares)
-                if order_id:
-                    log.info(
-                        "stock_order_submitted",
-                        symbol=sig.symbol,
-                        strategy=sig.strategy_name,
-                        shares=shares,
-                        order_id=order_id,
-                    )
-                    # Record the day trade if applicable (for PDT tracking)
-                    if self.pdt.would_be_day_trade(sig.hold_type):
-                        today = datetime.now(ET).strftime("%Y-%m-%d")
-                        self.pdt.record_day_trade(sig.symbol, today, buy_order_id=str(order_id))
+                self._submit_stock_signal(item, ctx, news_sentiment)
 
         except Exception as e:
             log.error("stock_evaluate_failed", error=str(e), error_type=type(e).__name__)
-            import traceback
+
             log.debug("stock_evaluate_traceback", tb=traceback.format_exc())
+
+    def _submit_stock_signal(self, item: dict, ctx, news_sentiment: dict) -> None:
+        """Apply sentiment modifiers and submit a single stock order.
+
+        Extracted from _evaluate_and_trade() to keep the main loop readable.
+        Handles regime/news modifiers, conviction gating, dry-run mode,
+        and PDT tracking.
+        """
+        sig = item["signal"]
+        shares = item["shares"]
+
+        # Apply market regime modifier to conviction
+        original_conviction = sig.conviction
+        if ctx:
+            sig.conviction = min(1.0, sig.conviction * ctx.conviction_modifier)
+            shares = max(1, int(shares * ctx.position_size_modifier))
+
+        # Apply news sentiment modifier to conviction
+        ns = news_sentiment.get(sig.symbol)
+        if ns:
+            sig.conviction = min(1.0, sig.conviction * ns.conviction_modifier)
+            if ns.net_score < -0.5 and not ns.catalyst_detected:
+                log.info(
+                    "trade_blocked_by_news",
+                    symbol=sig.symbol,
+                    net_score=ns.net_score,
+                    headline=ns.top_headline[:80],
+                )
+                print(f"    SKIP {sig.symbol}: blocked by bearish news ({ns.net_score:+.2f})"
+                      f" — \"{ns.top_headline[:60]}\"")
+                self.db.update_signal_action(sig.symbol, sig.strategy_name, "blocked_bearish_news")
+                return
+
+        # Final conviction gate after all modifiers
+        if sig.conviction < 0.35:
+            log.info(
+                "trade_below_min_conviction",
+                symbol=sig.symbol,
+                conviction=sig.conviction,
+                original=original_conviction,
+            )
+            print(f"    SKIP {sig.symbol}: conviction too low after modifiers"
+                  f" ({original_conviction:.2f} -> {sig.conviction:.2f})")
+            self.db.update_signal_action(sig.symbol, sig.strategy_name, "rejected_low_conviction")
+            return
+
+        # Email alert for high-conviction signals (>= 0.70)
+        if sig.conviction >= 0.70:
+            notify_high_conviction_signal(
+                symbol=sig.symbol,
+                strategy=sig.strategy_name,
+                conviction=sig.conviction,
+                hold_type=sig.hold_type.value,
+                entry_price=sig.entry_price,
+                stop_loss=sig.stop_loss_price,
+                take_profit=sig.take_profit_price,
+            )
+
+        # Dry-run mode: log the signal but don't submit orders
+        if self.dry_run:
+            log.info(
+                "dry_run_stock_signal",
+                symbol=sig.symbol,
+                strategy=sig.strategy_name,
+                conviction=sig.conviction,
+                original_conviction=original_conviction,
+                hold_type=sig.hold_type.value,
+                shares=shares,
+                entry=sig.entry_price,
+                stop=sig.stop_loss_price,
+                target=sig.take_profit_price,
+                regime=ctx.regime.value if ctx else "unknown",
+                news_score=ns.net_score if ns else 0,
+            )
+            self.db.update_signal_action(sig.symbol, sig.strategy_name, "dry_run")
+            return
+
+        # Submit the bracket order to Alpaca
+        order_id = self.orders.submit_bracket_order(sig, shares)
+        if order_id:
+            self.db.update_signal_action(sig.symbol, sig.strategy_name, "executed")
+            trade_type = sig.hold_type.value.upper()
+            cost = shares * sig.entry_price
+            log.info(
+                "stock_order_submitted",
+                symbol=sig.symbol,
+                strategy=sig.strategy_name,
+                shares=shares,
+                order_id=order_id,
+            )
+            print(f"    >>> ORDER SUBMITTED: {sig.symbol} | {shares} shares @ ${sig.entry_price:.2f}"
+                  f" (${cost:.2f}) | {trade_type} | {sig.strategy_name}"
+                  f" | stop=${sig.stop_loss_price:.2f} target=${sig.take_profit_price:.2f}")
+            notify_stock_order(
+                symbol=sig.symbol,
+                strategy=sig.strategy_name,
+                shares=shares,
+                entry_price=sig.entry_price,
+                stop_loss=sig.stop_loss_price,
+                take_profit=sig.take_profit_price,
+                hold_type=sig.hold_type.value,
+                conviction=sig.conviction,
+                order_id=order_id,
+                cost=cost,
+            )
+            if self.pdt.would_be_day_trade(sig.hold_type):
+                today = datetime.now(ET).strftime("%Y-%m-%d")
+                self.pdt.record_day_trade(sig.symbol, today, buy_order_id=str(order_id))
+                print(f"    PDT slot used ({self.pdt.day_trades_remaining()} remaining)")
+        else:
+            self.db.update_signal_action(sig.symbol, sig.strategy_name, "order_failed")
+            log.warning(
+                "stock_order_failed",
+                symbol=sig.symbol,
+                strategy=sig.strategy_name,
+                shares=shares,
+            )
+            print(f"    ORDER FAILED: {sig.symbol} | {sig.strategy_name} | {shares} shares")
+            notify_stock_order_failed(
+                symbol=sig.symbol,
+                strategy=sig.strategy_name,
+                shares=shares,
+            )
 
     # ══════════════════════════════════════════════════════════
     # Core Logic: Options evaluation pipeline
@@ -705,16 +1106,40 @@ class TradingBot:
           6. Risk-check each signal
           7. Submit orders for approved signals
         """
-        # Gate: market regime must allow options
+        # Determine which options biases the current regime permits
         ctx = self._market_context
-        if ctx and not ctx.allow_options:
-            log.info("options_blocked_by_regime", regime=ctx.regime.value)
+        allowed_biases = ctx.allowed_options_biases if ctx else ("bullish", "bearish", "neutral", "adaptive")
+        if not allowed_biases:
+            log.info("options_blocked_by_regime", regime=ctx.regime.value if ctx else "unknown")
+            print(f"    Options: all biases blocked by {ctx.regime.value if ctx else 'unknown'} regime.")
             return
 
-        if not self._candidates or not self.options_strategies:
-            log.info("options_skip", candidates=len(self._candidates or []),
+        # Use the options-specific universe; fall back to stock candidates
+        candidates = self._options_candidates or self._candidates
+        if not candidates or not self.options_strategies:
+            log.info("options_skip", candidates=len(candidates or []),
                       strategies=len(self.options_strategies))
             return
+
+        # Log which biases are active so the operator can see what's running
+        regime_name = ctx.regime.value if ctx else "unknown"
+        eligible = [
+            type(s).__name__ for s in self.options_strategies
+            if s.enabled and getattr(s, "bias", "neutral") in allowed_biases
+        ]
+        if eligible:
+            print(f"    Options: {regime_name} regime allows [{', '.join(allowed_biases)}]"
+                  f" — running {len(eligible)} eligible strategies.")
+        else:
+            print(f"    Options: no eligible strategies for {regime_name} regime"
+                  f" (allowed biases: {', '.join(allowed_biases)}).")
+            return
+        log.info(
+            "options_regime_filter",
+            regime=regime_name,
+            allowed_biases=list(allowed_biases),
+            eligible_strategies=eligible,
+        )
 
         try:
             account = get_account()
@@ -745,10 +1170,18 @@ class TradingBot:
                 log.info("options_capital_exhausted")
                 return
 
-            max_single_risk = getattr(self.cfg.options, "max_single_options_risk", 100.0)
+            max_single_risk_pct = getattr(self.cfg.options, "max_single_options_risk_pct", 0.12)
+            max_single_risk = equity * max_single_risk_pct
+
+            # Skip underlyings we already have options positions on
+            held_underlyings = {t.get("underlying", "") for t in open_options}
+            candidates = [c for c in candidates if c["symbol"] not in held_underlyings]
+            if not candidates:
+                log.info("options_all_candidates_held")
+                return
 
             # Fetch daily bars for all candidates
-            symbols = [c["symbol"] for c in self._candidates]
+            symbols = [c["symbol"] for c in candidates]
             end = datetime.now(ET)
             start = end - timedelta(days=60)
 
@@ -759,110 +1192,176 @@ class TradingBot:
                     continue
                 try:
                     add_all(df, intraday=False)
-                except Exception:
+                except Exception as e:
+                    log.debug("options_indicator_failed", symbol=sym, error=str(e))
                     daily_bars[sym] = pd.DataFrame()
 
-            # Evaluate each candidate with each options strategy
-            for symbol in symbols:
-                # Stop if we've exhausted budget or positions
-                if options_budget <= 0 or len(open_options) >= max_opts:
+            # ── Phase 1: Collect all options signals ──────────────
+            all_options_signals = self._collect_options_signals(
+                symbols, daily_bars, allowed_biases
+            )
+
+            if not all_options_signals:
+                log.info("no_options_signals", candidates=len(symbols))
+                print(f"    Options: no signals generated from {len(symbols)} candidates.")
+                return
+
+            # ── Phase 2: Rank by expected ROI and submit ──────────
+            def _options_roi(sig):
+                """ROI = (max_profit / max_loss) * conviction. Higher is better."""
+                if sig.max_loss <= 0:
+                    return 0.0
+                raw_roi = sig.max_profit / sig.max_loss if sig.max_profit > 0 else 0.0
+                return raw_roi * sig.conviction
+
+            all_options_signals.sort(key=_options_roi, reverse=True)
+
+            log.info(
+                "options_signals_ranked",
+                total=len(all_options_signals),
+                top_3=[(s.underlying, s.strategy_name, round(_options_roi(s), 2))
+                       for s in all_options_signals[:3]],
+            )
+            for sig in all_options_signals[:5]:
+                roi = _options_roi(sig)
+                print(f"    Options signal: {sig.underlying} | {sig.strategy_name}"
+                      f" | ROI={roi:.1f}x | conv={sig.conviction:.2f}"
+                      f" | risk=${sig.max_loss:.2f} | reward=${sig.max_profit:.2f}")
+
+            positions_filled = 0
+            for signal in all_options_signals:
+                if options_budget <= 0 or len(open_options) + positions_filled >= max_opts:
                     break
 
-                bars = daily_bars.get(symbol)
-                if bars is None or bars.empty:
+                # Risk checks
+                if signal.max_loss > max_single_risk:
+                    log.info(
+                        "options_trade_too_risky",
+                        symbol=signal.underlying,
+                        strategy=signal.strategy_name,
+                        max_loss=signal.max_loss,
+                        max_single_risk=round(max_single_risk, 2),
+                    )
                     continue
 
-                # Fetch the options chain for this underlying stock
-                try:
-                    chain = get_options_chain(symbol)
-                    if not chain:
-                        continue
-                    # Limit to 50 contracts to avoid excessive API calls
-                    option_symbols = [c["symbol"] for c in chain[:50]]
-                    snapshots = get_options_snapshot(option_symbols)
-                except Exception as e:
-                    log.debug("options_chain_fetch_failed", symbol=symbol, error=str(e))
+                if signal.max_loss > options_budget:
                     continue
 
-                # Run each options strategy against this candidate
-                for strategy in self.options_strategies:
-                    if not strategy.enabled:
-                        continue
+                # Dry-run mode: log but don't execute
+                if self.dry_run:
+                    log.info(
+                        "dry_run_options_signal",
+                        underlying=signal.underlying,
+                        strategy=signal.strategy_name,
+                        conviction=signal.conviction,
+                        max_loss=signal.max_loss,
+                        max_profit=signal.max_profit,
+                        roi=round(_options_roi(signal), 2),
+                        legs=len(signal.legs),
+                        expiration=signal.expiration,
+                    )
+                    continue
 
-                    strat_name = type(strategy).__name__
-                    try:
-                        signal = strategy.evaluate(symbol, bars, chain, snapshots)
-                    except Exception as e:
-                        log.debug(
-                            "options_strategy_error",
-                            strategy=strat_name,
-                            symbol=symbol,
-                            error=str(e),
-                        )
-                        continue
-
-                    if signal is None:
-                        log.debug("options_no_signal", strategy=strat_name, symbol=symbol)
-                        continue
-
-                    # Risk checks for the options signal
-                    if signal.max_loss > max_single_risk:
-                        log.info(
-                            "options_trade_too_risky",
-                            symbol=symbol,
-                            strategy=signal.strategy_name,
-                            max_loss=signal.max_loss,
-                        )
-                        continue
-
-                    if signal.max_loss > options_budget:
-                        continue
-
-                    # Dry-run mode: log but don't execute
-                    if self.dry_run:
-                        log.info(
-                            "dry_run_options_signal",
-                            underlying=signal.underlying,
-                            strategy=signal.strategy_name,
-                            conviction=signal.conviction,
-                            max_loss=signal.max_loss,
-                            max_profit=signal.max_profit,
-                            legs=len(signal.legs),
-                            expiration=signal.expiration,
-                        )
-                        continue
-
-                    # Submit the options order to Alpaca
-                    order_id = self.options_orders.submit_options_order(signal)
-                    if order_id:
-                        log.info(
-                            "options_order_submitted",
-                            underlying=signal.underlying,
-                            strategy=signal.strategy_name,
-                            order_id=order_id,
-                        )
-                        # Record the trade in the options_trades table
-                        self.db.insert_options_trade(
-                            underlying=signal.underlying,
-                            strategy=signal.strategy_name,
-                            legs=json.dumps(signal.legs),
-                            qty=1,
-                            entry_credit=signal.min_credit if signal.min_credit > 0 else None,
-                            entry_debit=signal.max_cost if signal.max_cost > 0 else None,
-                            max_loss=signal.max_loss,
-                            max_profit=signal.max_profit,
-                            expiration=signal.expiration,
-                            strikes=json.dumps(signal.strikes),
-                            net_delta=signal.net_delta,
-                            net_theta=signal.net_theta,
-                            order_id=str(order_id),
-                        )
-                        # Deduct from budget and increment position count
-                        options_budget -= signal.max_loss
-                        open_options.append({})  # Increment count
+                # Submit the options order to Alpaca
+                order_id = self.options_orders.submit_options_order(signal)
+                if order_id:
+                    log.info(
+                        "options_order_submitted",
+                        underlying=signal.underlying,
+                        strategy=signal.strategy_name,
+                        order_id=order_id,
+                        roi=round(_options_roi(signal), 2),
+                    )
+                    print(f"    >>> OPTIONS ORDER: {signal.underlying} | {signal.strategy_name}"
+                          f" | {len(signal.legs)} leg(s)"
+                          f" | max_loss=${signal.max_loss:.2f}"
+                          f" | max_profit=${signal.max_profit:.2f}"
+                          f" | ROI={_options_roi(signal):.1f}x"
+                          f" | exp={signal.expiration}")
+                    notify_options_order(
+                        underlying=signal.underlying,
+                        strategy=signal.strategy_name,
+                        legs=len(signal.legs),
+                        max_loss=signal.max_loss,
+                        max_profit=signal.max_profit,
+                        roi=_options_roi(signal),
+                        conviction=signal.conviction,
+                        expiration=signal.expiration,
+                        order_id=str(order_id),
+                    )
+                    # Record the trade in the options_trades table
+                    self.db.insert_options_trade(
+                        underlying=signal.underlying,
+                        strategy=signal.strategy_name,
+                        legs=json.dumps(signal.legs),
+                        qty=1,
+                        entry_credit=signal.min_credit if signal.min_credit > 0 else None,
+                        entry_debit=signal.max_cost if signal.max_cost > 0 else None,
+                        max_loss=signal.max_loss,
+                        max_profit=signal.max_profit,
+                        expiration=signal.expiration,
+                        strikes=json.dumps(signal.strikes),
+                        net_delta=signal.net_delta,
+                        net_theta=signal.net_theta,
+                        order_id=str(order_id),
+                    )
+                    # Deduct from budget and increment position count
+                    options_budget -= signal.max_loss
+                    positions_filled += 1
 
         except Exception as e:
             log.error("options_evaluate_failed", error=str(e))
+            log.debug("options_evaluate_traceback", tb=traceback.format_exc())
+
+    def _collect_options_signals(
+        self, symbols: list[str], daily_bars: dict, allowed_biases: tuple
+    ) -> list:
+        """Iterate candidates × strategies and collect all passing options signals.
+
+        For each symbol: fetch the options chain, run every eligible strategy,
+        and collect signals that pass. Caches chain availability to skip
+        symbols known to have no options.
+        """
+        signals = []
+        for symbol in symbols:
+            bars = daily_bars.get(symbol)
+            if bars is None or bars.empty:
+                continue
+
+            if self.screener._options_chain_cache.get(symbol) is False:
+                continue
+
+            try:
+                chain = get_options_chain(symbol)
+                if not chain:
+                    self.screener._options_chain_cache[symbol] = False
+                    continue
+                self.screener._options_chain_cache[symbol] = True
+                option_symbols = [c["symbol"] for c in chain[:50]]
+                snapshots = get_options_snapshot(option_symbols)
+            except Exception as e:
+                log.debug("options_chain_fetch_failed", symbol=symbol, error=str(e))
+                continue
+
+            for strategy in self.options_strategies:
+                if not strategy.enabled:
+                    continue
+                strat_bias = getattr(strategy, "bias", "neutral")
+                if strat_bias not in allowed_biases:
+                    continue
+
+                strat_name = type(strategy).__name__
+                try:
+                    signal = strategy.evaluate(symbol, bars, chain, snapshots)
+                except Exception as e:
+                    log.debug("options_strategy_error", strategy=strat_name,
+                              symbol=symbol, error=str(e))
+                    continue
+
+                if signal is not None:
+                    signals.append(signal)
+
+        return signals
 
 
 # ══════════════════════════════════════════════════════════════
@@ -882,7 +1381,15 @@ def main():
     parser.add_argument("--dry-run", action="store_true", help="Log signals without submitting orders")
     args = parser.parse_args()
 
-    bot = TradingBot(config_path=args.config, dry_run=args.dry_run)
+    try:
+        bot = TradingBot(config_path=args.config, dry_run=args.dry_run)
+    except FileNotFoundError as e:
+        print(f"\n  FATAL: Config file not found — {e}")
+        print(f"  Create config/settings.yaml or pass --config <path>.")
+        sys.exit(1)
+    except Exception as e:
+        print(f"\n  FATAL: Could not initialize TradingBot — {e}")
+        sys.exit(1)
 
     # Register signal handlers for graceful shutdown.
     # SIGINT = Ctrl+C, SIGTERM = kill command.
@@ -893,7 +1400,25 @@ def main():
     signal.signal(signal.SIGINT, _shutdown)
     signal.signal(signal.SIGTERM, _shutdown)
 
-    bot.start()
+    try:
+        bot.start()
+    except SystemExit:
+        raise  # Let sys.exit() through
+    except Exception as e:
+        # Last-resort handler — if something completely unexpected crashes
+        # the bot, log it and exit cleanly rather than showing a raw traceback.
+        print(f"\n  FATAL UNHANDLED ERROR: {type(e).__name__}: {e}")
+        try:
+            log.error("fatal_unhandled_error", error=str(e), error_type=type(e).__name__)
+
+            log.error("fatal_traceback", tb=traceback.format_exc())
+        except Exception:
+            pass
+        try:
+            bot.stop()
+        except Exception:
+            pass
+        sys.exit(1)
 
 
 if __name__ == "__main__":

@@ -67,6 +67,8 @@ class CreditPutSpreadStrategy(BaseOptionsStrategy):
     requires implementing the ``evaluate()`` method.
     """
 
+    bias = "bullish"
+
     # ------------------------------------------------------------------
     # evaluate
     # ------------------------------------------------------------------
@@ -241,24 +243,19 @@ class CreditPutSpreadStrategy(BaseOptionsStrategy):
         # ------------------------------------------------------------------
         # Start with a moderate base conviction of 0.6 (this strategy is
         # inherently high-probability).
-        conviction: float = 0.6
+        conviction: float = 0.55
         # Boost if RSI confirms bullish momentum (above neutral 50).
         if rsi > 50:
-            conviction += 0.1
+            conviction += 0.10
         # Boost if credit/width ratio is strong (>33% of max risk as premium).
         if credit_received / spread_width > 0.33:
-            conviction += 0.1
-        # Net theta: the short put's theta minus the long put's theta.
-        # Positive net theta means time decay is working in our favor.
-        # Theta for puts is typically negative; the seller benefits because
-        # they want the put to lose value (decay toward zero).
-        net_theta: float = short_put["_theta"] - abs(long_put["_theta"])
+            conviction += 0.10
+        # Net theta: sum of both legs' theta.
+        # Positive net theta means time decay benefits the spread overall.
+        net_theta: float = short_put["_theta"] + long_put["_theta"]
         if net_theta > 0:
-            conviction += 0.1
-        # Clamp conviction to [0.5, 1.0] range.
-        # ``max(0.5, min(1.0, conviction))`` is Python's way of clamping:
-        # first cap at 1.0, then floor at 0.5.
-        conviction = max(0.5, min(1.0, conviction))
+            conviction += 0.05
+        conviction = max(0.45, min(0.85, conviction))
 
         # ------------------------------------------------------------------
         # 6. Build and return the trade signal

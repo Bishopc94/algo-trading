@@ -72,6 +72,8 @@ class LongPutStrategy(BaseOptionsStrategy):
     price below both EMAs, RSI < 40, and a new 20-day low on volume.
     """
 
+    bias = "bearish"
+
     def evaluate(
         self,
         underlying: str,

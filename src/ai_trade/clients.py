@@ -14,12 +14,13 @@ Python-specific notes:
   - Module-level variables (``_trading_client``, etc.) persist for the
     lifetime of the process — they act like static fields in other languages.
 
-There are three types of Alpaca clients:
+There are four types of Alpaca clients:
   1. **TradingClient** — submits/cancels orders, fetches account info and
      positions.
   2. **StockHistoricalDataClient** — fetches historical OHLCV bars, quotes,
      and snapshots.
-  3. **StockDataStream** — WebSocket connection for real-time streaming bars.
+  3. **NewsClient** — fetches news articles for sentiment analysis.
+  4. **StockDataStream** — WebSocket connection for real-time streaming bars.
      Unlike the other two, streaming clients are NOT cached because each
      WebSocket connection is a separate session.
 """
@@ -28,6 +29,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+from alpaca.data import NewsClient
 from alpaca.data.historical.stock import StockHistoricalDataClient
 from alpaca.data.live.stock import StockDataStream
 from alpaca.trading.client import TradingClient
@@ -40,6 +42,7 @@ log = get_logger(__name__)
 # Starting as None ensures a clear error if someone forgets to initialise.
 _trading_client: TradingClient | None = None
 _data_client: StockHistoricalDataClient | None = None
+_news_client: NewsClient | None = None
 _cfg: SimpleNamespace | None = None  # Cached config for creating stream clients
 
 
@@ -55,7 +58,7 @@ def init_clients(cfg: SimpleNamespace) -> None:
              Must have ``cfg.alpaca.api_key``, ``cfg.alpaca.secret_key``,
              and ``cfg.alpaca.paper`` (True for paper trading).
     """
-    global _trading_client, _data_client, _cfg
+    global _trading_client, _data_client, _news_client, _cfg
     _cfg = cfg
 
     # TradingClient handles order submission, account queries, position queries.
@@ -69,6 +72,12 @@ def init_clients(cfg: SimpleNamespace) -> None:
     # and snapshots.  It does NOT require the paper flag because market data
     # is the same for paper and live accounts.
     _data_client = StockHistoricalDataClient(
+        cfg.alpaca.api_key, cfg.alpaca.secret_key,
+    )
+
+    # NewsClient handles fetching news articles for sentiment analysis.
+    # Separate from StockHistoricalDataClient — news lives on its own endpoint.
+    _news_client = NewsClient(
         cfg.alpaca.api_key, cfg.alpaca.secret_key,
     )
     log.info("clients_initialized", paper=cfg.alpaca.paper)
@@ -86,6 +95,13 @@ def get_data_client() -> StockHistoricalDataClient:
     if _data_client is None:
         raise RuntimeError("Call init_clients(cfg) before using get_data_client()")
     return _data_client
+
+
+def get_news_client() -> NewsClient:
+    """Return the cached NewsClient (for fetching news articles)."""
+    if _news_client is None:
+        raise RuntimeError("Call init_clients(cfg) before using get_news_client()")
+    return _news_client
 
 
 def get_stream_client(cfg: SimpleNamespace | None = None) -> StockDataStream:

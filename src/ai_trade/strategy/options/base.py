@@ -406,6 +406,13 @@ class BaseOptionsStrategy(ABC):
       field defined.
     """
 
+    # Directional bias — subclasses MUST override this.
+    # "bullish"  = profits when underlying rises (long call, debit call spread, credit put spread)
+    # "bearish"  = profits when underlying falls (long put)
+    # "neutral"  = profits in range-bound / flat markets (covered call, cash-secured put, covered straddle)
+    # "adaptive" = follows the prevailing direction (momentum options)
+    bias: str = "neutral"
+
     def __init__(self, config):
         self.config = config
         # ``getattr(config, "enabled", True)`` -- see docstring above.

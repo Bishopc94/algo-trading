@@ -49,16 +49,12 @@ Key Concepts in This File
 - **Don't sell calls when the stock is running**: If the stock is >5% above
   EMA-20, it's in a strong rally and selling calls would cap attractive upside.
 
-Note: This file does NOT use the shared ``filter_contracts`` / ``enrich_greeks``
-utilities from base.py. It implements its own inline filtering and enrichment,
-possibly because it was written before those utilities existed, or because the
-covered call has slightly different enrichment needs (reads delta/theta from
-the snapshot root instead of a nested "greeks" dict).
+Note: This file was refactored to use the shared ``filter_contracts`` /
+``enrich_greeks`` / ``select_by_delta`` utilities from base.py, ensuring
+consistent greeks extraction across all strategies.
 """
 
 from __future__ import annotations
-
-from datetime import datetime, timezone
 
 import pandas as pd
 
@@ -68,6 +64,9 @@ from ai_trade.strategy.options.base import (
     BaseOptionsStrategy,
     OptionsSignal,
     OptionsStrategyType,
+    enrich_greeks,
+    filter_contracts,
+    select_by_delta,
 )
 
 log = get_logger(__name__)
@@ -79,6 +78,8 @@ class CoveredCallStrategy(BaseOptionsStrategy):
     Precondition: the caller should only invoke this strategy for tickers
     where the account already holds >= 100 shares.
     """
+
+    bias = "neutral"
 
     def evaluate(
         self,
@@ -117,10 +118,10 @@ class CoveredCallStrategy(BaseOptionsStrategy):
         price: float = latest["close"]
         ema_20: float = latest.get("ema_20", price)
 
-        # Entry condition 1: RSI 40-65 (neutral to mildly bullish).
-        # Below 40 = bearish, selling calls doesn't help much if stock is falling.
-        # Above 65 = stock might rally hard, selling calls caps attractive upside.
-        if not (40 <= rsi <= 65):
+        # Entry condition 1: RSI 45-70 (neutral to mildly bullish).
+        # Below 45 = bearish, selling calls doesn't help if stock is falling.
+        # Above 70 = stock might rally hard, selling calls caps attractive upside.
+        if not (45 <= rsi <= 70):
             return None
         # Entry condition 2: Don't sell calls when the stock is running.
         # If price is >5% above EMA-20, the stock is in a strong rally and we'd
@@ -134,70 +135,28 @@ class CoveredCallStrategy(BaseOptionsStrategy):
         # ------------------------------------------------------------------
         # Select contract -- OTM call, 20-45 DTE
         # ------------------------------------------------------------------
-        # NOTE: This section does inline contract filtering instead of using
-        # the shared ``filter_contracts`` utility. It loops through the chain,
-        # parses expiration dates, and computes DTE manually.
-        now = datetime.now(tz=timezone.utc)
-        eligible_calls: list[dict] = []
-        for contract in chain_data:
-            # Skip non-call contracts.
-            if contract.get("type", "").lower() != "call":
-                continue
-            # Parse expiration date string into a datetime object.
-            exp_str = contract.get("expiration_date") or contract.get("expiration", "")
-            try:
-                exp_dt = datetime.fromisoformat(exp_str).replace(tzinfo=timezone.utc) if exp_str else None
-            except (ValueError, TypeError):
-                continue
-            if exp_dt is None:
-                continue
-            # Compute DTE (days to expiration) and filter by our DTE window.
-            dte = (exp_dt - now).days
-            if min_dte <= dte <= max_dte:
-                contract["_dte"] = dte
-                eligible_calls.append(contract)
-
+        eligible_calls = filter_contracts(chain_data, "call", min_dte, max_dte)
         if not eligible_calls:
             return None
 
-        # Enrich each eligible call with greeks and pricing from snapshots.
-        # NOTE: This reads delta/theta directly from the snapshot root level
-        # (snap.get("delta")), unlike the shared ``enrich_greeks`` which reads
-        # from a nested "greeks" dict (snap.get("greeks", {}).get("delta")).
-        # This difference may be due to a different snapshot format for this
-        # particular broker endpoint.
-        for c in eligible_calls:
-            sym = c.get("symbol", "")
-            snap = snapshots.get(sym, {})
-            c["_delta"] = snap.get("delta", 0.0)
-            c["_theta"] = snap.get("theta", 0.0)
-            # Use bid price since we're SELLING the call.
-            c["_bid"] = snap.get("bid", 0.0) or 0.0
-            c["_strike"] = float(c.get("strike_price") or c.get("strike", 0))
+        enrich_greeks(eligible_calls, snapshots)
 
-        # --- OTM call selection ---
-        # OTM calls have a strike ABOVE the current price (the stock must
-        # rise before these calls have intrinsic value).
-        # Primary filter: delta 0.20-0.40 range (sweet spot for covered calls).
+        # OTM calls only: strike above current price, delta 0.20-0.40.
         delta_candidates = [
             c for c in eligible_calls
-            if c["_strike"] > price and 0.20 <= c["_delta"] <= 0.40
+            if c["_strike"] > price and 0.20 <= abs(c["_delta"]) <= 0.40
         ]
         if not delta_candidates:
-            # Fallback: any OTM call with positive delta.
             delta_candidates = [
                 c for c in eligible_calls
-                if c["_strike"] > price and c["_delta"] > 0
+                if c["_strike"] > price and abs(c["_delta"]) > 0
             ]
         if not delta_candidates:
             return None
 
-        # ``min(..., key=lambda c: abs(c["_delta"] - target_delta))`` picks
-        # the contract whose delta is closest to our target (0.30).
-        # ``lambda`` creates an anonymous function that computes the distance
-        # between each contract's delta and the target. ``min`` returns the
-        # contract with the smallest distance.
-        selected = min(delta_candidates, key=lambda c: abs(c["_delta"] - target_delta))
+        selected = select_by_delta(delta_candidates, target_delta)
+        if selected is None:
+            return None
 
         strike: float = selected["_strike"]
         dte: int = selected["_dte"]
@@ -225,19 +184,18 @@ class CoveredCallStrategy(BaseOptionsStrategy):
         # ------------------------------------------------------------------
         # Conviction scoring
         # ------------------------------------------------------------------
-        conviction: float = 0.6
-        # Better annualized return boosts conviction.
+        # Base conviction lowered to 0.50 — covered calls tie up 100 shares,
+        # so on a $500 account they use most of the capital.
+        conviction: float = 0.50
         if annualized_return > 0.20:
-            conviction += 0.1
+            conviction += 0.10
         # RSI in the sweet spot (45-55): truly neutral, ideal for covered calls.
         if 45 <= rsi <= 55:
-            conviction += 0.1
-        # Theta < 0 for the option we sold means the option is decaying
-        # (losing value over time). Since we're short the option, this is
-        # good for us -- we profit from time decay.
-        if selected["_theta"] < 0:  # Theta works in our favor (we're short)
-            conviction += 0.1
-        conviction = max(0.5, min(1.0, conviction))
+            conviction += 0.10
+        # Theta < 0 means the call is decaying — good for us as the seller.
+        if selected["_theta"] < 0:
+            conviction += 0.05
+        conviction = max(0.45, min(0.80, conviction))
 
         call_symbol: str = selected.get("symbol", "")
         expiration: str = selected.get("expiration_date") or selected.get("expiration", "")

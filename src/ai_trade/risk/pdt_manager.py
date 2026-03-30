@@ -70,21 +70,58 @@ class PDTManager:
         # across bot restarts.
         self._database = database
 
+        # Alpaca's server-side PDT count — synced at startup and before trades.
+        # This is the authoritative count; our local DB is a backup.
+        self._alpaca_daytrade_count: int | None = None
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
-    def get_day_trades_used(self) -> int:
-        """Count day trades recorded in the last 5 business days.
+    def sync_with_alpaca(self) -> None:
+        """Sync our PDT count with Alpaca's server-side count.
 
-        Queries the database for any day-trade records with a trade_date
-        on or after the date that is 5 business days ago.  Returns the
-        count of matching records.
+        Alpaca independently tracks day trades.  If the bot was restarted,
+        or trades were made outside the bot, our local DB count may be
+        stale.  Alpaca's count is authoritative — if it's higher than
+        ours, we trust Alpaca.
         """
-        cutoff = self._five_business_days_ago()
+        try:
+            from ai_trade.clients import get_account
+            account = get_account()
+            self._alpaca_daytrade_count = int(account.daytrade_count)
+            local_count = self._get_local_day_trades_used()
+            if self._alpaca_daytrade_count != local_count:
+                logger.warning(
+                    "pdt_count_mismatch",
+                    alpaca_count=self._alpaca_daytrade_count,
+                    local_count=local_count,
+                    using="alpaca (authoritative)",
+                )
+            else:
+                logger.debug(
+                    "pdt_synced",
+                    count=self._alpaca_daytrade_count,
+                )
+        except Exception as e:
+            logger.warning("pdt_sync_failed", error=str(e))
 
-        # .isoformat() converts a Python date object to a string like
-        # "2025-06-01", which matches the TEXT format stored in SQLite.
+    def get_day_trades_used(self) -> int:
+        """Return the higher of Alpaca's count and our local count.
+
+        Alpaca's server-side count is authoritative.  We take the max
+        of both to be conservative — if either source says we've used
+        a slot, we respect that.
+        """
+        local = self._get_local_day_trades_used()
+        alpaca = self._alpaca_daytrade_count
+        if alpaca is not None:
+            return max(local, alpaca)
+        return local
+
+    def _get_local_day_trades_used(self) -> int:
+        """Count day trades recorded in our local DB in the last 5 business days."""
+        cutoff = self._five_business_days_ago()
         trades = self._database.get_day_trades_since(cutoff.isoformat())
         return len(trades)
 

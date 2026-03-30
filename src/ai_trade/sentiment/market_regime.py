@@ -10,7 +10,7 @@ WHAT THIS MODULE DOES:
     - conviction_modifier:     scales signal quality scores (0.3 to 1.3)
     - position_size_modifier:  scales position sizes (0.25 to 1.0)
     - allow_new_longs:         hard gate on new long positions
-    - allow_options:           hard gate on options strategies
+    - allowed_options_biases:  which options biases are permitted per regime
 
 WHY IT EXISTS:
     Individual stock signals don't exist in a vacuum.  A great-looking
@@ -129,7 +129,7 @@ class MarketContext:
     conviction_modifier: float   # Multiply strategy conviction by this (0.0 - 1.5)
     position_size_modifier: float  # Multiply position size by this (0.0 - 1.0)
     allow_new_longs: bool        # Whether new long positions are permitted
-    allow_options: bool          # Whether options strategies are permitted
+    allowed_options_biases: tuple[str, ...]  # Which strategy biases are allowed ("bullish", "bearish", "neutral", "adaptive")
 
     # Underlying data used to derive the regime — stored for logging and debugging.
     spy_trend: str       # "up", "down", or "sideways"
@@ -425,31 +425,31 @@ class MarketRegimeAnalyzer:
                 "conviction_modifier": 1.3,        # +30% conviction boost
                 "position_size_modifier": 1.0,     # Full position sizes
                 "allow_new_longs": True,
-                "allow_options": True,
+                "allowed_options_biases": ("bullish", "neutral", "adaptive"),
             },
             MarketRegime.BULL: {
                 "conviction_modifier": 1.1,        # +10% conviction boost
                 "position_size_modifier": 1.0,     # Full position sizes
                 "allow_new_longs": True,
-                "allow_options": True,
+                "allowed_options_biases": ("bullish", "neutral", "adaptive"),
             },
             MarketRegime.NEUTRAL: {
                 "conviction_modifier": 0.9,        # -10% conviction penalty
                 "position_size_modifier": 0.75,    # 75% position sizes
                 "allow_new_longs": True,
-                "allow_options": True,
+                "allowed_options_biases": ("bullish", "bearish", "neutral", "adaptive"),
             },
             MarketRegime.BEAR: {
                 "conviction_modifier": 0.6,        # -40% conviction penalty
                 "position_size_modifier": 0.5,     # Half position sizes
                 "allow_new_longs": True,           # Only high conviction gets through
-                "allow_options": False,            # No options — too risky
+                "allowed_options_biases": ("bearish", "adaptive"),  # Only bearish/adaptive options
             },
             MarketRegime.STRONG_BEAR: {
                 "conviction_modifier": 0.3,        # -70% conviction penalty (nearly kills all signals)
                 "position_size_modifier": 0.25,    # Quarter position sizes
                 "allow_new_longs": False,          # Hard stop on new longs
-                "allow_options": False,
+                "allowed_options_biases": ("bearish",),  # Only pure bearish options
             },
         }
 
@@ -476,7 +476,7 @@ class MarketRegimeAnalyzer:
             conviction_modifier=mods["conviction_modifier"],
             position_size_modifier=mods["position_size_modifier"],
             allow_new_longs=mods["allow_new_longs"],
-            allow_options=mods["allow_options"],
+            allowed_options_biases=mods["allowed_options_biases"],
             spy_trend=spy_trend,
             spy_rsi=spy_rsi,
             spy_above_20ema=spy_above_20,

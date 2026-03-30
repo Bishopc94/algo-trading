@@ -114,6 +114,8 @@ from zoneinfo import ZoneInfo
 import pandas as pd  # Pandas: tabular data library (DataFrames = tables with typed columns)
 
 from ai_trade.backtest.options_pricing import (
+    bs_call_price,              # Black-Scholes call pricing for MTM
+    bs_put_price,               # Black-Scholes put pricing for MTM
     generate_synthetic_chain,   # Creates fake-but-realistic options chains
     historical_volatility,      # Computes annualized vol from price history
     price_option_at_expiration, # Intrinsic value at expiration
@@ -262,7 +264,7 @@ class BacktestConfig:
     """
 
     starting_capital: float = 500.0       # Initial cash in the simulated account
-    max_position_pct: float = 0.30        # Max 30% of equity in a single stock position
+    max_position_pct: float = 0.25        # Max 25% of equity in a single stock position
     max_risk_per_trade_pct: float = 0.02  # Risk at most 2% of equity per trade (distance to stop)
     max_open_positions: int = 4           # Diversification limit
     daily_loss_limit_pct: float = 0.05    # Circuit breaker: stop trading if down 5% today
@@ -276,10 +278,11 @@ class BacktestConfig:
     use_market_regime: bool = True        # Enable market regime analysis (bullish/bearish gating)
     # Options-specific limits
     max_options_positions: int = 3        # Max concurrent options positions
-    max_options_capital_pct: float = 0.40 # Max 40% of equity allocated to options
-    max_single_options_risk_pct: float = 0.08  # Max 8% equity at risk per options trade
+    max_options_capital_pct: float = 0.50 # Max 50% of equity allocated to options
+    max_single_options_risk_pct: float = 0.12  # Max 12% equity at risk per options trade
     options_profit_target_pct: float = 0.50  # Close options at 50% of max profit
     options_loss_limit_pct: float = 2.0   # Close options when loss = 2x entry cost
+    options_slippage_pct: float = 0.003  # 0.3% options slippage (wider than stock 0.1%)
 
 
 # ── Core engine ────────────────────────────────────────────
@@ -326,6 +329,8 @@ class BacktestEngine:
         self._snapshots: list[DailySnapshot] = []             # End-of-day equity snapshots
         self._day_trade_dates: list[str] = []                 # Dates of day trades (for PDT counting)
         self._starting_equity_today: float = 0.0              # Equity at start of current day
+        self._pending_stock_orders: list[tuple] = []          # (Signal, shares) queued for next-bar fill
+        self._vol_cache: dict[str, float] = {}                # Per-symbol-per-day volatility cache
 
     # ── Public API ──────────────────────────────────────────
 
@@ -447,11 +452,20 @@ class BacktestEngine:
         for date_str in all_dates:
             self._process_day(date_str, enriched, enriched_market)
 
+        # Drop any unfilled pending orders (no next bar to fill against)
+        self._pending_stock_orders.clear()
+
         # ---- Step 5: Force-close all remaining positions at the last day's price ----
         # A real trader would still hold these, but for performance measurement
         # we need to mark them to market and realize the P&L.
         self._close_all_positions(all_dates[-1], enriched, reason="backtest_end")
         self._close_all_options(all_dates[-1], enriched, reason="backtest_end")
+
+        # Take a final snapshot AFTER force-closing so ending_equity matches
+        # total_pnl.  Without this, the last snapshot is from _process_day()
+        # (before force-close), creating a mismatch.
+        self._equity_cache.clear()
+        self._take_snapshot(all_dates[-1], enriched)
 
         results = BacktestResults(
             trades=self._trades,
@@ -478,6 +492,8 @@ class BacktestEngine:
         self._day_trade_dates = []
         self._starting_equity_today = self.cfg.starting_capital
         self._equity_cache: dict[str, float] = {}  # Memoization cache: date_str -> equity value
+        self._vol_cache: dict[str, float] = {}    # Per-symbol-per-day volatility cache
+        self._pending_stock_orders = []            # Queued signals for next-bar fill
         self._open_symbols: set[str] = set()  # Fast O(1) lookup for "do we hold this symbol?"
 
     def _equity(self, date_str: str, bars_dict: dict[str, pd.DataFrame]) -> float:
@@ -509,37 +525,53 @@ class BacktestEngine:
         for opt_pos in self._options_positions:
             stock_price = self._get_close(opt_pos.underlying, date_str, bars_dict)
             if stock_price is not None:
-                current_val = self._options_mark_to_market(opt_pos, stock_price, date_str)
+                current_val = self._options_mark_to_market(opt_pos, stock_price, date_str, bars_dict)
                 mkt_value += current_val
 
         eq = self._cash + mkt_value
         self._equity_cache[date_str] = eq  # Store in cache
         return eq
 
-    def _options_mark_to_market(
-        self, pos: OptionsBacktestPosition, stock_price: float, date_str: str
+    def _get_vol(
+        self, symbol: str, date_str: str, bars_dict: dict[str, pd.DataFrame]
     ) -> float:
-        """Estimate the current market value of an options position.
+        """Get historical volatility for a symbol, cached per day."""
+        cache_key = f"{symbol}:{date_str}"
+        cached = self._vol_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        bars_to_date = self._bars_up_to(symbol, date_str, bars_dict)
+        if bars_to_date is None or len(bars_to_date) < 10:
+            vol = 0.30  # Fallback: 30% annualized
+        else:
+            vol = historical_volatility(bars_to_date["close"])
+            if vol <= 0:
+                vol = 0.30
+        self._vol_cache[cache_key] = vol
+        return vol
 
-        SIMPLIFICATION: Rather than re-running full Black-Scholes pricing every
-        day (which would be computationally expensive and require volatility
-        re-estimation), this uses a simplified model:
+    def _options_mark_to_market(
+        self,
+        pos: OptionsBacktestPosition,
+        stock_price: float,
+        date_str: str,
+        bars_dict: dict[str, pd.DataFrame],
+    ) -> float:
+        """Compute current market value of an options position using Black-Scholes.
 
-            value = intrinsic_value + time_value_remaining
+        Each leg is repriced using the BS formula with today's stock price and
+        historical volatility.  This naturally handles:
+        - Non-linear theta decay (accelerates near expiration)
+        - Delta/gamma sensitivity to stock price moves
+        - Spread value bounding (a credit spread's cost-to-close cannot exceed
+          the spread width because BS prices are bounded by intrinsic value)
 
-        Where:
-        - intrinsic_value: What the option is worth if exercised right now
-          (computed per-leg, accounting for buy/sell sides)
-        - time_value_remaining: A linear decay of the estimated extrinsic
-          (time) value at entry.  Approximates theta decay.
-
-        In reality, theta decay is non-linear (accelerates near expiration),
-        but linear decay is adequate for backtesting purposes.
+        At expiration (T=0), BS returns intrinsic value, matching settlement.
 
         Returns:
-            Estimated market value in dollars (total across all contracts).
+            Net market value in dollars (total across all contracts).
+            Positive = asset (long positions), negative = liability (short positions).
         """
-        # Parse expiration and current dates to compute days-to-expiration (DTE)
         try:
             exp_dt = datetime.strptime(pos.expiration, "%Y-%m-%d")
             cur_dt = datetime.strptime(date_str, "%Y-%m-%d")
@@ -547,38 +579,30 @@ class BacktestEngine:
         except ValueError:
             dte = 0
 
-        # time_decay_factor: 1.0 at entry, decays linearly to 0.0 at expiration
-        entry_dt = datetime.strptime(pos.entry_date, "%Y-%m-%d")
-        original_dte = max(1, (exp_dt - entry_dt).days)  # Avoid division by zero
-        time_decay_factor = dte / original_dte
+        T = dte / 365.0
+        r = 0.045  # Risk-free rate (US Treasury ~4.5%)
+        vol = self._get_vol(pos.underlying, date_str, bars_dict)
 
-        # Calculate intrinsic value of each leg of the position.
-        # For multi-leg strategies (e.g., credit spread = one sold put + one bought put),
-        # we sum the intrinsic values with appropriate signs.
-        total_intrinsic = 0.0
+        total_per_share = 0.0
         for leg in pos.legs:
             strike = leg["strike"]
-            opt_type = leg["type"]    # "call" or "put"
-            side = leg["side"]        # "buy" (long) or "sell" (short)
+            opt_type = leg["type"]
+            side = leg["side"]
 
-            # Intrinsic value as if at expiration
-            intrinsic = price_option_at_expiration(opt_type, strike, stock_price)
+            if T <= 0:
+                # At expiration: intrinsic value only
+                price = price_option_at_expiration(opt_type, strike, stock_price)
+            elif opt_type == "call":
+                price = bs_call_price(stock_price, strike, T, r, vol)
+            else:
+                price = bs_put_price(stock_price, strike, T, r, vol)
 
             if side == "buy":
-                total_intrinsic += intrinsic   # Long legs add value
+                total_per_share += price
             else:
-                total_intrinsic -= intrinsic   # Short legs subtract value
+                total_per_share -= price
 
-        # Estimate remaining time value.
-        # Heuristic: ~30% of the entry cost was extrinsic (time) value.
-        # This fraction decays linearly to zero by expiration.
-        extrinsic_at_entry = abs(pos.entry_cost) * 0.3
-        time_value = extrinsic_at_entry * time_decay_factor
-
-        # Total value per contract, then multiply by 100 (shares per contract)
-        # and number of contracts.
-        value_per_contract = total_intrinsic + time_value
-        return value_per_contract * 100 * pos.contracts
+        return total_per_share * 100 * pos.contracts
 
     def _get_close(
         self, symbol: str, date_str: str, bars_dict: dict[str, pd.DataFrame]
@@ -685,11 +709,18 @@ class BacktestEngine:
         4. Close end-of-day day-trade positions
         5. Take end-of-day snapshot (equity curve data point)
         """
-        # Invalidate equity cache -- positions will change during today's processing
+        # Invalidate equity and volatility caches for the new day
         self._equity_cache.clear()
+        self._vol_cache.clear()
+
+        # 0a. Fill yesterday's pending stock orders at today's open price.
+        #     This eliminates lookahead bias: signals are generated at EOD,
+        #     but fills happen at the NEXT bar's open (realistic execution).
+        self._fill_pending_orders(date_str, bars_dict)
+
         self._starting_equity_today = self._equity(date_str, bars_dict)
 
-        # 0. Update market regime analysis (determines if we allow new longs)
+        # 0b. Update market regime analysis (determines if we allow new longs)
         if self._regime_analyzer and market_bars:
             self._update_regime(date_str, market_bars)
 
@@ -700,6 +731,9 @@ class BacktestEngine:
         # 1b. Check options positions for expiration or profit/loss triggers
         if self._options_positions:
             self._check_options_exits(date_str, bars_dict)
+
+        # Invalidate equity cache after exits — freed cash changes equity.
+        self._equity_cache.clear()
 
         # 2. Daily loss limit circuit breaker: if we've lost more than the threshold
         #    today (e.g., 5% of starting equity), stop all trading for the day.
@@ -776,13 +810,16 @@ class BacktestEngine:
             # at the stop price.  In real markets, stops are not guaranteed to fill
             # at the stop price (gaps can occur), but this is a standard simplification.
             if bar["low"] <= pos.stop_loss:
-                exit_price = pos.stop_loss
+                # Gap-aware fill: if open is already below stop, the stock
+                # gapped down and we fill at the open (not the stop price).
+                exit_price = min(bar["open"], pos.stop_loss)
                 exit_reason = "stop_loss"
 
             # ---- Take profit check ----
             # If the day's high reached the target, assume we got filled at the target.
             elif bar["high"] >= pos.take_profit:
-                exit_price = pos.take_profit
+                # Gap-aware fill: if open is already above target, fill at open.
+                exit_price = max(bar["open"], pos.take_profit)
                 exit_reason = "take_profit"
 
             else:
@@ -828,6 +865,87 @@ class BacktestEngine:
         # would shift index 3 to 2, causing us to remove the wrong position.
         for i in sorted(closed_indices, reverse=True):
             self._positions.pop(i)
+
+    def _fill_pending_orders(self, date_str: str, bars_dict: dict[str, pd.DataFrame]) -> None:
+        """Fill yesterday's queued stock orders at today's open price.
+
+        This method implements realistic fill simulation: strategies generate
+        signals at end-of-day, but orders execute at the NEXT bar's open.
+        This eliminates lookahead bias (the most common backtesting error).
+        """
+        if not self._pending_stock_orders:
+            return
+
+        carried = []
+        for sig, shares in self._pending_stock_orders:
+            bar = self._get_bar(sig.symbol, date_str, bars_dict)
+            if bar is None:
+                carried.append((sig, shares))  # No data today, carry forward
+                continue
+
+            # Fill at today's open + slippage
+            open_price = bar["open"]
+            slippage = open_price * self.cfg.slippage_pct
+            fill_price = open_price + slippage
+
+            # Volume validation: cap at 25% of daily volume
+            if bar.get("volume", 0) > 0:
+                max_fill = int(bar["volume"] * 0.25)
+                if max_fill <= 0:
+                    continue  # Too illiquid to fill
+                shares = min(shares, max_fill)
+
+            # Re-check cash at fill time (may have changed since signal day)
+            cost = shares * fill_price
+            if cost > self._cash:
+                shares = math.floor(self._cash / fill_price)
+                if shares <= 0:
+                    continue
+                cost = shares * fill_price
+
+            # Skip if already at position limit
+            if len(self._positions) >= self.cfg.max_open_positions:
+                break
+            # Skip if we now hold this symbol (opened via another pending order)
+            if any(p.symbol == sig.symbol for p in self._positions):
+                continue
+
+            # Recalculate stop/target proportionally for the new fill price.
+            # The risk/reward RATIO stays the same, but absolute levels shift.
+            original_risk = sig.entry_price - sig.stop_loss_price
+            original_reward = sig.take_profit_price - sig.entry_price
+            if sig.entry_price > 0 and original_risk > 0:
+                risk_pct = original_risk / sig.entry_price
+                reward_pct = original_reward / sig.entry_price
+                new_stop = fill_price * (1 - risk_pct)
+                new_target = fill_price * (1 + reward_pct)
+            else:
+                new_stop = sig.stop_loss_price
+                new_target = sig.take_profit_price
+
+            self._cash -= cost
+            self._positions.append(
+                BacktestPosition(
+                    symbol=sig.symbol,
+                    shares=shares,
+                    entry_price=fill_price,
+                    entry_date=date_str,
+                    stop_loss=new_stop,
+                    take_profit=new_target,
+                    hold_type=sig.hold_type,
+                    strategy_name=sig.strategy_name,
+                )
+            )
+            log.debug(
+                "backtest_entry",
+                symbol=sig.symbol,
+                strategy=sig.strategy_name,
+                shares=shares,
+                price=fill_price,
+                date=date_str,
+            )
+
+        self._pending_stock_orders = carried
 
     def _evaluate_entries(self, date_str: str, bars_dict: dict[str, pd.DataFrame]) -> None:
         """Run all strategies on all symbols and enter new positions for qualifying signals.
@@ -930,44 +1048,10 @@ class BacktestEngine:
                 if sig.conviction < 0.35:
                     continue  # Regime filter killed this signal
 
-            # ---- Apply slippage to entry price ----
-            # Slippage simulates the real-world cost of market impact: you
-            # typically get filled slightly ABOVE the expected price when buying.
-            slippage = sig.entry_price * self.cfg.slippage_pct
-            fill_price = sig.entry_price + slippage
-
-            # Check if we can afford this position
-            cost = shares * fill_price
-            if cost > self._cash:
-                # Reduce share count to fit available cash
-                # math.floor rounds DOWN (can't buy fractional shares)
-                shares = math.floor(self._cash / fill_price)
-                if shares <= 0:
-                    continue
-                cost = shares * fill_price
-
-            # ---- Execute the entry ----
-            self._cash -= cost
-            self._positions.append(
-                BacktestPosition(
-                    symbol=sig.symbol,
-                    shares=shares,
-                    entry_price=fill_price,
-                    entry_date=date_str,
-                    stop_loss=sig.stop_loss_price,
-                    take_profit=sig.take_profit_price,
-                    hold_type=sig.hold_type,
-                    strategy_name=sig.strategy_name,
-                )
-            )
-            log.debug(
-                "backtest_entry",
-                symbol=sig.symbol,
-                strategy=sig.strategy_name,
-                shares=shares,
-                price=fill_price,
-                date=date_str,
-            )
+            # ---- Queue for next-bar fill ----
+            # In reality, signals generated at EOD are executed at the next
+            # morning's open. Queuing here eliminates lookahead bias.
+            self._pending_stock_orders.append((sig, shares))
 
     def _size_position(self, signal: Signal, equity: float) -> int:
         """Fixed-fractional position sizing (mirrors the live PositionSizer).
@@ -1006,10 +1090,12 @@ class BacktestEngine:
         if signal.entry_price > 0:
             shares = min(shares, math.floor(self._cash / signal.entry_price))
 
-        # Ensure non-negative, but allow at least 1 share if we can afford it
+        # Ensure non-negative, but allow 1 share only if within risk budget
         shares = max(0, shares)
         if shares == 0 and self._cash >= signal.entry_price > 0:
-            shares = 1  # Minimum position: 1 share
+            single_share_risk = risk_per_share
+            if single_share_risk <= risk_amount:
+                shares = 1
 
         return shares
 
@@ -1121,7 +1207,12 @@ class BacktestEngine:
         current_eq = self._equity(date_str, bars_dict)
 
         # Check total options capital allocation (prevent overexposure to options)
-        options_exposure = sum(abs(p.entry_cost) * 100 * p.contracts for p in self._options_positions)
+        # Capital at risk: debit strategies = premium paid, credit strategies = collateral
+        options_exposure = sum(
+            abs(p.entry_cost) * 100 * p.contracts if p.entry_cost > 0
+            else p.max_loss * p.contracts
+            for p in self._options_positions
+        )
         max_options_capital = current_eq * self.cfg.max_options_capital_pct
         if options_exposure >= max_options_capital:
             return
@@ -1284,6 +1375,12 @@ class BacktestEngine:
                 position_legs[0]["type"] = "call"
                 position_legs[1]["type"] = "put"
 
+            # ---- Apply options slippage ----
+            if entry_cost > 0:
+                entry_cost *= (1 + self.cfg.options_slippage_pct)  # Debit: pay more
+            else:
+                entry_cost *= (1 - self.cfg.options_slippage_pct)  # Credit: receive less
+
             # ---- Execute: deduct cash ----
             if entry_cost > 0:
                 # Debit strategy: pay the premium (cost * 100 shares/contract * num contracts)
@@ -1360,19 +1457,23 @@ class BacktestEngine:
                 # ---- Close near/at expiration ----
                 # Use mark-to-market (not just intrinsic) to simulate selling
                 # before expiration, which captures remaining time value.
-                current_mtm = self._options_mark_to_market(pos, stock_price, date_str)
+                current_mtm = self._options_mark_to_market(pos, stock_price, date_str, bars_dict)
                 exit_value = current_mtm / (100 * pos.contracts) if pos.contracts > 0 else 0.0
                 exit_reason = "close_before_expiration" if close_before_exp else "expiration"
             else:
                 # ---- Check profit target and loss limit ----
-                current_mtm = self._options_mark_to_market(pos, stock_price, date_str)
+                current_mtm = self._options_mark_to_market(pos, stock_price, date_str, bars_dict)
                 entry_total = pos.entry_cost * 100 * pos.contracts  # Total capital deployed
+
+                # Total max_loss and max_profit across all contracts
+                total_max_loss = pos.max_loss * pos.contracts
+                total_max_profit = pos.max_profit * pos.contracts
 
                 if pos.entry_cost > 0:
                     # DEBIT strategy P&L: current value minus what we paid
                     current_pnl = current_mtm - entry_total
                     # Profit target: close if we've captured enough of the max profit
-                    if pos.max_profit > 0 and current_pnl >= pos.max_profit * self.cfg.options_profit_target_pct:
+                    if total_max_profit > 0 and current_pnl >= total_max_profit * self.cfg.options_profit_target_pct:
                         exit_value = current_mtm / (100 * pos.contracts)
                         exit_reason = "profit_target"
                     # Loss limit: close if loss exceeds threshold
@@ -1389,7 +1490,7 @@ class BacktestEngine:
                         exit_value = -cost_to_close / (100 * pos.contracts)
                         exit_reason = "profit_target"
                     # Loss limit: close if loss approaches max_loss
-                    elif current_pnl <= -pos.max_loss * 0.8:
+                    elif current_pnl <= -total_max_loss * 0.8:
                         exit_value = -cost_to_close / (100 * pos.contracts)
                         exit_reason = "loss_limit"
 
@@ -1450,11 +1551,17 @@ class BacktestEngine:
             credit_received = abs(entry_total)
             close_cost = max(0, -exit_value * 100 * pos.contracts)
             pnl = credit_received - close_cost
-            self._cash += pos.max_loss   # Release the reserved collateral
+            self._cash += pos.max_loss * pos.contracts  # Release the reserved collateral
             self._cash -= close_cost     # Pay the cost to close the short position
 
         # pnl_pct relative to capital at risk (avoid division by zero)
-        pnl_pct = pnl / max(abs(entry_total), 0.01)
+        # For credit strategies, measure return against capital at risk (collateral),
+        # not the small credit received.
+        if pos.entry_cost < 0:
+            capital_at_risk = pos.max_loss * pos.contracts
+        else:
+            capital_at_risk = abs(entry_total)
+        pnl_pct = pnl / max(capital_at_risk, 0.01)
 
         trade = OptionsBacktestTrade(
             underlying=pos.underlying,
@@ -1597,12 +1704,24 @@ class BacktestResults:
         expectancy = total_pnl / total_trades
 
         # ---- Sharpe ratio ----
-        # Computed from per-trade P&L (not daily returns, since trade frequency varies)
-        mean_pnl = total_pnl / total_trades
-        variance = sum((p - mean_pnl) ** 2 for p in all_pnls) / len(all_pnls)
-        std_pnl = math.sqrt(variance) if variance > 0 else 0
-        # Annualize: multiply by sqrt(252) assuming ~1 trade per day on average
-        sharpe = (mean_pnl / std_pnl * math.sqrt(252)) if std_pnl > 0 else 0
+        # Computed from daily equity curve returns (industry standard).
+        # Using per-trade P&L was incorrect — it assumed 1 trade/day.
+        if len(self.snapshots) >= 2:
+            equities = [s.equity for s in self.snapshots]
+            daily_returns = [
+                (equities[i] - equities[i - 1]) / equities[i - 1]
+                for i in range(1, len(equities))
+                if equities[i - 1] > 0
+            ]
+            if daily_returns and len(daily_returns) > 1:
+                mean_ret = sum(daily_returns) / len(daily_returns)
+                var_ret = sum((r - mean_ret) ** 2 for r in daily_returns) / len(daily_returns)
+                std_ret = math.sqrt(var_ret) if var_ret > 0 else 0
+                sharpe = (mean_ret / std_ret * math.sqrt(252)) if std_ret > 0 else 0
+            else:
+                sharpe = 0
+        else:
+            sharpe = 0
 
         # Max drawdown from equity curve (peak-to-trough decline)
         max_dd, max_dd_duration = self._max_drawdown()
@@ -1654,6 +1773,8 @@ class BacktestResults:
                 "avg_pnl": round(sum(t.pnl for t in strat_trades) / len(strat_trades), 2),
             }
 
+        ending_eq = self.snapshots[-1].equity if self.snapshots else self.config.starting_capital
+
         return {
             "total_trades": total_trades,
             "stock_trades": len(self.trades),
@@ -1662,7 +1783,9 @@ class BacktestResults:
             "losing_trades": len(losses_pnl),
             "win_rate": round(len(wins_pnl) / total_trades, 4) if total_trades else 0,
             "total_pnl": round(total_pnl, 2),
-            "total_return_pct": round(total_pnl / self.config.starting_capital * 100, 2),
+            "total_return_pct": round(
+                ((ending_eq - self.config.starting_capital) / self.config.starting_capital) * 100, 2
+            ),
             "avg_win": round(avg_win, 2),
             "avg_loss": round(avg_loss, 2),
             "expectancy": round(expectancy, 2),
@@ -1677,7 +1800,7 @@ class BacktestResults:
             "max_win": round(max(all_pnls), 2),
             "max_loss": round(min(all_pnls), 2),
             "starting_capital": self.config.starting_capital,
-            "ending_equity": self.snapshots[-1].equity if self.snapshots else self.config.starting_capital,
+            "ending_equity": ending_eq,
             "by_strategy": by_strategy,
         }
 

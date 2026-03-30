@@ -59,6 +59,8 @@ from pathlib import Path
 
 import structlog
 
+from ai_trade._version import __version__
+
 # Resolve the log directory: 3 levels up from this file, then into logs/.
 _LOG_DIR = Path(__file__).resolve().parents[3] / "logs"
 
@@ -126,6 +128,11 @@ def setup_logging(level: str = "INFO") -> None:
     # PYTHON PATTERN — structlog.configure:
     # Sets up the global structlog behavior.  The `processors` list defines
     # a pipeline that each log entry passes through before being output.
+    def _add_version(logger, method_name, event_dict):
+        """Stamp every log entry with the application version."""
+        event_dict["version"] = __version__
+        return event_dict
+
     structlog.configure(
         processors=[
             # merge_contextvars: merges any "context variables" (thread-local
@@ -140,6 +147,9 @@ def setup_logging(level: str = "INFO") -> None:
             # TimeStamper: adds an ISO-8601 timestamp to each log entry
             # (e.g., "2025-06-01T14:30:00.000000Z").
             structlog.processors.TimeStamper(fmt="iso"),
+
+            # Add application version to every log entry for traceability.
+            _add_version,
 
             # Final renderer: choose format based on whether stdout is a
             # terminal (TTY) or not.

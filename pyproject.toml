@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ai-trade"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Automated stock trading algorithm using Alpaca API"
 requires-python = ">=3.12"
 dependencies = [
@@ -26,6 +26,9 @@ dev = [
 [project.scripts]
 ai-trade = "ai_trade.main:main"
 ai-trade-backtest = "ai_trade.backtest.runner:main"
+
+[tool.setuptools.dynamic]
+version = {attr = "ai_trade._version.__version__"}
 
 [tool.setuptools.packages.find]
 where = ["src"]

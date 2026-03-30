@@ -52,14 +52,11 @@ Key Concepts in This File
 - **credit_pct**: ``total_premium / stock_price``. Represents the premium
   collected as a percentage of the stock price. Higher = better income.
 
-Note: Like covered_call.py, this file does its own inline contract filtering
-and enrichment rather than using the shared ``filter_contracts``/``enrich_greeks``
-utilities from base.py.
+Note: This file was refactored to use the shared ``filter_contracts`` /
+``enrich_greeks`` utilities from base.py for consistent greeks extraction.
 """
 
 from __future__ import annotations
-
-from datetime import datetime, timezone
 
 import pandas as pd
 
@@ -69,6 +66,8 @@ from ai_trade.strategy.options.base import (
     BaseOptionsStrategy,
     OptionsSignal,
     OptionsStrategyType,
+    enrich_greeks,
+    filter_contracts,
 )
 
 log = get_logger(__name__)
@@ -81,6 +80,8 @@ class CoveredStraddleStrategy(BaseOptionsStrategy):
     and tight Bollinger Bands. This is the most income-heavy but also
     the riskiest of the income strategies.
     """
+
+    bias = "neutral"
 
     def evaluate(
         self,
@@ -147,33 +148,15 @@ class CoveredStraddleStrategy(BaseOptionsStrategy):
         # ------------------------------------------------------------------
         # Select contracts -- ATM call + ATM put, same expiration
         # ------------------------------------------------------------------
-        # Inline contract filtering (same approach as covered_call.py).
-        now = datetime.now(tz=timezone.utc)
-        eligible: list[dict] = []
-        for contract in chain_data:
-            exp_str = contract.get("expiration_date") or contract.get("expiration", "")
-            try:
-                exp_dt = datetime.fromisoformat(exp_str).replace(tzinfo=timezone.utc) if exp_str else None
-            except (ValueError, TypeError):
-                continue
-            if exp_dt is None:
-                continue
-            dte = (exp_dt - now).days
-            if min_dte <= dte <= max_dte:
-                contract["_dte"] = dte
-                eligible.append(contract)
+        # Filter both calls and puts in the DTE window, then enrich with greeks.
+        eligible_calls = filter_contracts(chain_data, "call", min_dte, max_dte)
+        eligible_puts = filter_contracts(chain_data, "put", min_dte, max_dte)
+        eligible = eligible_calls + eligible_puts
 
         if not eligible:
             return None
 
-        # Enrich each eligible contract with greeks and pricing.
-        for c in eligible:
-            sym = c.get("symbol", "")
-            snap = snapshots.get(sym, {})
-            c["_delta"] = snap.get("delta", 0.0)
-            c["_theta"] = snap.get("theta", 0.0)
-            c["_bid"] = snap.get("bid", 0.0) or 0.0
-            c["_strike"] = float(c.get("strike_price") or c.get("strike", 0))
+        enrich_greeks(eligible, snapshots)
 
         # Separate calls and puts from the eligible contracts.
         # These list comprehensions filter by the "type" field.
