@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import pandas as pd
 
-from ai_trade.data.indicators import add_atr, add_ema, add_rsi
+from ai_trade.data.indicators import add_atr, add_ema, add_rsi, add_volume_profile
 from ai_trade.monitoring.logger import get_logger
 from ai_trade.strategy.base import BaseStrategy, HoldType, Signal
 
@@ -61,6 +61,7 @@ class EMACrossoverStrategy(BaseStrategy):
         add_ema(df, [fast_period, slow_period, trend_period])
         add_rsi(df)
         add_atr(df)
+        add_volume_profile(df)
 
         if len(df) < trend_period + 2:
             return None
@@ -78,6 +79,7 @@ class EMACrossoverStrategy(BaseStrategy):
         trend_ema: float = latest[trend_col]
         rsi_val: float = latest["rsi_14"]
         atr: float = latest["atr_14"]
+        rel_vol: float = latest.get("relative_volume", 1.0)
 
         prev_fast: float = prev[fast_col]
         prev_slow: float = prev[slow_col]
@@ -87,47 +89,52 @@ class EMACrossoverStrategy(BaseStrategy):
             return None
 
         # ── Entry condition 2: Crossover is fresh (previous bar had fast <= slow) ──
+        # Strict: only allow the exact crossover bar (not 2-bar window)
         if prev_fast > prev_slow:
-            # Check the bar before that for a 2-bar window
-            if len(df) >= 3:
-                prev2 = df.iloc[-3]
-                if prev2[fast_col] > prev2[slow_col]:
-                    logger.debug("ema_cross_reject", symbol=symbol, reason="stale_crossover")
-                    return None
-            else:
-                return None
+            logger.debug("ema_cross_reject", symbol=symbol, reason="stale_crossover")
+            return None
 
-        # ── Entry condition 3: Medium-term uptrend ──
-        if close <= trend_ema:
-            logger.debug("ema_cross_reject", symbol=symbol, reason="below_trend_ema",
+        # ── Entry condition 3: Medium-term uptrend (close well above trend EMA) ──
+        trend_gap_pct = (close - trend_ema) / trend_ema
+        if close <= trend_ema or trend_gap_pct < 0.01:
+            logger.debug("ema_cross_reject", symbol=symbol, reason="weak_trend",
                          close=close, trend_ema=trend_ema)
             return None
 
-        # ── Entry condition 4: RSI in positive-but-not-overbought range ──
+        # ── Entry condition 4: RSI confirms momentum ──
         if rsi_val <= rsi_min or rsi_val >= rsi_max:
             logger.debug("ema_cross_reject", symbol=symbol, reason="rsi_out_of_range",
                          rsi=rsi_val, min=rsi_min, max=rsi_max)
             return None
 
-        # ── Conviction scoring (0.50–0.85) ──
-        conviction = 0.50
+        # ── Entry condition 5: Volume confirmation (above average) ──
+        if rel_vol < 1.2:
+            return None
 
-        # +0.15 max: EMA gap strength (how far fast pulled above slow)
+        # ── Entry condition 6: Meaningful EMA gap (not a noise crossover) ──
         ema_gap_pct = (fast_ema - slow_ema) / close
-        conviction += min(0.15, ema_gap_pct / 0.01 * 0.15)
+        if ema_gap_pct < 0.002:
+            return None  # EMAs barely crossed — likely noise
+
+        # ── Conviction scoring (0.55–0.85) ──
+        conviction = 0.55
+
+        # +0.10 max: EMA gap strength
+        conviction += min(0.10, (ema_gap_pct - 0.002) / 0.008 * 0.10)
 
         # +0.10 max: RSI in sweet spot (55-65 gets full bonus)
         if 55 <= rsi_val <= 65:
             conviction += 0.10
-        elif 50 < rsi_val < 55 or 65 < rsi_val < 75:
+        elif 50 < rsi_val < 55 or 65 < rsi_val < 70:
             conviction += 0.05
 
-        # +0.10 max: Strong trend (close well above trend EMA)
-        trend_gap_pct = (close - trend_ema) / trend_ema
-        if trend_gap_pct > 0.01:
-            conviction += min(0.10, trend_gap_pct * 5.0)
+        # +0.10 max: Volume strength
+        if rel_vol >= 2.0:
+            conviction += 0.10
+        elif rel_vol >= 1.5:
+            conviction += 0.05
 
-        conviction = max(0.50, min(0.85, conviction))
+        conviction = max(0.55, min(0.85, conviction))
 
         entry_price = close
         stop_loss = entry_price - atr_stop_mult * atr

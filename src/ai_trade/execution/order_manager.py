@@ -57,6 +57,7 @@ from alpaca.trading.requests import (
 from ai_trade.clients import get_trading_client
 from ai_trade.monitoring.database import Database
 from ai_trade.monitoring.logger import get_logger
+from ai_trade.monitoring import console as con
 
 log = get_logger(__name__)
 
@@ -206,18 +207,33 @@ class OrderManager:
                             original_cost=round(original_shares * entry_price, 2),
                             adapted_cost=round(shares * current_price, 2),
                         )
-                        print(f"    Price adapted: {signal.symbol} signal@${entry_price:.2f}"
-                              f" -> now@${current_price:.2f}"
-                              f" | stop ${stop_price}->${new_stop}"
-                              f" | target ${target_price}->${new_target}"
-                              f" | shares {original_shares}->{shares}"
-                              f" (cost ${original_shares * entry_price:.0f}"
-                              f" -> ${shares * current_price:.0f})")
+                        print(con.price_adapted(
+                            symbol=signal.symbol,
+                            signal_entry=entry_price,
+                            current=current_price,
+                            old_stop=stop_price, new_stop=new_stop,
+                            old_target=target_price, new_target=new_target,
+                            old_shares=original_shares, new_shares=shares,
+                        ))
                     stop_price = new_stop
                     target_price = new_target
                     entry_price = current_price
             except Exception as e:
                 log.debug("bracket_price_adapt_failed", symbol=signal.symbol, error=str(e))
+
+            # Alpaca requires stop_price <= base_price - 0.01 and
+            # take_profit >= base_price + 0.01.  If price moved since
+            # signal generation, enforce these bounds to avoid rejection.
+            min_stop = round(entry_price - 0.01, 2)
+            min_target = round(entry_price + 0.01, 2)
+            if stop_price >= entry_price:
+                log.warning("stop_above_entry_clamped", symbol=signal.symbol,
+                            stop=stop_price, entry=entry_price, new_stop=min_stop)
+                stop_price = min_stop
+            if target_price <= entry_price:
+                log.warning("target_below_entry_clamped", symbol=signal.symbol,
+                            target=target_price, entry=entry_price, new_target=min_target)
+                target_price = min_target
 
             # Build the bracket order request.
             # OrderClass.BRACKET tells Alpaca this is a 3-legged order.
@@ -273,29 +289,28 @@ class OrderManager:
             # Classify the error for clear operator feedback
             if "pattern day trading" in error_msg or "40310100" in error_msg:
                 log.error("bracket_order_pdt_blocked", symbol=symbol, shares=shares, error=error_raw)
-                print(f"    ORDER BLOCKED: {symbol} — Alpaca PDT protection triggered."
-                      f" All day-trade slots used on Alpaca's side.")
+                print(con.error(f"ORDER BLOCKED {symbol} — PDT protection triggered. All day-trade slots used."))
             elif "insufficient" in error_msg or "buying power" in error_msg or "40110000" in error_msg:
                 log.error("bracket_order_insufficient_funds", symbol=symbol, shares=shares, error=error_raw)
-                print(f"    ORDER BLOCKED: {symbol} — Insufficient buying power for {shares} shares.")
+                print(con.error(f"ORDER BLOCKED {symbol} — Insufficient buying power for {shares} shares."))
             elif "forbidden" in error_msg or "403" in error_msg:
                 log.error("bracket_order_forbidden", symbol=symbol, shares=shares, error=error_raw)
-                print(f"    ORDER BLOCKED: {symbol} — Account restriction (403). Check Alpaca dashboard.")
+                print(con.error(f"ORDER BLOCKED {symbol} — Account restriction (403). Check Alpaca dashboard."))
             elif "not found" in error_msg or "asset" in error_msg and "not" in error_msg:
                 log.error("bracket_order_invalid_symbol", symbol=symbol, error=error_raw)
-                print(f"    ORDER FAILED: {symbol} — Symbol not found or not tradeable.")
+                print(con.error(f"ORDER FAILED {symbol} — Symbol not found or not tradeable."))
             elif "halt" in error_msg or "suspended" in error_msg:
                 log.error("bracket_order_halted", symbol=symbol, error=error_raw)
-                print(f"    ORDER BLOCKED: {symbol} — Trading halted/suspended.")
+                print(con.error(f"ORDER BLOCKED {symbol} — Trading halted/suspended."))
             elif "rate" in error_msg or "429" in error_msg or "too many" in error_msg:
                 log.error("bracket_order_rate_limited", symbol=symbol, error=error_raw)
-                print(f"    ORDER DELAYED: {symbol} — Rate limited by Alpaca. Try again next window.")
+                print(con.warning(f"ORDER DELAYED {symbol} — Rate limited by Alpaca. Try again next window."))
             elif "timeout" in error_msg or "timed out" in error_msg or "connect" in error_msg:
                 log.error("bracket_order_network_error", symbol=symbol, error=error_raw)
-                print(f"    ORDER FAILED: {symbol} — Network error: {error_raw[:80]}")
+                print(con.error(f"ORDER FAILED {symbol} — Network error: {error_raw[:80]}"))
             else:
                 log.exception("bracket_order_failed", symbol=symbol, shares=shares)
-                print(f"    ORDER FAILED: {symbol} — {error_raw[:120]}")
+                print(con.error(f"ORDER FAILED {symbol} — {error_raw[:120]}"))
             return None
 
     # ── Position closing ─────────────────────────────────────
@@ -323,7 +338,7 @@ class OrderManager:
             # Shares held by open orders — cancel them and retry once
             if "insufficient qty" in error_msg or "held_for_orders" in error_msg:
                 log.warning("close_position_held_by_orders", symbol=symbol)
-                print(f"    Shares held by open orders for {symbol} — cancelling orders and retrying...")
+                print(con.warning(f"Shares held by open orders for {symbol} — cancelling and retrying..."))
                 try:
                     self._cancel_orders_for_symbol(symbol)
                     time.sleep(1)  # Brief pause for Alpaca to process cancellations
@@ -336,11 +351,11 @@ class OrderManager:
                         log.info("position_already_closed_after_cancel", symbol=symbol)
                         return True
                     log.exception("close_position_retry_failed", symbol=symbol)
-                    print(f"    WARNING: Retry close {symbol} failed — {str(retry_err)[:100]}")
+                    print(con.warning(f"Retry close {symbol} failed — {str(retry_err)[:100]}"))
                     return False
 
             log.exception("close_position_failed", symbol=symbol)
-            print(f"    WARNING: Failed to close {symbol} — {str(e)[:100]}")
+            print(con.warning(f"Failed to close {symbol} — {str(e)[:100]}"))
             return False
 
     def close_all_day_trades(self, open_trades: list[dict]) -> None:

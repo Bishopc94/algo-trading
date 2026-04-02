@@ -62,6 +62,7 @@ from datetime import datetime
 
 from ai_trade.monitoring.database import Database
 from ai_trade.monitoring.logger import get_logger
+from ai_trade.monitoring import console as con
 
 log = get_logger(__name__)
 
@@ -250,30 +251,13 @@ class PerformanceTracker:
         metrics = self.calculate_metrics()
         today = datetime.now().strftime("%Y-%m-%d")
 
-        # PYTHON PATTERN — f-string formatting:
-        # - `{value:,.2f}` formats with commas as thousands separators
-        #   and 2 decimal places (e.g. 10,500.00).
-        # - `{value:.0%}` formats as a percentage with 0 decimal places
-        #   (e.g. 0.65 → "65%").
-        # - `{value:.1f}` formats with 1 decimal place.
-        summary = (
-            f"\n{'='*50}\n"
-            f"  Daily Summary — {today}\n"
-            f"{'='*50}\n"
-            f"  Equity:         ${equity:,.2f}\n"
-            f"  Cash:           ${cash:,.2f}\n"
-            f"  Open Positions: {open_positions}\n"
-            f"  Day Trades Used: {day_trades_used}/3\n"
-            f"{'─'*50}\n"
-            f"  Total Closed:   {metrics['total_trades']}\n"
-            f"  Win Rate:       {metrics['win_rate']:.0%}\n"
-            f"  Total P&L:      ${metrics['total_pnl']:,.2f}\n"
-            f"  Profit Factor:  {metrics['profit_factor']}\n"
-            f"  Sharpe Ratio:   {metrics['sharpe_ratio']}\n"
-            f"  Max Drawdown:   {metrics['max_drawdown_pct']:.1f}%\n"
-            f"{'='*50}\n"
-        )
         # Log the summary metrics as structured key-value pairs for
         # machine-parseable analysis.
         log.info("daily_summary", equity=equity, cash=cash, **metrics)
-        return summary
+
+        return con.daily_summary(
+            today=today, equity=equity, cash=cash,
+            open_positions=open_positions,
+            day_trades_used=day_trades_used,
+            metrics=metrics,
+        )

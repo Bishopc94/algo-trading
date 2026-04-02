@@ -95,13 +95,17 @@ class MACDDivergenceStrategy(BaseStrategy):
         if close <= ema_20 * 0.97:
             return None
 
-        # ── Entry condition 4: MACD hist positive or just turned positive ──
-        prev_hist: float = df.iloc[-2]["macd_hist"]
-        if macd_hist <= 0 and prev_hist <= 0:
+        # ── Entry condition 4: MACD hist must be positive NOW (divergence resolved) ──
+        if macd_hist <= 0:
             return None
 
+        # Confirm it just turned positive (was negative within last 3 bars)
+        recent_negative = any(float(df.iloc[i]["macd_hist"]) < 0 for i in range(-4, -1))
+        if not recent_negative:
+            return None  # MACD has been positive for a while — not a fresh divergence signal
+
         # ── Entry conditions 1-3: Find bullish divergence ──
-        swing_indices = _find_swing_lows(df, lookback=lookback, min_gap=3)
+        swing_indices = _find_swing_lows(df, lookback=lookback, min_gap=4)
 
         if len(swing_indices) < 2:
             return None
@@ -115,8 +119,8 @@ class MACDDivergenceStrategy(BaseStrategy):
         prior_macd: float = df.iloc[prior_idx]["macd_hist"]
         recent_macd: float = df.iloc[recent_idx]["macd_hist"]
 
-        # Require at least 1% price difference between lows (filter noise)
-        if abs(recent_low - prior_low) / prior_low < 0.01:
+        # Require at least 2% price difference between lows (filter noise)
+        if abs(recent_low - prior_low) / prior_low < 0.02:
             return None
 
         # ── Condition 2: Price makes lower low ──
@@ -127,13 +131,17 @@ class MACDDivergenceStrategy(BaseStrategy):
         if recent_macd <= prior_macd:
             return None
 
-        # ── Conviction scoring (0.55–0.80) ──
-        conviction = 0.55
-
-        # +0.15 max: Divergence magnitude (bigger MACD difference = stronger signal)
+        # ── Condition 6: Divergence must be meaningful (MACD diff > 20% of range) ──
         macd_diff = recent_macd - prior_macd
         macd_range = max(abs(prior_macd), 0.01)
         divergence_strength = min(1.0, abs(macd_diff) / macd_range)
+        if divergence_strength < 0.20:
+            return None  # Too weak — likely noise
+
+        # ── Conviction scoring (0.55–0.80) ──
+        conviction = 0.55
+
+        # +0.15 max: Divergence magnitude
         conviction += 0.15 * divergence_strength
 
         # +0.10 max: Proximity to EMA-20 (closer = better support)

@@ -71,14 +71,19 @@ class PullbackStrategy(BaseStrategy):
         atr: float = latest["atr_14"]
         rel_vol: float = latest.get("relative_volume", 1.0)
 
-        # ── Entry condition 1: Uptrend structure ──
+        # ── Entry condition 1: Strong uptrend structure (EMA gap > 1%) ──
         if ema_20 <= ema_50:
             return None
+        ema_gap_pct = (ema_20 - ema_50) / ema_50
+        if ema_gap_pct < 0.01:
+            return None  # Weak uptrend — not worth buying the dip
 
-        # ── Entry condition 2: Pulled back to support (within tolerance of EMA-20 or EMA-50) ──
+        # ── Entry condition 2: Pulled back to support (close BELOW EMA-20 but ABOVE EMA-50) ──
+        # Must be a real pullback: close dipped below EMA-20, seeking support
+        if close >= ema_20:
+            return None  # Not actually pulling back — still above fast EMA
         near_ema20 = abs(close - ema_20) / ema_20 <= tolerance_pct
         near_ema50 = abs(close - ema_50) / ema_50 <= tolerance_pct
-
         if not (near_ema20 or near_ema50):
             logger.debug("pullback_reject", symbol=symbol, reason="not_near_ema",
                          close=close, ema_20=ema_20, ema_50=ema_50)
@@ -96,25 +101,38 @@ class PullbackStrategy(BaseStrategy):
                          close=close, ema_50=ema_50)
             return None
 
+        # ── Entry condition 5: Volume confirmation (require above-average) ──
+        if rel_vol < 1.0:
+            return None
+
+        # ── Entry condition 6: RSI was higher recently (confirming it's a fresh pullback) ──
+        if len(df) >= 5:
+            recent_rsi_max = max(float(df.iloc[i]["rsi_14"]) for i in range(-5, -1))
+            if recent_rsi_max < 50:
+                return None  # RSI has been weak for a while — not a healthy pullback
+
         # ── Conviction scoring (0.50–0.85) ──
         conviction = 0.50
 
         # +0.15 max: Strong uptrend (EMA-20/EMA-50 gap > 2%)
-        ema_gap_pct = (ema_20 - ema_50) / ema_50
-        if ema_gap_pct > 0.02:
-            conviction += min(0.15, (ema_gap_pct - 0.02) * 7.5 + 0.05)
+        if ema_gap_pct > 0.03:
+            conviction += 0.15
+        elif ema_gap_pct > 0.02:
+            conviction += 0.10
         elif ema_gap_pct > 0.01:
             conviction += 0.05
 
-        # +0.10 max: RSI in ideal pullback zone (45-50)
-        if 45 <= rsi_val <= 50:
+        # +0.10 max: RSI in ideal pullback zone (43-48)
+        if 43 <= rsi_val <= 48:
             conviction += 0.10
-        elif 40 < rsi_val < 45 or 50 < rsi_val < 55:
+        elif 40 < rsi_val < 43 or 48 < rsi_val < 53:
             conviction += 0.05
 
-        # +0.10 max: Buying interest on pullback (relative volume > 1.0)
-        if rel_vol > 1.0:
-            conviction += min(0.10, (rel_vol - 1.0) * 0.10)
+        # +0.10 max: Volume above average
+        if rel_vol > 1.5:
+            conviction += 0.10
+        elif rel_vol > 1.2:
+            conviction += 0.05
 
         conviction = max(0.50, min(0.85, conviction))
 

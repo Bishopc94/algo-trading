@@ -74,10 +74,19 @@ class BBSqueezeStrategy(BaseStrategy):
         atr: float = latest["atr_14"]
 
         # ── Entry condition 1: Recent squeeze (BB width below threshold in last N bars) ──
+        # For small-cap / volatile stocks ($2-$50), bb_width is often wider than blue chips.
+        # Use a relative squeeze: width must have been in the bottom 20% of its own 50-bar range.
         lookback_start = max(0, len(df) - squeeze_lookback - 1)
         recent_widths = df["bb_width"].iloc[lookback_start:-1]  # Exclude current bar
 
-        if recent_widths.empty or recent_widths.min() >= squeeze_threshold:
+        # Also check relative squeeze: width was in bottom 20% of recent 50-bar range
+        long_range = df["bb_width"].iloc[max(0, len(df) - 50):]
+        width_percentile = (bb_width - long_range.min()) / max(long_range.max() - long_range.min(), 0.001)
+
+        absolute_squeeze = not recent_widths.empty and recent_widths.min() < squeeze_threshold
+        relative_squeeze = not recent_widths.empty and width_percentile < 0.40  # Was recently compressed
+
+        if not (absolute_squeeze or relative_squeeze):
             return None
 
         # ── Entry condition 2: Bands expanding ──

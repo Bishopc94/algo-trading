@@ -30,10 +30,10 @@ strategies:
   mean_reversion:
     enabled: true
     rsi_period: 14
-    rsi_oversold: 35                # Tightened from 40 — require deeper oversold for entry
-    rsi_exit: 55                    # Lowered from 60 — take profits earlier, avoid whipsaw
+    rsi_oversold: 38                # Loosened from 35 — was generating 0 trades
+    rsi_exit: 55
     atr_stop_multiplier: 1.5
-    atr_tp_multiplier: 3.0
+    atr_tp_multiplier: 3.5          # Wider target for better R:R
     hold_type: swing
     lookback_days: 30
 
@@ -42,7 +42,7 @@ strategies:
     volume_spike_multiplier: 2.0    # Raised from 1.5 — reduces false breakout signals
     breakout_lookback: 20
     atr_stop_multiplier: 1.5
-    atr_tp_multiplier: 3.0
+    atr_tp_multiplier: 3.5          # Wider target for better R:R
     hold_type: adaptive
     min_adr_pct: 2.0
 
@@ -60,22 +60,22 @@ strategies:
     rsi_min: 50
     rsi_max: 75
     atr_stop_multiplier: 1.5
-    atr_tp_multiplier: 3.0
+    atr_tp_multiplier: 3.5              # Wider target for better R:R
     hold_type: swing
 
   macd_divergence:
     enabled: true
     lookback_bars: 20
-    atr_stop_multiplier: 2.0
-    atr_tp_multiplier: 3.0
+    atr_stop_multiplier: 1.8
+    atr_tp_multiplier: 3.5              # Wider target for better R:R
     hold_type: swing
 
   bb_squeeze:
     enabled: true
-    squeeze_threshold: 0.08
+    squeeze_threshold: 0.10             # Raised from 0.08 — small caps have wider bands
     squeeze_lookback: 5
     min_relative_volume: 1.3
-    atr_tp_multiplier: 3.0
+    atr_tp_multiplier: 3.5
     hold_type: adaptive
 
   orb:
@@ -86,11 +86,11 @@ strategies:
 
   pullback:
     enabled: true
-    pullback_tolerance_pct: 1.0
+    pullback_tolerance_pct: 0.75        # Tightened from 1.0 — must be closer to EMA
     rsi_min: 40
-    rsi_max: 55
+    rsi_max: 53                         # Tightened from 55 — more clearly pulled back
     atr_stop_multiplier: 0.5
-    atr_tp_multiplier: 2.5
+    atr_tp_multiplier: 3.0              # Raised from 2.5 — better R:R
     hold_type: swing
 
   # ── Options Strategies ──────────────────────────────────
@@ -194,11 +194,7 @@ risk:
 schedule:
   premarket_scan: "09:00"
   market_open: "09:30"
-  entry_window: "09:35"
-  mid_morning_options: "10:15"
-  late_morning: "11:00"
-  midday_check: "12:00"
-  power_hour_scan: "15:00"
+  scan_interval_minutes: 15            # Scan & evaluate every 15 min (9:45 AM - 3:45 PM)
   options_expiry_check: "15:30"
   eod_close_day_trades: "15:50"
   eod_review: "16:05"

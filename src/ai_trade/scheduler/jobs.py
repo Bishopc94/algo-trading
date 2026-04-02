@@ -84,6 +84,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 
 from ai_trade.monitoring.logger import get_logger
+from ai_trade.monitoring import console as con
 
 if TYPE_CHECKING:
     from ai_trade.main import TradingBot
@@ -137,7 +138,7 @@ def create_scheduler(bot: TradingBot) -> BackgroundScheduler:
                 error=str(event.exception),
                 error_type=type(event.exception).__name__,
             )
-            print(f"  [Scheduler] Job '{event.job_id}' FAILED: {event.exception}")
+            print(con.error(f"Scheduler job '{event.job_id}' FAILED: {event.exception}"))
         else:
             log.warning("scheduled_job_missed", job_id=event.job_id)
 
@@ -187,65 +188,25 @@ def create_scheduler(bot: TradingBot) -> BackgroundScheduler:
         name="Market open setup",
     )
 
-    # ── Job 3: Entry window ──────────────────────────────────
-    # The main trading job.  Evaluates all strategy signals against
-    # the morning's scan results and submits bracket orders for any
-    # trades that pass risk checks.  Typically runs ~30 minutes after
-    # open (10:00 AM ET) to let the opening volatility settle.
-    h, m = _parse_time(cfg.entry_window)
+    # ── Job 3: Continuous scan & evaluate (every 15 min during market hours) ──
+    # Replaces the old fixed-time entry windows (9:35, 11:00, 12:00, 3:00).
+    # Scans for fresh candidates and evaluates all strategies every 15 minutes
+    # from 9:45 AM through 3:45 PM.  The algo decides when setups are
+    # worth entering — not the schedule.
+    #
+    # Starts at 9:45 (15 min after open) to let opening volatility settle.
+    # Stops at 3:45 to leave time for EOD close at 3:50.
+    scan_interval = getattr(cfg, "scan_interval_minutes", 15)
     scheduler.add_job(
-        bot.job_entry_window,
-        CronTrigger(hour=h, minute=m, day_of_week="mon-fri", timezone=ET),
-        id="entry_window",
-        name="Strategy evaluation & trade entry",
-    )
-
-    # ── Job 4: Mid-morning options ────────────────────────────
-    # Dedicated options pass after opening volatility settles (~10:15 AM).
-    # IV is typically inflated at open and normalizes by this time,
-    # giving better premium pricing for options entries.
-    h, m = _parse_time(cfg.mid_morning_options)
-    scheduler.add_job(
-        bot.job_mid_morning_options,
-        CronTrigger(hour=h, minute=m, day_of_week="mon-fri", timezone=ET),
-        id="mid_morning_options",
-        name="Mid-morning options evaluation",
-    )
-
-    # ── Job 5: Late morning ────────────────────────────────────
-    # Second evaluation pass.  Mean reversion dips and VWAP reclaims
-    # often take 1-2 hours to form after market open.
-    h, m = _parse_time(cfg.late_morning)
-    scheduler.add_job(
-        bot.job_late_morning,
-        CronTrigger(hour=h, minute=m, day_of_week="mon-fri", timezone=ET),
-        id="late_morning",
-        name="Late morning evaluation",
-    )
-
-    # ── Job 6: Midday check ──────────────────────────────────
-    # Reviews open positions around noon.  May tighten stops, take
-    # partial profits, or close underperforming trades.
-    h, m = _parse_time(cfg.midday_check)
-    scheduler.add_job(
-        bot.job_midday_check,
-        CronTrigger(hour=h, minute=m, day_of_week="mon-fri", timezone=ET),
-        id="midday_check",
-        name="Midday position review",
-    )
-
-    # ── Job 5: Power hour scan ───────────────────────────────
-    # TRADING CONCEPT — Power Hour:
-    # The last hour of trading (3:00–4:00 PM ET) is called "power hour"
-    # because trading volume and volatility typically spike as
-    # institutional investors make end-of-day portfolio adjustments.
-    # This creates additional trading opportunities.
-    h, m = _parse_time(cfg.power_hour_scan)
-    scheduler.add_job(
-        bot.job_power_hour,
-        CronTrigger(hour=h, minute=m, day_of_week="mon-fri", timezone=ET),
-        id="power_hour_scan",
-        name="Power hour scan",
+        bot.job_scan_and_evaluate,
+        CronTrigger(
+            hour="9-15",
+            minute=f"*/{scan_interval}",
+            day_of_week="mon-fri",
+            timezone=ET,
+        ),
+        id="scan_and_evaluate",
+        name=f"Scan & evaluate (every {scan_interval}min)",
     )
 
     # ── Job 9: Options expiry management ──────────────────────
