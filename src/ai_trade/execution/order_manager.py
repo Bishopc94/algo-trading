@@ -222,16 +222,19 @@ class OrderManager:
                 log.debug("bracket_price_adapt_failed", symbol=signal.symbol, error=str(e))
 
             # Alpaca requires stop_price <= base_price - 0.01 and
-            # take_profit >= base_price + 0.01.  If price moved since
-            # signal generation, enforce these bounds to avoid rejection.
-            min_stop = round(entry_price - 0.01, 2)
-            min_target = round(entry_price + 0.01, 2)
-            if stop_price >= entry_price:
-                log.warning("stop_above_entry_clamped", symbol=signal.symbol,
-                            stop=stop_price, entry=entry_price, new_stop=min_stop)
-                stop_price = min_stop
-            if target_price <= entry_price:
-                log.warning("target_below_entry_clamped", symbol=signal.symbol,
+            # take_profit >= base_price + 0.01.  We use a 0.05 buffer (not
+            # just 0.01) because market orders fill at the ask, which can be
+            # 1-2 cents above our snapshot price — a 0.01 gap becomes 0.00
+            # relative to the actual fill and Alpaca rejects with 42210000.
+            clamp_buffer = 0.05
+            max_stop = round(entry_price - clamp_buffer, 2)
+            min_target = round(entry_price + clamp_buffer, 2)
+            if stop_price >= entry_price - clamp_buffer + 0.01:
+                log.warning("stop_too_close_clamped", symbol=signal.symbol,
+                            stop=stop_price, entry=entry_price, new_stop=max_stop)
+                stop_price = max_stop
+            if target_price <= entry_price + clamp_buffer - 0.01:
+                log.warning("target_too_close_clamped", symbol=signal.symbol,
                             target=target_price, entry=entry_price, new_target=min_target)
                 target_price = min_target
 
