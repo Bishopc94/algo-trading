@@ -37,7 +37,7 @@ Pre-Market Scan          Find stocks moving on volume/gaps
         |
    Market Open           Analyze SPY/QQQ/VIX for market regime
         |
-  Strategy Evaluation    Run 3 stock + 8 options strategies on candidates
+  Strategy Evaluation    Run 8 stock + 8 options strategies on candidates
         |
   Signal Ranking         Score and prioritize signals by conviction
         |
@@ -63,7 +63,7 @@ Pre-Market Scan          Find stocks moving on volume/gaps
 
 | Category | Details |
 |---|---|
-| **Stock Strategies** | Mean Reversion, Momentum Breakout, VWAP Reclaim |
+| **Stock Strategies** | Mean Reversion, Momentum Breakout, VWAP Reclaim, EMA Crossover, Bollinger Band Squeeze, MACD Divergence, Pullback, Opening Range Breakout (ORB) |
 | **Options Strategies** | Credit Put Spreads, Debit Call Spreads, Long Calls, Long Puts, Cash-Secured Puts, Covered Calls, Covered Straddles, Momentum Options |
 | **PDT Management** | Swing-first philosophy, day-trade budgeting, emergency reserve |
 | **Market Regime** | SPY/QQQ/VIX breadth scoring gates all entries |
@@ -183,11 +183,16 @@ For the full deep dive, see [docs/BACKTESTING.md](docs/BACKTESTING.md).
 
 | Strategy | What It Does | When It Works | Hold Period | PDT Cost |
 |---|---|---|---|---|
-| **Mean Reversion** | Buys when RSI drops below 35 while price stays above the 20-day EMA and near the lower Bollinger Band. Bets the stock will bounce back to its average. | Ranging/pullback markets | Swing (2-5 days) | Free |
-| **Momentum** | Buys when price breaks above the 20-day high with 2x+ normal volume and high daily range. Rides the trend up. | Trending/breakout markets | Adaptive | 0 or 1 |
-| **VWAP Reclaim** | Buys when price reclaims VWAP from below on elevated volume during the trading day. Requires a meaningful dip (>0.5% below VWAP) before the reclaim. | Strong intraday trends | Day only | 1 |
+| **Mean Reversion** | Buys RSI-oversold dips near lower Bollinger Band with MACD turning up and volume capitulation. | Ranging/pullback markets | Swing (2-5 days) | Free |
+| **Momentum** | Buys breakouts above 20-day high with stacked EMAs, MACD > 0, RSI 50-80, and pre-breakout consolidation. | Trending/breakout markets | Adaptive | 0 or 1 |
+| **VWAP Reclaim** | Buys VWAP reclaim from below on elevated volume with bullish candle and meaningful dip depth (>0.5%). | Strong intraday trends | Day only | 1 |
+| **EMA Crossover** | Buys fresh EMA-9/EMA-20 crossovers in established uptrends (EMA-20 > EMA-50) with MACD and volume confirmation. | Trending markets | Swing | Free |
+| **BB Squeeze** | Buys breakouts from Bollinger Band squeeze (width in bottom 30%) with MACD, RSI, and volume confirmation. | Volatility compression | Adaptive | 0 or 1 |
+| **MACD Divergence** | Buys bullish MACD divergence (price lower low, MACD higher low) with RSI double-confirmation and volume decline. | Reversal setups | Swing | Free |
+| **Pullback** | Buys pullbacks to EMA-20/50 support with volume dry-up, MACD still positive, and bullish candle reversal. | Uptrend continuation | Swing | Free |
+| **ORB** | Buys opening range breakouts (first 30 min) with volume spike, bullish candle, and sustained close above range. | Intraday breakouts | Day only | 1 |
 
-**Why these three?** Mean reversion and momentum are anti-correlated strategies. When markets chop sideways, mean reversion profits (stocks keep bouncing between support and resistance) while momentum sits out (no breakouts to chase). When markets trend strongly, momentum profits (stocks break to new highs on volume) while mean reversion stays flat (stocks don't pull back to oversold levels). VWAP is the intraday specialist — used sparingly because it costs a precious day-trade slot.
+**Why these eight?** The strategies are designed for maximum diversification across market conditions. Mean reversion and momentum are anti-correlated. EMA crossover and pullback profit in established trends. BB squeeze catches volatility expansion. MACD divergence catches reversals. VWAP and ORB are intraday specialists. By combining trend-following, mean-reversion, and breakout strategies, the system stays profitable in more conditions than any single strategy.
 
 ### Options Strategies
 
@@ -281,11 +286,7 @@ All times Eastern Time (ET), Monday-Friday.
 |---|---|---|
 | **9:00 AM** | Pre-market scan | Scan ~10,000 stocks, return top 20 candidates by gap + volume. Scan separate options universe (top 30 by volume + liquidity). |
 | **9:30 AM** | Market open | Cache equity, sync positions, analyze SPY/QQQ/VIX market regime |
-| **9:35 AM** | Entry window | Run all stock + options strategies, rank signals, submit orders |
-| **10:15 AM** | Mid-morning options | Dedicated options pass after IV settles from open |
-| **11:00 AM** | Late morning | Catch mean reversion / VWAP setups that formed after open |
-| **12:00 PM** | Midday check | Re-evaluate, check new swing setups |
-| **3:00 PM** | Power hour | Fresh scan + full evaluation with current prices |
+| **9:45 AM - 3:45 PM** | Scan & evaluate (every 15 min) | Run all 8 stock + 8 options strategies, rank signals, submit orders |
 | **3:30 PM** | Options expiry check | Close options expiring today/tomorrow |
 | **3:50 PM** | EOD close | Force-close day trades |
 | **4:05 PM** | EOD review | Log P&L, save equity snapshot |
@@ -302,7 +303,7 @@ account:          # Starting capital, position limits (25% max), daily loss limi
 pdt:              # Day trade budget (3), reserve (1), min conviction for day trades
 scanner:          # Price range ($2-50), volume filters, gap threshold, max candidates
   options_universe: # Separate filters for options-eligible stocks ($10-500, >1M volume)
-strategies:       # Enable/disable and tune each of the 11 strategies
+strategies:       # Enable/disable and tune each of the 16 strategies
 options:          # Options position limits (3), capital allocation (50%)
 sentiment:        # News lookback window, conviction thresholds
 risk:             # Stop loss %, trailing stop %, Kelly fraction, portfolio heat
@@ -339,7 +340,13 @@ ai_trade/
 │   │   ├── mean_reversion.py           #   RSI oversold dip-buying (swing)
 │   │   ├── momentum.py                 #   Volume breakout (adaptive)
 │   │   ├── vwap.py                     #   VWAP reclaim (day trade)
+│   │   ├── ema_crossover.py            #   EMA-9/20 crossover trend-following (swing)
+│   │   ├── bb_squeeze.py               #   Bollinger Band squeeze breakout (adaptive)
+│   │   ├── macd_divergence.py          #   Bullish MACD divergence (swing)
+│   │   ├── pullback.py                 #   Pullback to EMA support (swing)
+│   │   ├── orb.py                      #   Opening range breakout (day trade)
 │   │   ├── signal.py                   #   Signal ranking + queue builder (the "brain")
+│   │   ├── weighter.py                 #   Adaptive strategy weighting
 │   │   └── options/                    #   8 options strategies
 │   │       ├── base.py                 #     Shared utilities: filter_contracts, enrich_greeks, select_by_delta
 │   │       ├── credit_put_spread.py    #     Bull put spread (defined risk income)
@@ -363,6 +370,7 @@ ai_trade/
 │   ├── monitoring/                     # Observability
 │   │   ├── database.py                #   SQLite persistence (indexed tables)
 │   │   ├── performance.py             #   P&L metrics (Sharpe, drawdown, win rate)
+│   │   ├── console.py                 #   Pretty console output formatters
 │   │   ├── notifier.py               #   Email alerts (SMTP, background threads)
 │   │   └── logger.py                  #   Structured logging (JSON + console)
 │   ├── scheduler/
@@ -404,7 +412,7 @@ ai-trade-backtest [--symbols AAPL MSFT] [--default-universe] [--days 90]
 | Document | What You'll Learn |
 |---|---|
 | [ARCHITECTURE.md](docs/ARCHITECTURE.md) | System design, data flow, component interactions, design patterns |
-| [STRATEGIES.md](docs/STRATEGIES.md) | All 11 strategies — theory, entry/exit conditions, conviction scoring |
+| [STRATEGIES.md](docs/STRATEGIES.md) | All 16 strategies — theory, entry/exit conditions, conviction scoring |
 | [OPTIONS_GUIDE.md](docs/OPTIONS_GUIDE.md) | Options fundamentals — calls, puts, Greeks, spreads |
 | [RISK_MANAGEMENT.md](docs/RISK_MANAGEMENT.md) | Position sizing, loss limits, portfolio heat, PDT, bracket orders |
 | [BACKTESTING.md](docs/BACKTESTING.md) | Walk-forward simulator, Black-Scholes pricing, limitations |
@@ -427,6 +435,45 @@ ai-trade-backtest [--symbols AAPL MSFT] [--default-universe] [--days 90]
 ---
 
 ## Changelog
+
+### v1.2.0 — Multi-Indicator Confluence & Options Strategy Optimization
+
+**Strategy Overhaul (16 strategies rewritten)**
+- All 8 stock strategies now require 5-7 independent entry conditions (price action + volume + RSI + MACD + EMA structure)
+- All 8 options strategies now require multi-indicator confluence (MACD, EMA-50, volume patterns, Bollinger Bands)
+- Additive conviction scoring with per-factor bonuses replaces linear scaling
+- Every stock strategy enforces minimum 2:1 reward-to-risk ratio (1.5:1 for intraday)
+- MACD histogram alignment required across all strategies
+- Stacked EMA confirmation (close > EMA-20 > EMA-50) for bullish entries
+- Pre-breakout consolidation filter on momentum and long call strategies
+- Volume pattern analysis: dry-up on pullbacks, spikes on breakouts, capitulation on reversals
+
+**Hardening**
+- PDT pre-check before order submission prevents 30+ blocked order attempts per day
+- Failed symbol blacklist after 2 consecutive order failures stops retrying halted/untradable symbols
+- Swing conviction floor raised to 0.55 (was no minimum)
+- Post-modifier conviction floor raised to 0.50 (was 0.35)
+- Scanner min_price raised to $5 to filter penny stocks prone to halts and spreads
+
+**Config Updates**
+- EMA crossover RSI max tightened from 75 to 70
+- BB squeeze min_relative_volume raised from 1.3 to 1.5
+- ORB min_range_pct parameter added (0.3%)
+- Debit call spread max_debit_pct tightened from 0.60 to 0.50
+- Credit put spread max_risk reduced from $250 to $100
+
+### v1.1.0 — Pretty Console Logging, 5 New Strategies, Adaptive Weighting
+
+**New Features**
+- 5 new stock strategies: EMA Crossover, BB Squeeze, MACD Divergence, Pullback, ORB
+- Adaptive strategy weighting based on recent performance (win rate + profit factor)
+- Pretty console output with Unicode box-drawing characters and consistent formatting
+- 15-minute scanning interval replaces fixed entry windows (9:45 AM - 3:45 PM every 15 min)
+
+**Bug Fixes**
+- Fixed bracket order rejection for fill slippage (widened clamp buffer from 0.01 to 0.05)
+- Fixed undefined variables in premarket scan job (momentum_count, mr_candidates, vwap_candidates)
+- Fixed Unicode encoding error in console output (added UTF-8 encoding)
 
 ### v0.4.0 — Refactor, Tuning & Email Alerts
 

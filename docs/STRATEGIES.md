@@ -11,16 +11,21 @@ This document is a comprehensive reference for every strategy the bot can execut
   - [1. Mean Reversion](#1-mean-reversion)
   - [2. Momentum](#2-momentum)
   - [3. VWAP Reclaim](#3-vwap-reclaim)
+  - [4. EMA Crossover](#4-ema-crossover)
+  - [5. BB Squeeze](#5-bb-squeeze)
+  - [6. MACD Divergence](#6-macd-divergence)
+  - [7. Pullback](#7-pullback)
+  - [8. Opening Range Breakout (ORB)](#8-opening-range-breakout-orb)
 - [Options Strategies](#options-strategies)
   - [Options Primer](#options-primer)
-  - [4. Credit Put Spread](#4-credit-put-spread-bull-put-spread)
-  - [5. Debit Call Spread](#5-debit-call-spread-bull-call-spread)
-  - [6. Long Call](#6-long-call)
-  - [7. Long Put](#7-long-put)
-  - [8. Cash Secured Put](#8-cash-secured-put)
-  - [9. Covered Call](#9-covered-call)
-  - [10. Covered Straddle](#10-covered-straddle)
-  - [11. Momentum Options](#11-momentum-options)
+  - [9. Credit Put Spread](#9-credit-put-spread-bull-put-spread)
+  - [10. Debit Call Spread](#10-debit-call-spread-bull-call-spread)
+  - [11. Long Call](#11-long-call)
+  - [12. Long Put](#12-long-put)
+  - [13. Cash Secured Put](#13-cash-secured-put)
+  - [14. Covered Call](#14-covered-call)
+  - [15. Covered Straddle](#15-covered-straddle)
+  - [16. Momentum Options](#16-momentum-options)
 - [Signal Ranking: The Brain](#signal-ranking-the-brain)
 - [Key Concepts Glossary](#key-concepts-glossary)
 
@@ -90,13 +95,16 @@ Mean reversion strategies profit by buying during these temporary dips and selli
 
 #### Entry Conditions
 
-All three of these must be true simultaneously:
+All of these must be true simultaneously:
 
-| Condition | Code Equivalent | What It Means |
-|-----------|----------------|---------------|
-| RSI < 40 | `rsi < 40` | The stock is **oversold** — selling pressure has been heavy recently. RSI (Relative Strength Index) measures the ratio of recent up-moves to down-moves on a 0-100 scale. Below 30 is classically "oversold"; we use 40 as a less aggressive threshold. |
-| Close > EMA-20 * 0.98 | `close > ema_20 * 0.98` | The stock is **still in an uptrend**. Even though it dipped, the current price is within 2% of the 20-day Exponential Moving Average. The EMA-20 gives more weight to recent prices than a simple average. If the stock were crashing through its trend, this condition would fail and we'd stay out. |
-| Close < BB_lower * 1.03 | `close < bb_lower * 1.03` | The stock is **near the lower Bollinger Band**. Bollinger Bands are an envelope drawn 2 standard deviations above and below a 20-period moving average. The lower band represents a statistically extreme low. Being within 3% of it confirms the stock is stretched to the downside. |
+| Condition | What It Means |
+|-----------|---------------|
+| RSI < 38 (configurable) | Oversold — heavy recent selling pressure |
+| Close > EMA-20 * 0.97 | Still near short-term uptrend (3% buffer) |
+| Close < BB_lower * 1.02 | At or below lower Bollinger Band (statistical extreme) |
+| Close > EMA-50 * 0.95 | Medium-term structure not broken (5% buffer) |
+| MACD histogram rising | Selling momentum decelerating (less negative than prior bar) |
+| Volume declining 3 bars | Capitulation pattern — sellers exhausting |
 
 **In plain English:** "The stock is oversold, near statistical support, but hasn't broken its uptrend."
 
@@ -150,21 +158,15 @@ For a 20-period EMA, the multiplier is `2 / 21 = 0.0952`. Today's close gets abo
 
 #### Conviction Calculation
 
-Conviction scales **linearly** from 0.5 to 1.0 as RSI drops from 40 to 20:
-
+Conviction is additive (0.55-0.85 range):
 ```
-conviction = 0.5 + 0.5 * (40 - rsi) / (40 - 20)
+Base conviction: 0.55
++ 0.10: RSI depth (deeper oversold = stronger reversion)
++ 0.07: BB proximity (closer to lower band)
++ 0.05: MACD turning (histogram rising = selling decelerating)
++ 0.05: Volume capitulation (3-bar declining pattern)
++ 0.03: EMA-20 > EMA-50 (uptrend structure intact)
 ```
-
-| RSI | Conviction | Interpretation |
-|-----|-----------|----------------|
-| 40 | 0.50 | Minimum — barely oversold |
-| 35 | 0.625 | Moderate |
-| 30 | 0.75 | Strong |
-| 25 | 0.875 | Very strong |
-| 20 | 1.00 | Maximum — deeply oversold, likely to bounce |
-
-The lower the RSI, the more "stretched" the rubber band is, and the more confident we are in a snapback.
 
 #### Stop-Loss and Take-Profit (ATR-Based)
 
@@ -218,14 +220,17 @@ The key insight is **volume confirmation**. A stock can briefly touch a new high
 
 #### Entry Conditions
 
-All four must be true:
+All of these must be true:
 
-| Condition | Code Equivalent | What It Means |
-|-----------|----------------|---------------|
-| Close > 20-day high | `close > high_20d` | The stock is making a **new 20-day high** — a breakout. The `high_20d` is the highest closing price over the last 20 trading days. |
-| Relative volume > 1.5x | `rel_vol > 1.5` | Today's volume is at least **1.5 times the 20-day average volume**. This confirms the breakout has real participation. |
-| ADR > 2% | `adr > 0.02` | **Average Daily Range** exceeds 2%. ADR = average of `(high - low) / close` over recent bars. This filters out low-volatility stocks where a "breakout" might only be a few cents. |
-| Close > EMA-20 | `close > ema_20` | The stock is **above its short-term trend**, confirming upward momentum. |
+| Condition | What It Means |
+|-----------|---------------|
+| Close > 20-day high | Fresh breakout above resistance |
+| Relative volume > 2.0x | Institutional participation (raised from 1.5x) |
+| ADR > 2% | Enough daily range to be worth trading |
+| Close > EMA-20 > EMA-50 | Stacked uptrend (price above both EMAs, EMAs in order) |
+| RSI 50-80 | Positive momentum, not exhausted |
+| MACD histogram > 0 | Momentum aligned bullish |
+| Prior 5-bar range < 2x ATR | Pre-breakout consolidation (tight range before explosion) |
 
 #### Relative Volume Explained
 
@@ -245,23 +250,15 @@ relative_volume = current_bar_volume / average_volume_20_days
 
 #### Conviction Calculation
 
-Conviction scales linearly with relative volume:
-
+Conviction is additive (0.55-1.0 range):
 ```
-if rel_vol <= 1.5:  conviction = 0.50
-if rel_vol >= 5.0:  conviction = 1.00
-else:               conviction = 0.50 + 0.50 * (rel_vol - 1.5) / (5.0 - 1.5)
+Base conviction: 0.55
++ 0.10: Volume strength (3x+ = full, 2x = partial)
++ 0.10: Trend strength (EMA-20/EMA-50 gap)
++ 0.08: RSI sweet spot (55-70)
++ 0.07: MACD accelerating (histogram rising)
++ 0.05: Tight pre-breakout consolidation
 ```
-
-> **Python note:** The code uses `min()` and `max()` built-in functions to clamp the result between 0.5 and 1.0. `min(1.0, max(0.5, value))` ensures the conviction never goes below 0.5 or above 1.0.
-
-| Relative Volume | Conviction |
-|-----------------|-----------|
-| 1.5x | 0.50 |
-| 2.0x | 0.571 |
-| 3.0x | 0.714 |
-| 4.0x | 0.857 |
-| 5.0x+ | 1.00 |
 
 #### Why "Adaptive" Hold Type?
 
@@ -307,22 +304,20 @@ VWAP is the benchmark that institutional traders (mutual funds, pension funds) u
 
 | Condition | What It Means |
 |-----------|---------------|
-| Price reclaims VWAP from below | The current bar closes above VWAP, but a recent bar closed below it. This is the "reclaim" event. |
-| Bar volume > 1.5x average | The reclaim bar has elevated volume, confirming institutional participation. |
-| Recent dip below VWAP in last 10 bars | At least one of the last 10 bars had a close below VWAP. This ensures we're catching a real reclaim, not just a stock that's been above VWAP all day. |
+| Close > VWAP * 1.001 | Meaningfully above VWAP (not noise) |
+| Recent dip below VWAP (last 10 bars) | True reclaim, not just hovering above |
+| Dip depth >= 0.5% below VWAP | Meaningful dip, not a shallow touch |
+| Bar volume > 1.5x average | Volume confirms reclaim |
+| Bullish candle (close > open) | Buyers in control on the reclaim bar |
 
 #### Conviction Calculation
 
-The conviction for VWAP Reclaim has a **base of 0.7** and is adjusted by two factors:
-
+Conviction is additive (0.55-0.90 range):
 ```
-conviction = 0.7 + depth_adjustment + volume_adjustment
+Base conviction: 0.55
++ up to 0.20: Dip depth (deeper dip = stronger reclaim)
++ up to 0.15: Volume strength above 1.5x average
 ```
-
-- **Depth-of-dip adjustment:** How far below VWAP did the stock fall? A deeper dip (e.g., 2% below VWAP) gets a larger bonus than a shallow dip (0.1% below). The logic: a deeper dip that gets reclaimed is a stronger signal.
-- **Volume strength adjustment:** How strong is the reclaim volume relative to average? Volume at 3x average adds more conviction than volume at 1.6x.
-
-The result is clamped to the [0.5, 1.0] range.
 
 #### Stops
 
@@ -339,6 +334,176 @@ This makes intuitive sense: if the stock falls back below the low of the dip, th
 #### Why DAY Only?
 
 VWAP resets at market open every day. It is a purely intraday indicator with no meaning overnight. A VWAP reclaim trade has no thesis after the close, so it must be closed the same day — making it a day trade that costs 1 PDT slot.
+
+---
+
+### 4. EMA Crossover
+
+> **Hold Type:** SWING (no PDT cost)
+
+#### Theory
+
+When the fast EMA (9-period) crosses above the slow EMA (20-period) in an established uptrend (EMA-20 > EMA-50), it signals trend continuation. This strategy requires multi-indicator confluence: the crossover must be fresh (single-bar), MACD must be positive, volume must confirm, and the candle must be bullish.
+
+#### Entry Conditions
+
+| Condition | What It Means |
+|-----------|---------------|
+| EMA-9 > EMA-20 (current bar) | Bullish crossover happened |
+| EMA-9 <= EMA-20 (prior bar) | Crossover is fresh (just occurred) |
+| EMA-20 > EMA-50 | Established uptrend structure |
+| Close > EMA-50 | Confirmed above medium-term trend |
+| RSI 50-70 | Positive momentum, not overbought |
+| MACD histogram > 0 | Momentum aligned |
+| Relative volume >= 1.2x | Participation confirms move |
+| Bullish candle (close > open) | Buyers in control |
+
+#### Conviction
+
+Additive scoring (0.55-0.90):
+```
+Base: 0.55
++ 0.10: Trend strength (EMA-20/EMA-50 gap)
++ 0.08: RSI sweet spot (55-65)
++ 0.07: MACD accelerating
++ 0.07: Volume strength (2x+ = full)
++ 0.05: EMA gap strength
+```
+
+---
+
+### 5. BB Squeeze
+
+> **Hold Type:** ADAPTIVE (DAY if conviction >= 0.9, else SWING)
+
+#### Theory
+
+Volatility compression (Bollinger Bands narrowing) precedes explosive moves. When BB width contracts to the bottom 30% of its 50-bar range and then expands with a breakout above the upper band on volume, it signals a directional breakout.
+
+#### Entry Conditions
+
+| Condition | What It Means |
+|-----------|---------------|
+| Recent BB width in bottom 30% | Volatility was compressed (squeeze) |
+| BB width expanding | Bands releasing — breakout starting |
+| Close > BB upper band | Price breaking out above the envelope |
+| Relative volume > 1.5x | Volume confirms the breakout |
+| MACD histogram > 0 | Momentum aligned |
+| RSI 50-80 | Positive momentum, not exhausted |
+| Close > EMA-20 | Trend confirmation |
+
+#### Conviction
+
+Additive scoring (0.55-0.90):
+```
+Base: 0.55
++ 0.10: Squeeze depth (tighter = more explosive)
++ 0.08: Volume strength
++ 0.07: MACD accelerating
++ 0.06: RSI sweet spot
++ 0.05: EMA-20 > EMA-50 uptrend structure
+```
+
+---
+
+### 6. MACD Divergence
+
+> **Hold Type:** SWING (no PDT cost)
+
+#### Theory
+
+Bullish divergence: price makes a lower low but MACD histogram makes a higher low. This signals weakening selling pressure — a reversal setup. We require double confirmation: RSI must also show divergence (higher low while price makes lower low).
+
+#### Entry Conditions
+
+| Condition | What It Means |
+|-----------|---------------|
+| Two swing lows in last 20 bars (4+ bars apart) | Defined price structure |
+| Price lower low + MACD higher low | Classic bullish divergence |
+| MACD hist positive NOW, was negative within 3 bars | Fresh turn from bearish to bullish |
+| RSI > 30 | Not in freefall |
+| RSI divergence (higher low at recent swing low) | Double confirmation |
+| Close > EMA-50 * 0.97 | Near structural support |
+| Volume declining on second low | Sellers exhausting |
+
+#### Conviction
+
+Additive scoring (0.55-0.85):
+```
+Base: 0.55
++ 0.10: Divergence magnitude
++ 0.07: RSI double-divergence confirmation
++ 0.05: Volume declining (seller exhaustion)
++ 0.05: Close near EMA-20 support
++ 0.03: EMA-20 > EMA-50 (uptrend intact)
+```
+
+---
+
+### 7. Pullback
+
+> **Hold Type:** SWING (no PDT cost)
+
+#### Theory
+
+In established uptrends, buying pullbacks to key moving average support offers high-probability entries. The key insight is that during a healthy pullback, volume dries up (sellers exhaust) while the trend structure (MACD, EMAs) remains intact.
+
+#### Entry Conditions
+
+| Condition | What It Means |
+|-----------|---------------|
+| EMA-20 > EMA-50 (gap > 1%) | Uptrend structure with meaningful separation |
+| Close < EMA-20 but > EMA-50 | Pulled back into support zone |
+| Close near EMA-20 or EMA-50 | Within tolerance % of moving average support |
+| RSI 40-55 | Pulled back but not broken |
+| MACD line > signal line | Trend momentum still intact despite pullback |
+| Relative volume < 1.2x | Volume dry-up (sellers exhausted) |
+| Bullish candle (close > open) | Buyers stepping in |
+| Recent RSI was higher (5-bar lookback) | Fresh pullback, not sustained weakness |
+
+#### Conviction
+
+Additive scoring (0.55-0.85):
+```
+Base: 0.55
++ 0.10: Strong uptrend structure (EMA gap)
++ 0.07: RSI in ideal pullback zone (43-50)
++ 0.05: Volume dry-up (lower = better)
++ 0.05: MACD spread (bigger = stronger trend)
++ 0.03: Near EMA-20 (shallow pullback = stronger)
+```
+
+---
+
+### 8. Opening Range Breakout (ORB)
+
+> **Hold Type:** DAY (costs 1 PDT slot)
+
+#### Theory
+
+The first 30 minutes of trading establishes a range that reflects the initial battle between buyers and sellers. A breakout above that range on strong volume with multiple confirmations predicts the intraday trend direction.
+
+#### Entry Conditions
+
+| Condition | What It Means |
+|-----------|---------------|
+| Opening range width >= 0.3% of price | Meaningful volatility (not a flat open) |
+| Close > opening range high | Price breaking above the range |
+| Breakout bar volume > 1.5x OR average volume | Volume confirms the breakout |
+| Bullish candle (close > open) | Buyers in control |
+| Close in upper half of bar | Sustained push, not just a wick |
+| 2 of last 3 bars above OR high | Trend forming, not a single-bar spike |
+
+#### Conviction
+
+Additive scoring (0.60-0.90):
+```
+Base: 0.60
++ 0.10: Breakout magnitude (% above OR high)
++ 0.08: Volume ratio strength
++ 0.07: Bar strength (close position within bar)
++ 0.05: Opening range tightness (tighter = more explosive)
+```
 
 ---
 
