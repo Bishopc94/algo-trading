@@ -15,6 +15,7 @@ venv/
 # Data
 data/
 logs/
+!src/ai_trade/data
 
 # IDE
 .vscode/
