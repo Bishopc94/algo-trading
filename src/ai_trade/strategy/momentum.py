@@ -1,30 +1,31 @@
 """Volume-breakout momentum strategy (adaptive hold type).
 
 Theory:
-  Stocks that break out to new highs on heavy volume tend to keep going.
-  The volume confirms the breakout is "real" — driven by institutional
-  buying, not just a few retail traders.
+  Stocks that break out to new highs on heavy volume tend to continue.
+  We require multi-indicator confluence: price breakout + volume spike +
+  trend alignment + momentum confirmation (MACD + RSI) + tight consolidation.
 
 Entry conditions (ALL must be true):
-  1. Close > 20-day high (price is at a new short-term high)
-  2. Relative volume > 1.5x (trading activity is well above average)
-  3. ADR% > 2.0 (the stock moves enough daily to be worth trading)
-  4. Close > EMA-20 (confirmed uptrend)
+  1. Close > 20-day high (fresh breakout)
+  2. Relative volume > 2.0x (institutional participation)
+  3. ADR% > 2.0 (enough range to be worth trading)
+  4. Close > EMA-20 > EMA-50 (stacked uptrend)
+  5. RSI 50-80 (positive momentum, not exhausted)
+  6. MACD histogram > 0 (momentum aligned)
+  7. Prior 5-bar range was tight (consolidation before breakout)
 
-Conviction: mapped from relative volume (1.5x→0.5, 3x→0.75, 5x+→1.0).
+Conviction: additive across 5 factors (volume, trend, RSI, MACD, consolidation).
 
-Adaptive hold type:
-  - Conviction >= 0.90 → DAY trade (costs 1 PDT slot)
-  - Conviction < 0.90  → SWING trade (free, held overnight)
-
-Exit: ``should_exit()`` always returns False — bracket orders handle it.
+Exit: bracket orders handle all exits.
 """
 
 from __future__ import annotations
 
 import pandas as pd
 
-from ai_trade.data.indicators import add_atr, add_ema, add_volume_profile, compute_adr
+from ai_trade.data.indicators import (
+    add_atr, add_ema, add_macd, add_rsi, add_volume_profile, compute_adr,
+)
 from ai_trade.monitoring.logger import get_logger
 from ai_trade.strategy.base import BaseStrategy, HoldType, Signal
 
@@ -32,13 +33,7 @@ logger = get_logger(__name__)
 
 
 class MomentumStrategy(BaseStrategy):
-    """Enter on volume-confirmed breakouts above the 20-day high.
-
-    Uses ATR-based stops that automatically adapt to each stock's volatility.
-    Exits are handled entirely by bracket orders (stop loss + take profit +
-    trailing stop).  The ``should_exit`` method always returns False so that
-    the mechanical exits run the trade — no second-guessing.
-    """
+    """Enter on volume-confirmed breakouts with multi-indicator confluence."""
 
     def evaluate(
         self,
@@ -48,24 +43,21 @@ class MomentumStrategy(BaseStrategy):
     ) -> Signal | None:
         df = daily_bars.copy()
 
-        # Read config parameters
         breakout_lookback: int = getattr(self.config, "breakout_lookback", 20)
-        vol_spike: float = getattr(self.config, "volume_spike_multiplier", 1.5)
+        vol_spike: float = getattr(self.config, "volume_spike_multiplier", 2.0)
         min_adr: float = getattr(self.config, "min_adr_pct", 2.0)
         atr_stop_mult: float = getattr(self.config, "atr_stop_multiplier", 1.5)
-        atr_tp_mult: float = getattr(self.config, "atr_tp_multiplier", 3.0)
+        atr_tp_mult: float = getattr(self.config, "atr_tp_multiplier", 3.5)
 
-        # Compute required indicators
         add_volume_profile(df)
         add_atr(df)
-        add_ema(df, [20])
+        add_ema(df, [20, 50])
+        add_rsi(df)
+        add_macd(df)
 
-        if len(df) < breakout_lookback + 1:
+        if len(df) < max(breakout_lookback + 1, 52):
             return None
 
-        # 20-day high EXCLUDING the current bar (shift(1)) — so the
-        # breakout must be fresh (today's close surpasses yesterday's
-        # 20-day rolling max)
         df["high_20"] = df["high"].rolling(breakout_lookback).max().shift(1)
 
         latest = df.iloc[-1]
@@ -75,53 +67,87 @@ class MomentumStrategy(BaseStrategy):
         adr_pct: float = compute_adr(df)
         atr: float = latest["atr_14"]
         ema_20: float = latest["ema_20"]
+        ema_50: float = latest["ema_50"]
+        rsi_val: float = latest["rsi_14"]
+        macd_hist: float = latest["macd_hist"]
 
-        # ----- Entry conditions (ALL must be true) -----
-
-        # Condition 1: Price must break above the 20-day high
+        # ── Hard filters ──
         if close <= high_20:
-            logger.debug("momentum_reject", symbol=symbol, reason="no_breakout", close=close, high_20=high_20)
             return None
-
-        # Condition 2: Volume must be elevated (confirms the breakout)
         if rel_vol <= vol_spike:
-            logger.debug("momentum_reject", symbol=symbol, reason="volume_too_low", rel_vol=rel_vol, threshold=vol_spike)
             return None
-
-        # Condition 3: Stock must have enough daily range to be profitable
         if adr_pct <= min_adr:
-            logger.debug("momentum_reject", symbol=symbol, reason="adr_too_low", adr_pct=adr_pct, threshold=min_adr)
             return None
 
-        # Condition 4: Trend confirmation — price above the 20-day EMA
-        if close <= ema_20:
-            logger.debug("momentum_reject", symbol=symbol, reason="below_ema20", close=close, ema_20=ema_20)
+        # Stacked uptrend: close > EMA-20 > EMA-50
+        if close <= ema_20 or ema_20 <= ema_50:
             return None
 
-        # ----- Conviction scoring (linear interpolation) -----
-        # Maps relative volume to conviction:
-        #   1.5x → 0.50,  3.0x → 0.75,  5.0x → 1.00
+        # RSI in momentum range (not oversold, not exhausted)
+        if rsi_val <= 50 or rsi_val >= 80:
+            return None
+
+        # MACD histogram positive (momentum aligned)
+        if macd_hist <= 0:
+            return None
+
+        # Pre-breakout consolidation: 5-bar range was tight (< 1.5x ATR)
+        recent_5 = df.iloc[-6:-1]
+        consolidation_range = recent_5["high"].max() - recent_5["low"].min()
+        if consolidation_range > 2.0 * atr:
+            return None  # Too choppy, not a clean breakout
+
+        # ── Conviction scoring (additive, 0.55–1.0) ──
+        conviction = 0.55
+
+        # +0.10: Volume strength
         if rel_vol >= 5.0:
-            conviction = 1.0
+            conviction += 0.10
         elif rel_vol >= 3.0:
-            conviction = 0.75 + 0.25 * (rel_vol - 3.0) / 2.0
+            conviction += 0.07
         else:
-            conviction = 0.5 + 0.25 * (rel_vol - 1.5) / 1.5
-        conviction = max(0.5, min(1.0, conviction))
+            conviction += 0.03
+
+        # +0.10: Trend strength (EMA gap)
+        trend_gap = (ema_20 - ema_50) / ema_50
+        if trend_gap > 0.03:
+            conviction += 0.10
+        elif trend_gap > 0.015:
+            conviction += 0.06
+        else:
+            conviction += 0.02
+
+        # +0.08: RSI sweet spot (55-70 = strong but not exhausted)
+        if 55 <= rsi_val <= 70:
+            conviction += 0.08
+        elif 50 < rsi_val < 55 or 70 < rsi_val < 75:
+            conviction += 0.04
+
+        # +0.07: MACD histogram strength (accelerating momentum)
+        prev_macd_hist = float(df.iloc[-2]["macd_hist"])
+        if macd_hist > prev_macd_hist > 0:
+            conviction += 0.07  # Accelerating
+        elif macd_hist > 0:
+            conviction += 0.03  # Positive but decelerating
+
+        # +0.05: Tight consolidation before breakout
+        if consolidation_range < 1.0 * atr:
+            conviction += 0.05
+        elif consolidation_range < 1.5 * atr:
+            conviction += 0.02
+
+        conviction = max(0.55, min(1.0, conviction))
 
         entry_price = close
-
-        # ATR-based stops adapt to each stock's volatility
         stop_loss = entry_price - atr_stop_mult * atr
         take_profit = entry_price + atr_tp_mult * atr
 
-        # Sanity: stop must be below entry, target above entry
-        if stop_loss >= entry_price or take_profit <= entry_price:
+        # Enforce minimum 2:1 R:R
+        risk = entry_price - stop_loss
+        reward = take_profit - entry_price
+        if risk <= 0 or reward / risk < 2.0:
             return None
 
-        # ----- Adaptive hold type -----
-        # Very high conviction (0.9+) → use a day-trade slot for quick profit
-        # Lower conviction → hold overnight as a swing trade (free PDT)
         hold_type = HoldType.DAY if conviction >= 0.9 else HoldType.SWING
 
         logger.info(
@@ -133,6 +159,9 @@ class MomentumStrategy(BaseStrategy):
             entry=entry_price,
             stop=stop_loss,
             target=take_profit,
+            rsi=rsi_val,
+            macd_hist=macd_hist,
+            trend_gap=round(trend_gap, 4),
             atr=atr,
             hold_type=hold_type.value,
         )
@@ -150,6 +179,9 @@ class MomentumStrategy(BaseStrategy):
                 "relative_volume": rel_vol,
                 "adr_pct": adr_pct,
                 "breakout_level": high_20,
+                "rsi": rsi_val,
+                "macd_hist": macd_hist,
+                "trend_gap": round(trend_gap, 4),
                 "atr": atr,
             },
         )
@@ -157,11 +189,4 @@ class MomentumStrategy(BaseStrategy):
     def should_exit(
         self, symbol: str, bars: pd.DataFrame, entry_price: float
     ) -> bool:
-        """Always returns False — bracket orders handle all exits.
-
-        The old dynamic should_exit was causing premature exits because
-        the rolling high_20 recalculates after entry, creating a moving
-        reference that triggers too easily.  Server-side bracket orders
-        are more reliable and persist even if the bot crashes.
-        """
         return False

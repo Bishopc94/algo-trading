@@ -1,32 +1,33 @@
 """Bollinger Band squeeze breakout strategy (adaptive hold type).
 
 Theory:
-  When Bollinger Band width contracts (volatility compression), it signals
-  that a big move is imminent.  When the bands expand and price breaks out
-  above the upper band on volume, it marks the start of a new trend.
-
-  This is the opposite of mean reversion (which buys at the bands) — this
-  strategy buys when price breaks through the bands after a squeeze.
+  Volatility compression (Bollinger Bands narrowing) precedes explosive moves.
+  True squeeze: BB width contracts AND Keltner Channel contains BB (TTM-style).
+  When bands expand and price breaks above the upper band on volume with
+  MACD momentum aligned, it signals a directional breakout.
 
 Entry conditions (ALL must be true):
-  1. BB width was below 0.08 within the last 5 bars (recent squeeze)
-  2. Current BB width is expanding (current > previous bar)
-  3. Close > BB upper (breakout above the upper band)
-  4. Relative volume > 1.3 (volume confirms the breakout)
+  1. Recent BB width was in bottom 30% of its 50-bar range (squeeze)
+  2. BB width expanding (current > previous)
+  3. Close > BB upper (breakout)
+  4. Relative volume > 1.5x (volume confirms)
+  5. MACD histogram > 0 (momentum aligned)
+  6. RSI 50-80 (positive momentum, not exhausted)
+  7. Close > EMA-20 (trend confirmation)
 
-Conviction: 0.55–0.85 based on squeeze depth and volume.
+Conviction: additive across squeeze depth, volume, MACD, RSI, trend.
 
-Exit conditions:
-  - Close < BB middle (retreated to mean — breakout failed)
-
-Hold type: ADAPTIVE (high conviction → DAY, else → SWING).
+Exit: Close < BB middle (breakout failed).
+Hold type: ADAPTIVE.
 """
 
 from __future__ import annotations
 
 import pandas as pd
 
-from ai_trade.data.indicators import add_atr, add_bollinger, add_volume_profile
+from ai_trade.data.indicators import (
+    add_atr, add_bollinger, add_ema, add_macd, add_rsi, add_volume_profile,
+)
 from ai_trade.monitoring.logger import get_logger
 from ai_trade.strategy.base import BaseStrategy, HoldType, Signal
 
@@ -34,11 +35,7 @@ logger = get_logger(__name__)
 
 
 class BBSqueezeStrategy(BaseStrategy):
-    """Enter on Bollinger Band squeeze breakouts confirmed by volume.
-
-    Uses BB middle (20-SMA) as stop level — if price falls back to the
-    mean, the breakout failed.  Target is ATR-based.
-    """
+    """Enter on Bollinger Band squeeze breakouts with multi-indicator confluence."""
 
     def evaluate(
         self,
@@ -48,18 +45,18 @@ class BBSqueezeStrategy(BaseStrategy):
     ) -> Signal | None:
         df = daily_bars.copy()
 
-        # Config parameters
-        squeeze_threshold: float = getattr(self.config, "squeeze_threshold", 0.08)
         squeeze_lookback: int = getattr(self.config, "squeeze_lookback", 5)
-        min_rel_vol: float = getattr(self.config, "min_relative_volume", 1.3)
-        atr_tp_mult: float = getattr(self.config, "atr_tp_multiplier", 3.0)
+        min_rel_vol: float = getattr(self.config, "min_relative_volume", 1.5)
+        atr_tp_mult: float = getattr(self.config, "atr_tp_multiplier", 3.5)
 
-        # Compute indicators
         add_bollinger(df)
         add_volume_profile(df)
         add_atr(df)
+        add_macd(df)
+        add_rsi(df)
+        add_ema(df, [20, 50])
 
-        if len(df) < 22:
+        if len(df) < 52:
             return None
 
         latest = df.iloc[-1]
@@ -72,74 +69,105 @@ class BBSqueezeStrategy(BaseStrategy):
         prev_bb_width: float = prev["bb_width"]
         rel_vol: float = latest.get("relative_volume", 1.0)
         atr: float = latest["atr_14"]
+        macd_hist: float = latest["macd_hist"]
+        rsi_val: float = latest["rsi_14"]
+        ema_20: float = latest["ema_20"]
+        ema_50: float = latest["ema_50"]
 
-        # ── Entry condition 1: Recent squeeze (BB width below threshold in last N bars) ──
-        # For small-cap / volatile stocks ($2-$50), bb_width is often wider than blue chips.
-        # Use a relative squeeze: width must have been in the bottom 20% of its own 50-bar range.
-        lookback_start = max(0, len(df) - squeeze_lookback - 1)
-        recent_widths = df["bb_width"].iloc[lookback_start:-1]  # Exclude current bar
+        # ── Hard filters ──
 
-        # Also check relative squeeze: width was in bottom 20% of recent 50-bar range
+        # Squeeze detection: width in bottom 30% of 50-bar range
         long_range = df["bb_width"].iloc[max(0, len(df) - 50):]
-        width_percentile = (bb_width - long_range.min()) / max(long_range.max() - long_range.min(), 0.001)
-
-        absolute_squeeze = not recent_widths.empty and recent_widths.min() < squeeze_threshold
-        relative_squeeze = not recent_widths.empty and width_percentile < 0.40  # Was recently compressed
-
-        if not (absolute_squeeze or relative_squeeze):
+        width_range = long_range.max() - long_range.min()
+        if width_range <= 0.001:
             return None
+        lookback_start = max(0, len(df) - squeeze_lookback - 1)
+        recent_widths = df["bb_width"].iloc[lookback_start:-1]
+        if recent_widths.empty:
+            return None
+        min_width = recent_widths.min()
+        width_percentile = (min_width - long_range.min()) / width_range
+        if width_percentile > 0.30:
+            return None  # Not a meaningful squeeze
 
-        # ── Entry condition 2: Bands expanding ──
+        # Bands must be expanding
         if bb_width <= prev_bb_width:
-            logger.debug("bb_squeeze_reject", symbol=symbol, reason="not_expanding",
-                         width=bb_width, prev_width=prev_bb_width)
             return None
 
-        # ── Entry condition 3: Breakout above upper band ──
+        # Breakout above upper band
         if close <= bb_upper:
-            logger.debug("bb_squeeze_reject", symbol=symbol, reason="not_above_upper_bb",
-                         close=close, bb_upper=bb_upper)
             return None
 
-        # ── Entry condition 4: Volume confirmation ──
+        # Volume confirmation
         if rel_vol < min_rel_vol:
-            logger.debug("bb_squeeze_reject", symbol=symbol, reason="low_volume",
-                         rel_vol=rel_vol, threshold=min_rel_vol)
             return None
 
-        # ── Conviction scoring (0.55–0.85) ──
+        # MACD momentum aligned
+        if macd_hist <= 0:
+            return None
+
+        # RSI in momentum range
+        if rsi_val <= 50 or rsi_val >= 80:
+            return None
+
+        # Price above EMA-20 (trend confirmation)
+        if close <= ema_20:
+            return None
+
+        # ── Conviction scoring (additive, 0.55–0.90) ──
         conviction = 0.55
 
-        # +0.15 max: Squeeze depth (tighter squeeze = stronger breakout potential)
-        min_width = recent_widths.min()
-        squeeze_depth = max(0, squeeze_threshold - min_width) / squeeze_threshold
-        conviction += 0.15 * min(1.0, squeeze_depth)
+        # +0.10: Squeeze depth (tighter = more explosive)
+        squeeze_depth = max(0, 0.30 - width_percentile) / 0.30
+        conviction += 0.10 * min(1.0, squeeze_depth)
 
-        # +0.15 max: Volume strength (1.3x→0, 3x+→max)
-        if rel_vol > min_rel_vol:
-            vol_bonus = (rel_vol - min_rel_vol) / (3.0 - min_rel_vol)
-            conviction += 0.15 * min(1.0, max(0, vol_bonus))
+        # +0.08: Volume strength
+        if rel_vol >= 3.0:
+            conviction += 0.08
+        elif rel_vol >= 2.0:
+            conviction += 0.05
+        elif rel_vol >= 1.5:
+            conviction += 0.03
 
-        conviction = max(0.55, min(0.85, conviction))
+        # +0.07: MACD accelerating
+        prev_macd_hist = float(prev["macd_hist"])
+        if macd_hist > prev_macd_hist > 0:
+            conviction += 0.07
+        elif macd_hist > 0:
+            conviction += 0.03
+
+        # +0.06: RSI in sweet spot
+        if 55 <= rsi_val <= 70:
+            conviction += 0.06
+        elif 50 < rsi_val < 55:
+            conviction += 0.03
+
+        # +0.05: Uptrend structure (EMA-20 > EMA-50)
+        if ema_20 > ema_50:
+            trend_gap = (ema_20 - ema_50) / ema_50
+            conviction += min(0.05, trend_gap * 2.0)
+
+        conviction = max(0.55, min(0.90, conviction))
 
         entry_price = close
-
-        # Stop at BB middle (20-SMA) — breakout failed if price returns to mean
         stop_loss = bb_middle
         take_profit = entry_price + atr_tp_mult * atr
 
-        if stop_loss >= entry_price or take_profit <= entry_price:
+        risk = entry_price - stop_loss
+        reward = take_profit - entry_price
+        if risk <= 0 or reward / risk < 2.0:
             return None
 
-        # Adaptive hold type
         hold_type = HoldType.DAY if conviction >= 0.9 else HoldType.SWING
 
         logger.info(
             "bb_squeeze_signal",
             symbol=symbol,
             bb_width=bb_width,
-            min_squeeze_width=min_width,
+            width_percentile=round(width_percentile, 3),
             rel_vol=rel_vol,
+            rsi=rsi_val,
+            macd_hist=macd_hist,
             conviction=conviction,
             entry=entry_price,
             stop=stop_loss,
@@ -158,8 +186,10 @@ class BBSqueezeStrategy(BaseStrategy):
             take_profit_price=take_profit,
             metadata={
                 "bb_width": bb_width,
-                "min_squeeze_width": min_width,
+                "width_percentile": round(width_percentile, 3),
                 "relative_volume": rel_vol,
+                "rsi": rsi_val,
+                "macd_hist": macd_hist,
                 "bb_middle": bb_middle,
                 "bb_upper": bb_upper,
                 "atr": atr,
@@ -169,21 +199,9 @@ class BBSqueezeStrategy(BaseStrategy):
     def should_exit(
         self, symbol: str, bars: pd.DataFrame, entry_price: float
     ) -> bool:
-        """Exit when price retreats below BB middle (breakout failed)."""
         df = bars.copy()
         add_bollinger(df)
-
         latest = df.iloc[-1]
-        close: float = latest["close"]
-        bb_middle: float = latest["bb_middle"]
-
-        if close < bb_middle:
-            logger.info(
-                "bb_squeeze_exit",
-                symbol=symbol,
-                close=close,
-                bb_middle=bb_middle,
-            )
+        if latest["close"] < latest["bb_middle"]:
             return True
-
         return False

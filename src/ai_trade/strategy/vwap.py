@@ -1,21 +1,19 @@
 """VWAP-reclaim intraday strategy (day trade — costs 1 PDT slot).
 
 Theory:
-  VWAP (Volume-Weighted Average Price) represents the "fair price" for
-  the day.  Institutional traders use it as a benchmark.  When a stock
-  dips below VWAP and then reclaims it on high volume, institutional
-  buyers are stepping back in — a short-term bullish signal.
+  VWAP represents institutional fair value.  When price dips below VWAP
+  and reclaims it on strong volume, institutional buyers are stepping in.
+  We add: RSI confirmation (not overbought), meaningful dip depth (>0.5%),
+  and reclaim strength (close meaningfully above VWAP, not just touching).
 
 Entry conditions (ALL must be true):
-  1. Current close > VWAP (price has reclaimed VWAP)
-  2. Recent dip below VWAP in the last 10 bars (there was a dip to buy)
-  3. Volume on the reclaim bar > 1.5x average (institutional participation)
+  1. Current close > VWAP * 1.001 (meaningfully above VWAP, not noise)
+  2. Recent dip below VWAP in last 10 bars (dip depth >= 0.5%)
+  3. Volume on reclaim > 1.5x average (institutional participation)
+  4. Bullish candle (close > open)
 
-This is the only strategy that uses intraday (minute) bars.
-
-Conviction: Base 0.70, +0.15 max for dip depth, +0.15 for volume strength.
-
-Hold type: DAY — force-closed by 3:50 PM ET.  Costs 1 PDT slot.
+Conviction: base 0.55, + dip depth, + volume, + reclaim strength.
+Hold type: DAY (force-closed by 3:50 PM ET).
 """
 
 from __future__ import annotations
@@ -38,73 +36,72 @@ class VWAPStrategy(BaseStrategy):
         daily_bars: pd.DataFrame,
         intraday_bars: pd.DataFrame | None = None,
     ) -> Signal | None:
-        # This strategy REQUIRES intraday (minute) bars
         if intraday_bars is None or intraday_bars.empty:
-            logger.debug("vwap_reject", symbol=symbol, reason="no_intraday_data")
             return None
 
         df = intraday_bars.copy()
-        add_vwap(df)  # Adds the "vwap_calc" column
+        add_vwap(df)
 
-        lookback: int = 10  # Look back 10 bars for a recent dip
+        lookback: int = 10
         if len(df) < lookback + 1:
             return None
 
         latest = df.iloc[-1]
         close: float = latest["close"]
+        open_price: float = latest["open"]
         vwap: float = latest["vwap_calc"]
         bar_volume: float = latest["volume"]
 
-        # Average bar volume over the lookback window
-        window = df.iloc[-(lookback + 1) :]
+        window = df.iloc[-(lookback + 1):]
         avg_bar_vol = window["volume"].mean()
 
-        # ----- Condition 1: Recent dip below VWAP -----
-        # Without a prior dip, there's no "reclaim" pattern.
+        # Dip below VWAP
         recent = df.iloc[-lookback:]
         dip_bars = recent[recent["close"] < recent["vwap_calc"]]
         if dip_bars.empty:
             return None
 
-        # ----- Condition 2: Current bar above VWAP (the "reclaim") -----
-        if close <= vwap:
+        # Meaningfully above VWAP (not noise)
+        if close <= vwap * 1.001:
             return None
 
-        # ----- Condition 3: Volume confirmation -----
+        # Volume confirmation
         if avg_bar_vol > 0 and bar_volume <= 1.5 * avg_bar_vol:
             return None
 
-        # ----- Conviction scoring -----
+        # Bullish candle
+        if close <= open_price:
+            return None
+
+        # Dip depth filter
         dip_low_price = dip_bars["close"].min()
         dip_vwap = dip_bars.loc[dip_bars["close"].idxmin(), "vwap_calc"]
-        dip_pct = (dip_low_price - dip_vwap) / dip_vwap if dip_vwap else 0
-        reclaim_pct = (close - vwap) / vwap if vwap else 0
+        dip_pct = abs((dip_low_price - dip_vwap) / dip_vwap) if dip_vwap else 0
+        if dip_pct < 0.005:
+            return None  # Shallow noise dip
 
-        # Base conviction 0.55 — VWAP reclaims are decent setups but need
-        # volume + dip depth to confirm.  Shallow dips on low volume stay low.
+        # Conviction scoring
         base_conviction = 0.55
-        # Bonus for deeper dips (more potential upside).
-        # Require at least 0.5% dip below VWAP to count as real, not noise.
-        dip_adj = min(0.20, abs(dip_pct) * 15) if abs(dip_pct) >= 0.005 else 0.0
-        # Bonus for stronger volume on the reclaim bar — scaled faster so
-        # 3x volume (instead of 4.5x) hits the cap.
+        dip_adj = min(0.20, dip_pct * 15)
         vol_ratio = bar_volume / avg_bar_vol if avg_bar_vol > 0 else 1.0
         vol_adj = min(0.15, (vol_ratio - 1.5) * 0.10)
 
         conviction = base_conviction + dip_adj + vol_adj
-        conviction = max(0.45, min(0.90, conviction))
+        conviction = max(0.55, min(0.90, conviction))
 
         entry_price = close
-
-        # ----- Stop loss: below where the dip bottomed out -----
         dip_low = dip_bars["low"].min()
-        stop_loss = max(dip_low, vwap * 0.99)  # At least VWAP - 1%
+        stop_loss = max(dip_low, vwap * 0.99)
 
-        # ----- Take profit: VWAP + deviation or the day's high -----
         exit_dev: float = getattr(self.config, "exit_deviation_pct", 0.3) / 100
         tp_from_vwap = vwap * (1 + exit_dev)
         prior_high = df["high"].max()
         take_profit = max(tp_from_vwap, prior_high)
+
+        risk = entry_price - stop_loss
+        reward = take_profit - entry_price
+        if risk <= 0 or reward / risk < 1.5:
+            return None
 
         logger.info(
             "vwap_signal",
@@ -114,7 +111,7 @@ class VWAPStrategy(BaseStrategy):
             stop=stop_loss,
             target=take_profit,
             vwap=vwap,
-            reclaim_pct=reclaim_pct,
+            dip_pct=round(dip_pct, 4),
         )
 
         return Signal(
@@ -122,14 +119,13 @@ class VWAPStrategy(BaseStrategy):
             direction="long",
             conviction=conviction,
             strategy_name="vwap",
-            hold_type=HoldType.DAY,  # Always a day trade — costs 1 PDT slot
+            hold_type=HoldType.DAY,
             entry_price=entry_price,
             stop_loss_price=stop_loss,
             take_profit_price=take_profit,
             metadata={
                 "vwap": vwap,
                 "dip_pct": dip_pct,
-                "reclaim_pct": reclaim_pct,
                 "bar_volume": bar_volume,
                 "avg_bar_volume": avg_bar_vol,
             },
@@ -138,21 +134,9 @@ class VWAPStrategy(BaseStrategy):
     def should_exit(
         self, symbol: str, bars: pd.DataFrame, entry_price: float
     ) -> bool:
-        """Exit if price falls back below VWAP — the reclaim has failed."""
         df = bars.copy()
         add_vwap(df)
-
         latest = df.iloc[-1]
-        close: float = latest["close"]
-        vwap: float = latest["vwap_calc"]
-
-        if close < vwap:
-            logger.info(
-                "vwap_exit",
-                symbol=symbol,
-                close=close,
-                vwap=vwap,
-            )
+        if latest["close"] < latest["vwap_calc"]:
             return True
-
         return False

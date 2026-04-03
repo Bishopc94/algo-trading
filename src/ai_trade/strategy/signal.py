@@ -152,8 +152,15 @@ class SignalAggregator:
             else:
                 day_signals.append(sig)
 
-        # ── Step 3: Sort swing signals by conviction (best first) ──
-        # Swing trades are free (no PDT cost) so they get priority.
+        # ── Step 3: Filter and sort swing signals by conviction ──
+        # Swing trades are free (no PDT cost) so they get priority, but
+        # they still need a minimum conviction to avoid noise trades.
+        min_swing_conviction: float = getattr(
+            self.risk_manager.config, "min_conviction_for_swing", 0.55
+        )
+        swing_signals = [
+            s for s in swing_signals if s.conviction >= min_swing_conviction
+        ]
         swing_signals.sort(key=lambda s: s.conviction, reverse=True)
 
         # ── Step 4: Filter day signals by PDT budget and conviction ──

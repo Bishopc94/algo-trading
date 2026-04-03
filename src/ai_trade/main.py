@@ -204,6 +204,8 @@ class TradingBot:
         self._candidates: list[dict] = []          # Today's stock scanner candidates
         self._options_candidates: list[dict] = []  # Today's options-eligible candidates
         self._running = False
+        self._failed_symbols: dict[str, str] = {}  # symbol -> reason (untradable, halted, etc.)
+        self._failed_symbol_counts: dict[str, int] = {}  # symbol -> consecutive fail count
 
     # ══════════════════════════════════════════════════════════
     # Lifecycle
@@ -410,6 +412,9 @@ class TradingBot:
         now = datetime.now(ET)
         log.info("job_start", job="premarket_scan", time=now.strftime("%H:%M:%S"))
         print(con.section("Pre-market Scan"))
+        # Reset daily blacklists — symbols halted yesterday may be tradable today
+        self._failed_symbols.clear()
+        self._failed_symbol_counts.clear()
         try:
             counts = self._run_full_scan()
             symbols = [c["symbol"] for c in self._candidates]
@@ -817,7 +822,10 @@ class TradingBot:
                 return
 
             # Fetch 60 days of daily bars for all candidates at once
-            symbols = [c["symbol"] for c in self._candidates]
+            # Filter out symbols that have repeatedly failed orders (halted, untradable, etc.)
+            symbols = [c["symbol"] for c in self._candidates if c["symbol"] not in self._failed_symbols]
+            if len(self._failed_symbols) > 0:
+                log.info("blacklisted_symbols_filtered", blacklisted=list(self._failed_symbols.keys()))
             end = datetime.now(ET)
             start = end - timedelta(days=60)
 
@@ -958,7 +966,8 @@ class TradingBot:
                 return
 
         # Final conviction gate after all modifiers
-        if sig.conviction < 0.35:
+        min_post_mod = getattr(self.cfg.sentiment, "min_conviction_after_mods", 0.50)
+        if sig.conviction < min_post_mod:
             log.info(
                 "trade_below_min_conviction",
                 symbol=sig.symbol,
@@ -998,6 +1007,17 @@ class TradingBot:
                 news_score=ns.net_score if ns else 0,
             )
             self.db.update_signal_action(sig.symbol, sig.strategy_name, "dry_run")
+            return
+
+        # Pre-check: skip if this symbol is already blacklisted
+        if sig.symbol in self._failed_symbols:
+            return
+
+        # Pre-check: verify PDT budget before submitting — Alpaca may classify
+        # even swing trades as day trades if the same symbol was closed today.
+        if self.pdt.would_be_day_trade(sig.hold_type) and not self.pdt.can_day_trade():
+            log.info("order_skipped_pdt_exhausted", symbol=sig.symbol)
+            print(con.skip(f"{sig.symbol}: PDT slots exhausted, skipping day trade."))
             return
 
         # Submit the bracket order to Alpaca
@@ -1049,6 +1069,13 @@ class TradingBot:
                 strategy=sig.strategy_name,
                 shares=shares,
             )
+            # Track consecutive failures — blacklist after 2 failures to avoid
+            # retrying halted/untradable symbols every 15-minute cycle.
+            count = self._failed_symbol_counts.get(sig.symbol, 0) + 1
+            self._failed_symbol_counts[sig.symbol] = count
+            if count >= 2:
+                self._failed_symbols[sig.symbol] = "repeated_order_failure"
+                log.info("symbol_blacklisted", symbol=sig.symbol, failures=count)
 
     # ══════════════════════════════════════════════════════════
     # Core Logic: Options evaluation pipeline
