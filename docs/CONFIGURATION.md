@@ -22,6 +22,11 @@ Both are loaded at startup by `src/ai_trade/config.py` and merged into a single 
   - [strategies.mean_reversion](#strategiesmean_reversion)
   - [strategies.momentum](#strategiesmomentum)
   - [strategies.vwap](#strategiesvwap)
+  - [strategies.ema_crossover](#strategiesema_crossover)
+  - [strategies.macd_divergence](#strategiesmacd_divergence)
+  - [strategies.bb_squeeze](#strategiesbb_squeeze)
+  - [strategies.orb](#strategiesorb)
+  - [strategies.pullback](#strategiespullback)
   - [strategies.credit_put_spread](#strategiescredit_put_spread)
   - [strategies.debit_call_spread](#strategiesdebit_call_spread)
   - [strategies.long_call](#strategieslong_call)
@@ -34,6 +39,7 @@ Both are loaded at startup by `src/ai_trade/config.py` and merged into a single 
   - [options](#options)
   - [risk](#risk)
   - [schedule](#schedule)
+  - [strategy_weighting](#strategy_weighting)
 - [Tuning Guide](#tuning-guide)
 
 ---
@@ -125,10 +131,10 @@ Portfolio-level sizing and loss limits. These parameters define the "envelope" w
 | Parameter | Default | Type | Valid Range | Description |
 |---|---|---|---|---|
 | `starting_capital` | `500.0` | float | > 0 | The dollar amount you funded the account with. Used as the baseline for percentage calculations. This does not need to match your actual account equity exactly -- it is a reference point for the position sizer. If your account grows to $800, the bot uses live equity from Alpaca for real-time sizing, but this value anchors initial calculations. |
-| `max_position_pct` | `0.30` | float | 0.01 -- 1.0 | Maximum fraction of portfolio equity that can go into a single position. At 0.30 (30%), a $500 account can put at most $150 into one stock. **Lower = more diversified but smaller positions. Higher = concentrated bets.** For accounts under $1,000, going below 0.20 may produce positions too small to be practical (e.g., 1-2 shares of a $10 stock). |
+| `max_position_pct` | `0.25` | float | 0.01 -- 1.0 | Maximum fraction of portfolio equity that can go into a single position. At 0.30 (30%), a $500 account can put at most $150 into one stock. **Lower = more diversified but smaller positions. Higher = concentrated bets.** For accounts under $1,000, going below 0.20 may produce positions too small to be practical (e.g., 1-2 shares of a $10 stock). |
 | `max_risk_per_trade_pct` | `0.02` | float | 0.005 -- 0.10 | Maximum fraction of equity you are willing to lose on a single trade if the stop loss is hit. At 0.02 (2%), a $500 account risks at most $10 per trade. This is the classic "2% rule" from position sizing theory. The position sizer uses this along with the stop-loss distance to calculate share count. **Lower = smaller positions, slower drawdowns. Higher = larger positions, faster drawdowns.** |
 | `daily_loss_limit_pct` | `0.05` | float | 0.01 -- 0.20 | If portfolio equity drops more than this percentage from the day's starting equity, the bot stops opening new trades for the rest of the day. At 0.05 (5%), a $500 account halts after losing $25 intraday. This is a circuit breaker. **Tighter limits protect capital but may cause you to miss recovery opportunities.** |
-| `max_open_positions` | `4` | integer | 1 -- 20 | Hard cap on simultaneous open stock positions. With a $500 account and 30% max position size, 4 positions could theoretically use 120% of the account (impossible without margin), so in practice this acts as a diversification floor. **Fewer positions = simpler to monitor. More positions = better diversification but thinner per-position sizing.** |
+| `max_open_positions` | `5` | integer | 1 -- 20 | Hard cap on simultaneous open stock positions. With a $500 account and 30% max position size, 4 positions could theoretically use 120% of the account (impossible without margin), so in practice this acts as a diversification floor. **Fewer positions = simpler to monitor. More positions = better diversification but thinner per-position sizing.** |
 
 ---
 
@@ -150,7 +156,7 @@ Pre-market stock screening filters. The scanner runs before market open to build
 
 | Parameter | Default | Type | Valid Range | Description |
 |---|---|---|---|---|
-| `min_price` | `2.00` | float | >= 0.01 | Minimum stock price in dollars. Stocks below $2 are often penny stocks with unreliable price action, wide spreads, and manipulation risk. **Lower = more candidates but riskier. Below $1 you enter OTC territory.** |
+| `min_price` | `1.00` | float | >= 0.01 | Minimum stock price in dollars. Stocks below $2 are often penny stocks with unreliable price action, wide spreads, and manipulation risk. **Lower = more candidates but riskier. Below $1 you enter OTC territory.** |
 | `max_price` | `50.00` | float | > min_price | Maximum stock price. With a $500 account and 30% max position, the most you can spend on one position is ~$150, meaning you can buy at most 3 shares of a $50 stock. **Higher max_price finds better-quality stocks but yields tiny share counts. Lower max_price focuses on cheaper stocks where you can build more meaningful positions.** |
 | `min_avg_volume` | `500000` | integer | >= 10000 | Minimum average daily volume (shares). Ensures adequate liquidity -- you want to enter and exit without moving the price. 500K shares/day is a moderate threshold. **Lower = more candidates but potential slippage issues. Higher = only highly liquid names.** |
 | `min_relative_volume` | `1.5` | float | >= 1.0 | Minimum ratio of today's volume to average volume. A value of 1.5 means the stock is trading at 150% of its typical volume. This is a proxy for "something is happening." **Higher = fewer but more active candidates. A value of 1.0 disables this filter.** |
@@ -167,10 +173,10 @@ Buys stocks that have pulled back from recent highs, betting on a return to the 
 |---|---|---|---|---|
 | `enabled` | `true` | boolean | true/false | Whether this strategy participates in signal generation. Set to `false` to disable without removing the config. |
 | `rsi_period` | `14` | integer | 2 -- 50 | Number of bars used to calculate RSI. The industry standard is 14. Shorter periods (e.g., 7) are more sensitive and trigger more signals. Longer periods are smoother and trigger fewer signals. |
-| `rsi_oversold` | `40` | integer | 10 -- 50 | RSI value below which the stock is considered oversold (a buy signal). The textbook value is 30, but 40 is more lenient, catching pullbacks earlier. **Lower = stricter, fewer but higher-conviction entries. Higher = more entries, some may be premature.** |
+| `rsi_oversold` | `38` | integer | 10 -- 50 | RSI value below which the stock is considered oversold (a buy signal). The textbook value is 30, but 40 is more lenient, catching pullbacks earlier. **Lower = stricter, fewer but higher-conviction entries. Higher = more entries, some may be premature.** |
 | `rsi_exit` | `60` | integer | 40 -- 90 | RSI value at which to take profit (exit signal). When RSI climbs back to 60, the stock has reverted toward its mean. **Higher = lets winners run longer. Lower = exits sooner, locking in smaller gains.** |
 | `atr_stop_multiplier` | `1.5` | float | 0.5 -- 5.0 | Stop loss is placed this many ATRs below the entry price. ATR measures typical daily price movement, so 1.5x ATR means the stop is 1.5 "normal days" of movement away. **Lower = tighter stops, more frequent stop-outs. Higher = wider stops, fewer stop-outs but larger losses when hit.** |
-| `atr_tp_multiplier` | `3.0` | float | 1.0 -- 10.0 | Take-profit target is placed this many ATRs above entry. At 3.0 with a stop multiplier of 1.5, the reward-to-risk ratio is 2:1, which is a solid baseline. **Higher = larger potential wins but fewer trades reach the target. Lower = more frequent exits but smaller wins.** |
+| `atr_tp_multiplier` | `3.5` | float | 1.0 -- 10.0 | Take-profit target is placed this many ATRs above entry. At 3.0 with a stop multiplier of 1.5, the reward-to-risk ratio is 2:1, which is a solid baseline. **Higher = larger potential wins but fewer trades reach the target. Lower = more frequent exits but smaller wins.** |
 | `hold_type` | `"swing"` | string | `"day"`, `"swing"`, `"adaptive"` | How long the strategy intends to hold. `"swing"` means multi-day (avoids using a day trade). `"day"` means intraday only (uses a day trade). `"adaptive"` lets the bot decide based on conditions. Mean reversion is set to swing because pullback recovery typically takes 2-5 days. |
 | `lookback_days` | `30` | integer | 10 -- 200 | Number of historical trading days used to assess the "mean" the stock should revert to. 30 days captures the recent trend. **Shorter = reacts to recent action, may miss larger context. Longer = incorporates more history but may be stale.** |
 
@@ -183,10 +189,10 @@ Buys stocks breaking out above recent resistance on above-average volume. Rides 
 | Parameter | Default | Type | Valid Range | Description |
 |---|---|---|---|---|
 | `enabled` | `true` | boolean | true/false | Enable or disable this strategy. |
-| `volume_spike_multiplier` | `1.5` | float | 1.0 -- 5.0 | Minimum ratio of current volume to average volume for a valid breakout. A breakout on low volume is often a false signal. 1.5 means volume must be at least 50% above average. **Higher = fewer but more reliable breakout signals. 1.0 disables volume confirmation.** |
+| `volume_spike_multiplier` | `2.0` | float | 1.0 -- 5.0 | Minimum ratio of current volume to average volume for a valid breakout. A breakout on low volume is often a false signal. 1.5 means volume must be at least 50% above average. **Higher = fewer but more reliable breakout signals. 1.0 disables volume confirmation.** |
 | `breakout_lookback` | `20` | integer | 5 -- 100 | Number of bars to look back for the resistance level. The stock's highest high over this window becomes the breakout threshold. 20 days is roughly one trading month. **Shorter = catches minor breakouts. Longer = only catches breakouts above significant, long-standing resistance.** |
 | `atr_stop_multiplier` | `1.5` | float | 0.5 -- 5.0 | Stop loss placement in ATR multiples below entry. Same mechanics as mean reversion. |
-| `atr_tp_multiplier` | `3.0` | float | 1.0 -- 10.0 | Take-profit target in ATR multiples above entry. Same mechanics as mean reversion. |
+| `atr_tp_multiplier` | `3.5` | float | 1.0 -- 10.0 | Take-profit target in ATR multiples above entry. Same mechanics as mean reversion. |
 | `hold_type` | `"adaptive"` | string | `"day"`, `"swing"`, `"adaptive"` | Momentum plays can resolve in hours or days. `"adaptive"` lets the bot decide based on time of day and signal strength. If a breakout happens at 3:30 PM, it may close same-day; if at 10:00 AM with a strong trend, it may hold overnight. |
 | `min_adr_pct` | `2.0` | float | 0.5 -- 10.0 | Minimum Average Daily Range as a percentage of price. ADR measures how much the stock typically moves in a day. At 2.0%, a $20 stock must have an average daily range of at least $0.40. This filters out stocks that do not move enough to be worth trading. **Lower = more candidates but some may barely move. Higher = only volatile names.** |
 
@@ -205,6 +211,82 @@ Intraday strategy that trades deviations from the Volume-Weighted Average Price.
 
 ---
 
+### `strategies.ema_crossover`
+
+Buys stocks when the fast EMA (9-period) crosses above the slow EMA (20-period) in an established uptrend. Catches smooth trend continuations.
+
+| Parameter | Default | Type | Valid Range | Description |
+|---|---|---|---|---|
+| `enabled` | `true` | boolean | true/false | Enable or disable this strategy. |
+| `fast_period` | `9` | integer | 3 -- 20 | Period for the fast EMA. Shorter = more sensitive to recent price action. |
+| `slow_period` | `20` | integer | 10 -- 50 | Period for the slow EMA. The crossover signal fires when fast crosses above slow. |
+| `trend_period` | `50` | integer | 20 -- 200 | Period for the trend-confirming EMA. Price must be above this EMA for uptrend confirmation. |
+| `rsi_min` | `50` | integer | 30 -- 60 | Minimum RSI for entry. Ensures positive momentum. |
+| `rsi_max` | `70` | integer | 60 -- 90 | Maximum RSI for entry. Avoids overbought entries. |
+| `atr_stop_multiplier` | `1.5` | float | 0.5 -- 5.0 | Stop loss in ATR multiples below entry. |
+| `atr_tp_multiplier` | `3.0` | float | 1.0 -- 10.0 | Take-profit target in ATR multiples above entry. |
+| `hold_type` | `"swing"` | string | `"day"`, `"swing"`, `"adaptive"` | Hold type. Swing by default -- crossover trends need 2-5 days to develop. |
+
+---
+
+### `strategies.macd_divergence`
+
+Detects bullish divergence where price makes lower lows but MACD histogram makes higher lows, signaling momentum is turning. A swing reversal strategy.
+
+| Parameter | Default | Type | Valid Range | Description |
+|---|---|---|---|---|
+| `enabled` | `true` | boolean | true/false | Enable or disable this strategy. |
+| `lookback_bars` | `20` | integer | 10 -- 50 | Number of bars to search for swing lows when detecting divergence. Longer lookback catches bigger divergence patterns. |
+| `atr_stop_multiplier` | `1.8` | float | 0.5 -- 5.0 | Stop loss in ATR multiples. Wider than typical (1.8x) because divergence entries can be early. |
+| `atr_tp_multiplier` | `3.5` | float | 1.0 -- 10.0 | Take-profit target in ATR multiples. |
+| `hold_type` | `"swing"` | string | `"day"`, `"swing"`, `"adaptive"` | Always swing -- divergence patterns resolve over days. |
+
+---
+
+### `strategies.bb_squeeze`
+
+Detects Bollinger Band compression (low volatility squeeze) followed by an expansion breakout above the upper band on volume. Catches the start of new trends after consolidation.
+
+| Parameter | Default | Type | Valid Range | Description |
+|---|---|---|---|---|
+| `enabled` | `true` | boolean | true/false | Enable or disable this strategy. |
+| `squeeze_lookback` | `5` | integer | 3 -- 20 | Number of bars to look back for the squeeze condition. BB width must have been below threshold within this window. |
+| `min_relative_volume` | `1.5` | float | 1.0 -- 5.0 | Minimum relative volume on the breakout bar. Volume confirms the breakout is real, not a false move. |
+| `atr_tp_multiplier` | `3.5` | float | 1.0 -- 10.0 | Take-profit target in ATR multiples above entry. |
+| `hold_type` | `"adaptive"` | string | `"day"`, `"swing"`, `"adaptive"` | Adaptive -- high-conviction breakouts may be day-traded, others held as swings. |
+
+---
+
+### `strategies.orb`
+
+Opening Range Breakout -- an intraday strategy that identifies the high/low of the first 30 minutes of trading and enters when price breaks above the range on volume.
+
+| Parameter | Default | Type | Valid Range | Description |
+|---|---|---|---|---|
+| `enabled` | `true` | boolean | true/false | Enable or disable this strategy. |
+| `opening_range_minutes` | `30` | integer | 5 -- 60 | Length of the opening range in minutes. The first 30 minutes is the standard ORB period. |
+| `min_volume_ratio` | `1.5` | float | 1.0 -- 5.0 | Minimum volume ratio on the breakout bar vs average opening range bar volume. |
+| `min_range_pct` | `0.3` | float | 0.1 -- 2.0 | Minimum opening range width as a percentage of price. Filters out stocks with tiny ranges that won't produce meaningful moves. |
+| `hold_type` | `"day"` | string | `"day"` | Always day -- this is an intraday pattern. Uses a day trade slot. |
+
+---
+
+### `strategies.pullback`
+
+Buys healthy pullbacks to EMA support in established uptrends. Different from mean reversion (which buys extreme oversold conditions) -- this catches dips before they become extreme.
+
+| Parameter | Default | Type | Valid Range | Description |
+|---|---|---|---|---|
+| `enabled` | `true` | boolean | true/false | Enable or disable this strategy. |
+| `pullback_tolerance_pct` | `0.75` | float | 0.1 -- 3.0 | How close price must be to EMA-20 or EMA-50 (as %). At 0.75%, price must be within 0.75% of a key moving average to qualify as a pullback. |
+| `rsi_min` | `40` | integer | 20 -- 50 | Minimum RSI. Below 40, the pullback may be too deep (mean reversion territory). |
+| `rsi_max` | `53` | integer | 45 -- 65 | Maximum RSI. Above 53, the stock hasn't really pulled back. |
+| `atr_stop_multiplier` | `0.5` | float | 0.3 -- 3.0 | Stop loss below EMA-50 support. Tight (0.5x ATR) because pullback entries should resolve quickly. |
+| `atr_tp_multiplier` | `3.0` | float | 1.0 -- 10.0 | Take-profit target in ATR multiples. |
+| `hold_type` | `"swing"` | string | `"day"`, `"swing"`, `"adaptive"` | Swing -- pullback recovery takes 2-5 days. |
+
+---
+
 ### `strategies.credit_put_spread`
 
 Sells a put spread (sell a higher-strike put, buy a lower-strike put) to collect premium. Profits when the stock stays above the short strike. This is a defined-risk, bullish/neutral options strategy.
@@ -212,11 +294,12 @@ Sells a put spread (sell a higher-strike put, buy a lower-strike put) to collect
 | Parameter | Default | Type | Valid Range | Description |
 |---|---|---|---|---|
 | `enabled` | `true` | boolean | true/false | Enable or disable this strategy. |
-| `target_delta` | `0.30` | float | 0.05 -- 0.50 | Delta of the short (sold) put. Delta approximates the probability that the option expires in-the-money. At 0.30, there is roughly a 30% chance the short put finishes ITM, meaning a ~70% probability of keeping the full credit. **Lower delta = higher win rate but smaller premiums. Higher delta = larger premiums but more risk of assignment.** |
+| `target_delta` | `0.25` | float | 0.05 -- 0.50 | Delta of the short (sold) put. Delta approximates the probability that the option expires in-the-money. At 0.30, there is roughly a 30% chance the short put finishes ITM, meaning a ~70% probability of keeping the full credit. **Lower delta = higher win rate but smaller premiums. Higher delta = larger premiums but more risk of assignment.** |
 | `min_dte` | `20` | integer | 1 -- 90 | Minimum days to expiration. Avoids selling spreads too close to expiration where gamma risk (rapid price sensitivity changes) is highest. |
 | `max_dte` | `45` | integer | > min_dte | Maximum days to expiration. The 20-45 DTE window is the "sweet spot" for theta decay (time value erosion) -- options lose value fastest in this range. Going further out ties up capital longer for less daily decay. |
-| `max_spread_width` | `2.50` | float | 0.50 -- 20.0 | Maximum distance (in dollars) between the two strikes. This caps your maximum loss per spread at the width minus the credit received. At $2.50 width on a $500 account, max loss per spread is under $250. **Wider = more premium but more risk. Narrower = less premium, less risk.** |
+| `max_spread_width` | `1.50` | float | 0.50 -- 20.0 | Maximum distance (in dollars) between the two strikes. This caps your maximum loss per spread at the width minus the credit received. At $2.50 width on a $500 account, max loss per spread is under $250. **Wider = more premium but more risk. Narrower = less premium, less risk.** |
 | `min_credit_pct` | `0.30` | float | 0.10 -- 0.80 | Minimum credit received as a fraction of the spread width. At 0.30, a $2.50-wide spread must collect at least $0.75 in premium. This ensures the risk/reward is acceptable. **Higher = only enters high-premium trades (pickier). Lower = accepts thinner premiums.** |
+| `max_risk` | `100.0` | float | 10.0 -- 500.0 | Hard cap on maximum loss per trade in dollars. At $100, limits single-trade risk to 20% of a $500 account regardless of spread width. |
 
 ---
 
@@ -231,7 +314,7 @@ Buys a call spread (buy a lower-strike call, sell a higher-strike call). Profits
 | `short_delta` | `0.35` | float | 0.05 -- long_delta | Delta of the short (sold) call. Must be lower than `long_delta` (further out-of-the-money). The spread between the two deltas determines the spread's directional sensitivity. |
 | `min_dte` | `30` | integer | 1 -- 120 | Minimum days to expiration. Debit spreads need time for the underlying to move. |
 | `max_dte` | `60` | integer | > min_dte | Maximum days to expiration. Beyond 60 DTE, the cost of the spread increases and the theta decay you are paying for slows. |
-| `max_debit_pct` | `0.60` | float | 0.10 -- 0.90 | Maximum debit (cost) as a fraction of the spread width. At 0.60, a $5-wide spread can cost at most $3.00 ($300 per contract). This ensures you are getting at least a 0.67:1 potential reward relative to the cost. **Lower = only cheap spreads (more speculative). Higher = accepts more expensive, higher-probability spreads.** |
+| `max_debit_pct` | `0.50` | float | 0.10 -- 0.90 | Maximum debit (cost) as a fraction of the spread width. At 0.60, a $5-wide spread can cost at most $3.00 ($300 per contract). This ensures you are getting at least a 0.67:1 potential reward relative to the cost. **Lower = only cheap spreads (more speculative). Higher = accepts more expensive, higher-probability spreads.** |
 
 ---
 
@@ -246,7 +329,7 @@ Buys a single call option outright. The simplest bullish options bet. Unlimited 
 | `min_dte` | `20` | integer | 1 -- 120 | Minimum days to expiration. Short-dated options lose value rapidly if the stock does not move quickly. |
 | `max_dte` | `60` | integer | > min_dte | Maximum days to expiration. Balances time value cost against giving the trade time to work. |
 | `max_contract_cost` | `75.0` | float | 10.0 -- 10000.0 | Maximum dollar cost per contract. One options contract controls 100 shares, so a $75 max means the premium cannot exceed $0.75 per share. This is calibrated for a $500 account. **Increase proportionally with account size.** |
-| `max_iv_percentile` | `0.70` | float | 0.10 -- 1.0 | Maximum implied volatility percentile. IV percentile ranks current IV against historical IV. At 0.70, the strategy refuses to buy calls when IV is in the top 30% of its historical range, because options are expensive and you are overpaying for time value. **Lower = pickier about IV, buys only when options are cheap. Higher = allows buying in higher-IV environments.** |
+| `max_iv_percentile` | `1.00` | float | 0.10 -- 1.0 | Maximum implied volatility percentile. IV percentile ranks current IV against historical IV. At 0.70, the strategy refuses to buy calls when IV is in the top 30% of its historical range, because options are expensive and you are overpaying for time value. **Lower = pickier about IV, buys only when options are cheap. Higher = allows buying in higher-IV environments.** |
 
 ---
 
@@ -261,7 +344,7 @@ Buys a single put option for bearish directional bets or as a hedge. Profits whe
 | `min_dte` | `20` | integer | 1 -- 120 | Minimum days to expiration. |
 | `max_dte` | `60` | integer | > min_dte | Maximum days to expiration. |
 | `max_contract_cost` | `75.0` | float | 10.0 -- 10000.0 | Maximum dollar cost per contract. Same reasoning as long calls -- keeps individual trade risk proportional to a $500 account. |
-| `breakdown_lookback` | `20` | integer | 5 -- 100 | Number of bars to look back for support levels. A put entry requires the stock to be breaking below a support level identified over this window. **Shorter = catches minor breakdowns. Longer = only enters on breaks of significant support.** |
+| `breakdown_lookback` | `10` | integer | 5 -- 100 | Number of bars to look back for support levels. A put entry requires the stock to be breaking below a support level identified over this window. **Shorter = catches minor breakdowns. Longer = only enters on breaks of significant support.** |
 
 ---
 
@@ -272,11 +355,11 @@ Sells a put option and sets aside enough cash to buy 100 shares if assigned. Col
 | Parameter | Default | Type | Valid Range | Description |
 |---|---|---|---|---|
 | `enabled` | `true` | boolean | true/false | Enable or disable this strategy. |
-| `target_delta` | `0.25` | float | 0.05 -- 0.50 | Delta of the put to sell. At 0.25, there is roughly a 25% chance of assignment. Conservative -- you collect modest premium with a high probability of keeping it. **Lower = safer but less income. Higher = more income but higher assignment risk.** |
+| `target_delta` | `0.20` | float | 0.05 -- 0.50 | Delta of the put to sell. At 0.25, there is roughly a 25% chance of assignment. Conservative -- you collect modest premium with a high probability of keeping it. **Lower = safer but less income. Higher = more income but higher assignment risk.** |
 | `min_dte` | `20` | integer | 1 -- 90 | Minimum days to expiration. |
 | `max_dte` | `45` | integer | > min_dte | Maximum days to expiration. The 20-45 window optimizes theta decay. |
 | `min_annualized_return` | `0.15` | float | 0.05 -- 1.0 | Minimum annualized return from the premium collected relative to the capital secured. At 0.15 (15%), if you secure $500 for a 30-day put, the premium must be at least ~$6.16. Filters out trades that are not worth the capital lock-up. **Higher = pickier, fewer trades. Lower = accepts thinner premiums.** |
-| `max_stock_price` | `5.00` | float | 1.0 -- 10000.0 | Maximum stock price to sell puts on. Since you need cash to buy 100 shares, a $5 stock requires $500. This must align with your account size. **Scale this proportionally: $25K account could use $250.** |
+| `max_stock_price` | `3.00` | float | 1.0 -- 10000.0 | Maximum stock price to sell puts on. Since you need cash to buy 100 shares, a $5 stock requires $500. This must align with your account size. **Scale this proportionally: $25K account could use $250.** |
 
 ---
 
@@ -287,14 +370,14 @@ Buys cheap, short-dated options on stocks showing momentum breakouts. High risk,
 | Parameter | Default | Type | Valid Range | Description |
 |---|---|---|---|---|
 | `enabled` | `true` | boolean | true/false | Enable or disable this strategy. |
-| `min_dte` | `2` | integer | 0 -- 30 | Minimum days to expiration. As low as 2 days -- these are very short-term bets. |
+| `min_dte` | `5` | integer | 0 -- 30 | Minimum days to expiration. As low as 2 days -- these are very short-term bets. |
 | `max_dte` | `20` | integer | > min_dte | Maximum days to expiration. Keeps the contracts cheap. |
-| `min_delta` | `0.15` | float | 0.01 -- 0.50 | Minimum delta. Below 0.15, the option barely moves with the stock and is essentially a lottery ticket. |
+| `min_delta` | `0.25` | float | 0.01 -- 0.50 | Minimum delta. Below 0.15, the option barely moves with the stock and is essentially a lottery ticket. |
 | `max_delta` | `0.45` | float | min_delta -- 0.90 | Maximum delta. Caps cost -- higher delta options are more expensive. The 0.15-0.45 range targets OTM to slightly ITM contracts. |
-| `max_contract_cost` | `100.0` | float | 5.0 -- 10000.0 | Maximum dollar cost per contract. At $100, this is 20% of a $500 account on a single speculative play. **Reduce for smaller accounts; increase proportionally for larger ones.** |
-| `min_relative_volume` | `1.5` | float | 1.0 -- 10.0 | Minimum relative volume of the underlying stock. Ensures the stock has unusual activity, confirming the breakout has participation. |
+| `max_contract_cost` | `75.0` | float | 5.0 -- 10000.0 | Maximum dollar cost per contract. At $100, this is 20% of a $500 account on a single speculative play. **Reduce for smaller accounts; increase proportionally for larger ones.** |
+| `min_relative_volume` | `2.0` | float | 1.0 -- 10.0 | Minimum relative volume of the underlying stock. Ensures the stock has unusual activity, confirming the breakout has participation. |
 | `breakout_lookback` | `20` | integer | 5 -- 100 | Number of bars used to identify the breakout level, same as the stock momentum strategy. |
-| `min_roi_pct` | `0.25` | float | 0.05 -- 5.0 | Minimum estimated return-on-investment potential. At 0.25 (25%), the strategy only enters if the potential profit is at least 25% of the cost. Filters out contracts with poor leverage. |
+| `min_roi_pct` | `0.30` | float | 0.05 -- 5.0 | Minimum estimated return-on-investment potential. At 0.25 (25%), the strategy only enters if the potential profit is at least 25% of the cost. Filters out contracts with poor leverage. |
 
 ---
 
@@ -309,7 +392,7 @@ Sells a call option against shares you already own. Generates income by collecti
 | `min_dte` | `20` | integer | 1 -- 90 | Minimum days to expiration. |
 | `max_dte` | `45` | integer | > min_dte | Maximum days to expiration. |
 | `min_annualized_return` | `0.12` | float | 0.05 -- 1.0 | Minimum annualized return from the premium. At 0.12 (12%), the premium must annualize to at least a 12% return on the stock held. Ensures the income is worth the upside cap. |
-| `max_stock_price` | `5.00` | float | 1.0 -- 10000.0 | Maximum price of the underlying stock. You must own 100 shares -- at $5/share that is $500, the entire default account. **Scale with account size.** |
+| `max_stock_price` | `3.00` | float | 1.0 -- 10000.0 | Maximum price of the underlying stock. You must own 100 shares -- at $5/share that is $500, the entire default account. **Scale with account size.** |
 
 ---
 
@@ -323,8 +406,8 @@ Sells both a call and a put against shares you own. Collects double premium but 
 | `min_dte` | `20` | integer | 1 -- 90 | Minimum days to expiration. |
 | `max_dte` | `45` | integer | > min_dte | Maximum days to expiration. |
 | `max_stock_price` | `5.00` | float | 1.0 -- 10000.0 | Maximum stock price. You need to hold 100 shares AND have cash to secure the put side. With a $5 stock, you need ~$1,000 total (100 shares at $5 plus $500 to secure the put). |
-| `min_total_credit_pct` | `0.04` | float | 0.01 -- 0.20 | Minimum combined premium (call + put) as a percentage of the stock price. At 0.04 (4%), selling a straddle on a $5 stock must collect at least $0.20 total premium. **Higher = pickier, better risk/reward. Lower = accepts thinner premiums.** |
-| `max_bb_width` | `0.10` | float | 0.02 -- 0.50 | Maximum Bollinger Band width (a volatility measure). A narrow BB width means the stock has been range-bound. At 0.10 (10%), the upper and lower Bollinger Bands must be within 10% of each other, ensuring the stock is in a low-volatility regime where a straddle is most profitable. **Lower = stricter, only in very quiet stocks. Higher = allows more volatile names.** |
+| `min_total_credit_pct` | `0.06` | float | 0.01 -- 0.20 | Minimum combined premium (call + put) as a percentage of the stock price. At 0.04 (4%), selling a straddle on a $5 stock must collect at least $0.20 total premium. **Higher = pickier, better risk/reward. Lower = accepts thinner premiums.** |
+| `max_bb_width` | `0.06` | float | 0.02 -- 0.50 | Maximum Bollinger Band width (a volatility measure). A narrow BB width means the stock has been range-bound. At 0.10 (10%), the upper and lower Bollinger Bands must be within 10% of each other, ensuring the stock is in a low-volatility regime where a straddle is most profitable. **Lower = stricter, only in very quiet stocks. Higher = allows more volatile names.** |
 
 ---
 
@@ -337,7 +420,7 @@ News sentiment analysis that modifies conviction scores and can block trades on 
 | `enabled` | `true` | boolean | true/false | Enable or disable sentiment analysis entirely. When disabled, all trades proceed without news checks. |
 | `news_lookback_hours` | `36` | integer | 1 -- 168 | How many hours back to search for news articles. 36 hours covers the previous trading day plus overnight. **Longer = catches older catalysts. Shorter = focuses on very recent news.** |
 | `news_max_articles` | `10` | integer | 1 -- 50 | Maximum articles to analyze per symbol. More articles give a better sentiment picture but increase processing time and API calls. |
-| `min_conviction_after_mods` | `0.35` | float | 0.0 -- 1.0 | After all conviction modifiers are applied (market regime + news sentiment), a signal must still be above this threshold to proceed. This is the final gate. At 0.35, a signal that started at 0.80 conviction but was hammered by bearish regime and news can still trade if it stays above 0.35. **Higher = more conservative, blocks more trades. Lower = allows trades through even after negative modifiers.** |
+| `min_conviction_after_mods` | `0.45` | float | 0.0 -- 1.0 | After all conviction modifiers are applied (market regime + news sentiment), a signal must still be above this threshold to proceed. This is the final gate. At 0.35, a signal that started at 0.80 conviction but was hammered by bearish regime and news can still trade if it stays above 0.35. **Higher = more conservative, blocks more trades. Lower = allows trades through even after negative modifiers.** |
 | `block_on_bearish_news` | `-0.5` | float | -1.0 -- 0.0 | News sentiment score below which the trade is blocked entirely (regardless of conviction). The score ranges from -1.0 (extremely bearish) to +1.0 (extremely bullish). At -0.5, a stock with moderately bearish news is blocked. **Closer to 0.0 = blocks more easily. Closer to -1.0 = only blocks on very negative news.** |
 
 ---
@@ -367,6 +450,7 @@ Portfolio-wide risk management parameters.
 | `position_sizing` | `"fractional"` | string | `"fractional"`, `"fixed"` | Position sizing method. `"fractional"` sizes positions based on the Kelly criterion and risk-per-trade percentage, meaning position size varies with conviction and volatility. `"fixed"` would use a fixed dollar amount per trade (not recommended for small accounts). |
 | `kelly_fraction` | `0.25` | float | 0.05 -- 1.0 | Fraction of the full Kelly criterion to use. The Kelly criterion is a formula that determines optimal bet size given win rate and payoff ratio. Full Kelly (1.0) is mathematically optimal but has enormous volatility. Quarter-Kelly (0.25) sacrifices some expected growth for significantly smoother equity curves. **Higher = larger positions, faster growth in good times, deeper drawdowns in bad times. Lower = more conservative sizing.** |
 | `max_portfolio_heat_pct` | `0.06` | float | 0.01 -- 0.30 | Maximum "heat" (total risk across all open positions) as a percentage of equity. If all open positions hit their stops simultaneously, the total loss must not exceed this percentage. At 0.06 (6%), total portfolio risk across all positions is capped at $30 on a $500 account. **Lower = very safe, but limits how many positions you can hold. Higher = allows more concurrent risk.** |
+| `min_conviction_for_swing` | `0.55` | float | 0.0 -- 1.0 | Minimum conviction score required for swing trades (post-weighting). Signals below this threshold are filtered out. Day trades use the higher pdt.min_conviction_for_day_trade threshold. |
 
 ---
 
@@ -378,13 +462,27 @@ All times are in US Eastern Time (ET). The bot uses a scheduler that fires jobs 
 |---|---|---|---|---|
 | `premarket_scan` | `"09:00"` | string | `"HH:MM"` | When the scanner runs to build the day's candidate list. 9:00 AM is 30 minutes before market open -- enough time for pre-market data to accumulate. |
 | `market_open` | `"09:30"` | string | `"HH:MM"` | When the bot caches starting equity, syncs positions with Alpaca, and analyzes the market regime (SPY/QQQ/VIX analysis). This should match the NYSE market open. |
-| `entry_window` | `"09:35"` | string | `"HH:MM"` | When the bot first evaluates strategies on the candidate list and submits trades. Set to 5 minutes after open to avoid the opening volatility spike where spreads are wide and prices are erratic. |
-| `midday_check` | `"12:00"` | string | `"HH:MM"` | Mid-day re-evaluation. Syncs positions, re-runs strategies looking for new setups or managing existing ones. The lunch hour is often quieter, making it a good time for swing setups. |
-| `power_hour_scan` | `"15:00"` | string | `"HH:MM"` | Final scan of the day. The last hour of trading (3:00-4:00 PM) often sees increased volume as institutional traders rebalance. Fresh candidates are scanned and evaluated. |
+| `scan_interval_minutes` | `15` | integer | 5 -- 60 | Interval in minutes between strategy evaluation cycles. The bot scans and evaluates from 9:45 AM to 3:45 PM at this interval. Replaces the previous fixed 3-scan schedule with continuous coverage. |
+| `options_expiry_check` | `"15:30"` | string | `"HH:MM"` | When the bot checks for options positions nearing expiration and manages them (close or roll). |
 | `eod_close_day_trades` | `"15:50"` | string | `"HH:MM"` | 10 minutes before close, all positions with `hold_type: day` are force-closed. This ensures day trades do not accidentally become overnight positions (which could affect PDT status). |
 | `eod_review` | `"16:05"` | string | `"HH:MM"` | 5 minutes after close, the bot saves a daily performance snapshot (equity, cash, P&L, positions). Waits until after close so final settlement prices are available. |
 
 **Note on missed jobs**: If you start the bot during market hours (e.g., at 11:00 AM), it automatically catches up by running the premarket scan and market open jobs immediately. If there are no open positions, it also runs the entry window job to look for opportunities right away rather than waiting for the next scheduled window.
+
+---
+
+### `strategy_weighting`
+
+Adaptive strategy weighting that adjusts conviction multipliers based on each strategy's historical performance. Strategies start at weight 1.0 and adjust after accumulating enough trade history.
+
+| Parameter | Default | Type | Valid Range | Description |
+|---|---|---|---|---|
+| `enabled` | `true` | boolean | true/false | Enable adaptive weighting. When disabled, all strategies use weight 1.0 (equal). |
+| `min_weight` | `0.3` | float | 0.1 -- 1.0 | Minimum weight multiplier. Even poorly-performing strategies keep at least 30% of their conviction. Prevents a strategy from being completely suppressed by a bad streak. |
+| `max_weight` | `2.0` | float | 1.0 -- 5.0 | Maximum weight multiplier. Top-performing strategies can have their conviction doubled. |
+| `burn_in_trades` | `10` | integer | 5 -- 50 | Number of closed trades required before a strategy's weight is adjusted. Until then, weight stays at 1.0. Prevents premature adjustment based on too few data points. |
+| `recalc_interval_trades` | `5` | integer | 1 -- 20 | Recalculate weights every N new closed trades across all strategies. |
+| `recency_halflife_trades` | `20` | integer | 5 -- 100 | Half-life for exponential decay in the recency score. Recent trades are weighted more heavily. At 20, a trade from 20 trades ago has half the influence of the most recent trade. |
 
 ---
 
