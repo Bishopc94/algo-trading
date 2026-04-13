@@ -596,7 +596,7 @@ For example, selling a $48 put and buying a $45 put creates a spread width of $3
 
 ---
 
-### 4. Credit Put Spread (Bull Put Spread)
+### 9. Credit Put Spread (Bull Put Spread)
 
 > **Direction:** Bullish | **Risk:** Defined | **PDT:** N/A (options positions)
 
@@ -663,7 +663,7 @@ Profit
 
 ---
 
-### 5. Debit Call Spread (Bull Call Spread)
+### 10. Debit Call Spread (Bull Call Spread)
 
 > **Direction:** Bullish | **Risk:** Defined | **PDT:** N/A
 
@@ -728,7 +728,7 @@ Profit
 
 ---
 
-### 6. Long Call
+### 11. Long Call
 
 > **Direction:** Bullish | **Risk:** Premium paid | **PDT:** N/A
 
@@ -773,7 +773,7 @@ By requiring IV < 70%, the bot avoids buying options when they're expensive (oft
 
 ---
 
-### 7. Long Put
+### 12. Long Put
 
 > **Direction:** Bearish | **Risk:** Premium paid | **PDT:** N/A
 
@@ -811,7 +811,7 @@ Breakeven  = Strike Price - Premium Paid
 
 ---
 
-### 8. Cash Secured Put
+### 13. Cash Secured Put
 
 > **Direction:** Neutral to bullish | **Risk:** Obligation to buy 100 shares | **PDT:** N/A
 
@@ -861,7 +861,7 @@ Breakeven  = Strike Price - Premium Received
 
 ---
 
-### 9. Covered Call
+### 14. Covered Call
 
 > **Direction:** Neutral to mildly bullish | **Risk:** Capped upside on shares you already own | **PDT:** N/A
 
@@ -903,7 +903,7 @@ Breakeven  = Current Price - Premium Received
 
 ---
 
-### 10. Covered Straddle
+### 15. Covered Straddle
 
 > **Direction:** Neutral | **Risk:** High — exposed on both sides | **PDT:** N/A
 
@@ -947,7 +947,7 @@ Max Loss   = Substantial on both sides:
 
 ---
 
-### 11. Momentum Options
+### 16. Momentum Options
 
 > **Direction:** Bullish or Bearish | **Risk:** Premium paid (small, defined) | **PDT:** N/A
 
@@ -1023,7 +1023,7 @@ estimated_roi >= 0.25  (25%)
 
 ## Signal Ranking: The Brain
 
-The `SignalAggregator` is the central decision engine. It collects signals from all 11 strategies, ranks them, and decides which ones actually get executed. Think of it as a dispatcher that takes a queue of "I want to trade" requests and filters them through resource constraints.
+The `SignalAggregator` is the central decision engine. It collects signals from all 16 strategies, ranks them, and decides which ones actually get executed. Think of it as a dispatcher that takes a queue of "I want to trade" requests and filters them through resource constraints.
 
 ### Step 1: Collect Signals
 

@@ -36,7 +36,7 @@ to [Alpaca](https://alpaca.markets/) as its broker, currently operating in
 At a high level, the bot:
 
 1. Scans the entire US equity universe each morning for tradeable candidates.
-2. Evaluates 11 strategies (3 stock, 8 options) against those candidates.
+2. Evaluates 16 strategies (8 stock, 8 options) against those candidates.
 3. Ranks the resulting signals, checks them against risk limits and PDT rules,
    and builds an execution queue.
 4. Submits orders to Alpaca, then monitors and reconciles positions throughout
@@ -72,7 +72,7 @@ At a high level, the bot:
                               |                    |
                               v                    v
                      +------------------+   +--------------+
-                     |  11 Strategies   |   |  Indicators  |
+                     |  16 Strategies   |   |  Indicators  |
                      |  (stock+options) |   |  (RSI, EMA,  |
                      +--------+---------+   |  VWAP, ATR,  |
                               |             |  BB, MACD)   |
@@ -166,7 +166,7 @@ symbols were eliminated at each stage.
 
 | Filter | Condition | Default |
 |---|---|---|
-| Price range | `min_price <= price <= max_price` | $2 -- $50 |
+| Price range | `min_price <= price <= max_price` | $1 -- $50 |
 | Gap % | `abs(gap_pct) >= min_gap_pct` | >= 2% |
 | Relative volume | `rvol >= min_relative_volume` | >= 1.5x |
 
@@ -191,9 +191,10 @@ sorted by score descending.
 
 ## 2. Strategies
 
-The bot runs **11 strategies** total: 3 stock strategies evaluated by the
+The bot runs **16 strategies** total: 8 stock strategies evaluated by the
 `SignalAggregator`, and 8 options strategies evaluated in a separate
-`_evaluate_options()` path.
+`_evaluate_options()` path. All strategies use **multi-indicator confluence**
+(3-7 independent confirmations) and **additive conviction scoring**.
 
 ### Strategy Base Classes
 
@@ -254,11 +255,9 @@ includes legs, max cost/credit, max loss/profit, greeks, and contract details.
 |---|---|
 | Hold type | SWING (no PDT cost) |
 | Core idea | Buy oversold dips in a short-term uptrend, targeting mean reversion |
-| Entry conditions | RSI < 40 **AND** close >= 98% of 20-EMA **AND** close <= 103% of lower Bollinger Band |
-| Stop loss | Entry - 1.5x ATR(14) |
-| Take profit | Entry + 3.0x ATR(14) -- a 2:1 reward-to-risk |
-| Exit override | RSI recovers above 60 **OR** price touches upper Bollinger Band |
-| Conviction | Linear from 0.5 (at RSI threshold) to 1.0 (at RSI = 20) |
+| Entry | RSI < 38 **AND** close near EMA-20 (within 2%) **AND** close near lower BB **AND** MACD histogram rising **AND** volume confirms capitulation |
+| Stop / Target | 1.5x ATR stop, 3.5x ATR target (2.3:1 R:R) |
+| Conviction | Additive 0.50-0.90 (RSI depth + volume pattern + BB proximity + MACD turning + EMA support) |
 
 #### Momentum (Adaptive)
 
@@ -268,11 +267,9 @@ includes legs, max cost/credit, max loss/profit, greeks, and contract details.
 |---|---|
 | Hold type | ADAPTIVE -- defaults to SWING, switches to DAY if conviction >= 0.9 |
 | Core idea | Enter on volume-confirmed breakouts above the 20-day high |
-| Entry conditions | Close > 20-day rolling high **AND** relative volume > 1.5x **AND** ADR% > 2% **AND** close > 20-EMA |
-| Stop loss | Entry - 1.5x ATR(14) |
-| Take profit | Entry + 3.0x ATR(14) |
-| Exit | Entirely mechanical -- bracket orders only; `should_exit()` returns `False` |
-| Conviction | Linear interpolation: 1.5x rvol = 0.5, 3x = 0.75, 5x+ = 1.0 |
+| Entry | Close > 20-day high **AND** relative volume > 2.0x **AND** ADR% > 2% **AND** stacked EMAs (close > EMA-20 > EMA-50) **AND** MACD > 0 **AND** pre-breakout consolidation (5-bar range < 2x ATR) **AND** bullish candle |
+| Stop / Target | 1.5x ATR stop, 3.5x ATR target (2.3:1 R:R) |
+| Conviction | Additive 0.50-0.90 (volume spike + RSI strength + MACD acceleration + EMA gap + consolidation tightness) |
 
 #### VWAP Reclaim (Day Trade)
 
@@ -282,10 +279,69 @@ includes legs, max cost/credit, max loss/profit, greeks, and contract details.
 |---|---|
 | Hold type | DAY (costs a PDT slot) |
 | Core idea | Enter when price reclaims VWAP from below on elevated intraday volume |
-| Entry conditions | Recent bars dipped below VWAP **AND** current bar closes above VWAP **AND** bar volume > 1.5x average |
-| Stop loss | Max of (dip low, VWAP - 1%) |
-| Take profit | Max of (VWAP + exit deviation %, prior intraday high) |
-| Conviction | Base 0.7, adjusted +/- for dip depth and volume strength |
+| Entry | Dipped below VWAP **AND** reclaimed above **AND** bar volume > 1.5x avg **AND** RSI 40-65 **AND** EMA-9 > EMA-20 **AND** MACD > 0 or rising |
+| Stop / Target | Max of (dip low, VWAP - 1%), target VWAP + exit deviation (1.5:1 R:R minimum) |
+| Conviction | Additive 0.55-0.90 (dip depth + volume strength + RSI + MACD + EMA alignment) |
+
+#### EMA Crossover (Swing)
+
+**File**: `src/ai_trade/strategy/ema_crossover.py`
+
+| Aspect | Detail |
+|---|---|
+| Hold type | SWING |
+| Core idea | Buy when EMA-9 crosses above EMA-20 in an established uptrend (above EMA-50) |
+| Entry | Fresh EMA-9/EMA-20 crossover **AND** close > EMA-50 **AND** RSI 50-70 **AND** MACD > 0 **AND** relative volume > 1.0 |
+| Stop / Target | 1.5x ATR stop, 3.0x ATR target (2:1 R:R) |
+| Conviction | Additive 0.50-0.85 (EMA gap + RSI sweet spot + trend strength + volume + MACD) |
+
+#### MACD Divergence (Swing)
+
+**File**: `src/ai_trade/strategy/macd_divergence.py`
+
+| Aspect | Detail |
+|---|---|
+| Hold type | SWING |
+| Core idea | Bullish divergence -- price makes lower low but MACD histogram makes higher low |
+| Entry | Two swing lows found **AND** price lower low **AND** MACD higher low **AND** MACD turning positive **AND** close near EMA-20 **AND** volume confirmation |
+| Stop / Target | 1.8x ATR stop, 3.5x ATR target (1.9:1 R:R) |
+| Conviction | Additive 0.55-0.80 (divergence magnitude + EMA proximity + volume + MACD momentum) |
+
+#### BB Squeeze (Adaptive)
+
+**File**: `src/ai_trade/strategy/bb_squeeze.py`
+
+| Aspect | Detail |
+|---|---|
+| Hold type | ADAPTIVE -- DAY if conviction >= 0.9, else SWING |
+| Core idea | Volatility compression (tight BB width) followed by breakout above upper band on volume |
+| Entry | Recent BB squeeze (width < 0.08 in last 5 bars) **AND** width expanding **AND** close > BB upper **AND** relative volume > 1.5 **AND** MACD > 0 **AND** RSI 50-80 |
+| Stop / Target | BB middle (20-SMA) as stop, 3.5x ATR target |
+| Conviction | Additive 0.55-0.85 (squeeze depth + volume + MACD + RSI + squeeze duration) |
+
+#### Opening Range Breakout (Day Trade)
+
+**File**: `src/ai_trade/strategy/orb.py`
+
+| Aspect | Detail |
+|---|---|
+| Hold type | DAY (costs a PDT slot) |
+| Core idea | Break above the first 30-minute trading range on volume |
+| Entry | Close > OR high **AND** breakout volume > 1.5x avg **AND** bullish candle **AND** close in upper half of bar **AND** 2/3 recent bars above OR high **AND** minimum range width 0.3% |
+| Stop / Target | Range midpoint as stop, target = OR high + 2x range (1.5:1 R:R minimum) |
+| Conviction | Additive 0.60-0.90 (breakout magnitude + volume ratio + bar strength + range tightness) |
+
+#### Pullback (Swing)
+
+**File**: `src/ai_trade/strategy/pullback.py`
+
+| Aspect | Detail |
+|---|---|
+| Hold type | SWING |
+| Core idea | Buy healthy pullbacks to EMA support in established uptrends |
+| Entry | EMA-20 > EMA-50 **AND** close within 0.75% of EMA-20 or EMA-50 **AND** RSI 40-53 **AND** close > EMA-50 **AND** MACD > 0 or rising **AND** volume declining (healthy pullback) |
+| Stop / Target | EMA-50 - 0.5x ATR as stop, 3.0x ATR target |
+| Conviction | Additive 0.50-0.85 (EMA gap + RSI zone + volume + MACD + proximity to support) |
 
 ### Options Strategies
 
@@ -306,7 +362,7 @@ selection, and greek enrichment.
 
 Options orders go through a separate risk budget:
 - Max options positions: configurable (default 3)
-- Max capital allocated to options: configurable % of equity (default 40%)
+- Max capital allocated to options: configurable % of equity (default 50%)
 - Max single-trade risk: configurable dollar cap (default $100)
 
 ---
@@ -866,9 +922,8 @@ All jobs run Monday -- Friday, Eastern Time:
 |---|---|---|---|
 | 9:00 AM | `premarket_scan` | `job_premarket_scan()` | Scan universe, build candidate list |
 | 9:30 AM | `market_open` | `job_market_open()` | Cache starting equity, sync positions, analyze market regime |
-| 9:35 AM | `entry_window` | `job_entry_window()` | Run all strategies, rank signals, submit trades |
-| 12:00 PM | `midday_check` | `job_midday_check()` | Re-evaluate positions, look for new swing setups |
-| 3:00 PM | `power_hour_scan` | `job_power_hour()` | Fresh scan + strategy evaluation for late momentum |
+| Every 15 min (9:45 AM -- 3:45 PM) | `scan_and_evaluate` | `job_scan_and_evaluate()` | Run all 16 strategies, rank signals, submit trades |
+| 3:30 PM | `options_expiry_check` | `job_options_expiry_check()` | Check and manage options positions nearing expiration |
 | 3:50 PM | `eod_close_day_trades` | `job_eod_close_day_trades()` | Force-close all day-trade positions |
 | 4:05 PM | `eod_review` | `job_eod_review()` | Save daily snapshot, print P&L summary |
 
@@ -1045,9 +1100,15 @@ src/ai_trade/
   strategy/
     base.py                     # BaseStrategy ABC, Signal dataclass, HoldType enum
     signal.py                   # SignalAggregator -- ranking + queue building
+    weighter.py                 # Adaptive strategy weighting based on performance
     mean_reversion.py           # RSI mean-reversion (swing)
     momentum.py                 # Volume-breakout momentum (adaptive)
     vwap.py                     # VWAP reclaim (day trade)
+    ema_crossover.py            # EMA-9/EMA-20 crossover in uptrend (swing)
+    macd_divergence.py          # Bullish MACD divergence reversal (swing)
+    bb_squeeze.py               # Bollinger Band squeeze breakout (adaptive)
+    orb.py                      # Opening range breakout (day trade)
+    pullback.py                 # EMA pullback in uptrend (swing)
     options/
       base.py                   # BaseOptionsStrategy ABC, OptionsSignal, shared utils
       credit_put_spread.py
@@ -1081,6 +1142,7 @@ src/ai_trade/
   monitoring/
     database.py                 # SQLite persistence layer
     logger.py                   # structlog configuration
+    console.py                  # Pretty console output (Rich-based tables + panels)
     performance.py              # P&L, Sharpe, win rate, drawdown
 
   scheduler/

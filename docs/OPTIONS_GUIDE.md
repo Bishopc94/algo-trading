@@ -104,8 +104,8 @@ to filter contracts. For example, the `long_call` strategy requires 20-60 DTE
 Why it matters:
 - **High DTE** (45-60 days): More time for your thesis to play out, but higher
   premium.
-- **Low DTE** (2-10 days): Cheap, but time decay accelerates rapidly. The
-  `momentum_options` strategy targets these (2-20 DTE).
+- **Low DTE** (5-10 days): Cheap, but time decay accelerates rapidly. The
+  `momentum_options` strategy targets these (5-20 DTE).
 
 ### ITM / ATM / OTM
 
@@ -168,9 +168,9 @@ Each strategy has a `target_delta` in `settings.yaml`:
 | `long_call` | 0.60 | ~60% chance ITM (moderately aggressive) |
 | `long_put` | 0.55 | ~55% chance ITM |
 | `credit_put_spread` | 0.30 | ~30% chance ITM (conservative, selling premium) |
-| `cash_secured_put` | 0.25 | ~25% chance ITM (want to collect premium, not get assigned) |
+| `cash_secured_put` | 0.20 | ~20% chance ITM (want to collect premium, not get assigned) |
 | `covered_call` | 0.30 | ~30% chance ITM (sell upside above this) |
-| `momentum_options` | 0.15-0.45 | Variable, cheap OTM contracts for big moves |
+| `momentum_options` | 0.25-0.45 | Variable, OTM contracts for momentum breakouts |
 
 The selection pipeline (covered below) calls `filter_by_delta()` to narrow the
 chain and `select_by_delta()` to pick the contract closest to the target.
@@ -215,7 +215,7 @@ Value
  60                     0
 ```
 
-This is why `momentum_options` (2-20 DTE) are risky for buyers: theta is at its
+This is why `momentum_options` (5-20 DTE) are risky for buyers: theta is at its
 maximum, eating into your position daily.
 
 ### Implied Volatility (IV)
@@ -233,10 +233,11 @@ Same stock, same strike, same expiration:
   IV = 50%  -->  Call costs $3.80
 ```
 
-**How the bot uses IV**: The `long_call` strategy has a `max_iv_percentile: 0.70`
-setting. Before buying a call, the bot checks if the current IV is in the 70th
-percentile or below (compared to its recent range). If IV is too high, the bot
-skips the trade to avoid overpaying for inflated premiums.
+**How the bot uses IV**: The `long_call` strategy has a `max_iv_percentile`
+setting (default 1.00, effectively disabled). Rather than filtering on IV
+percentile alone, the bot relies on the `max_contract_cost` cap ($75) to
+limit overpaying for expensive options. The multi-indicator confluence
+filters also help avoid entering during volatile, uncertain conditions.
 
 Think of it like shopping: you do not want to buy options when they are "on sale"
 at full price. High IV means you are paying a markup.
@@ -351,8 +352,9 @@ The bot's strategies:
 
 **What it does**: Buy a call option. Profit if the stock goes up.
 
-**When the bot uses it**: Bullish signal on the stock, momentum/trend indicators
-positive, IV not too high.
+**When the bot uses it**: Bullish signal confirmed by multi-indicator confluence --
+stacked EMAs (close > EMA-20 > EMA-50), MACD > 0 and rising, RSI 50-70, elevated
+volume, and pre-breakout consolidation. IV not too high.
 
 **Example**:
 ```
@@ -376,15 +378,16 @@ long_call:
   min_dte: 20               # At least 20 days
   max_dte: 60               # No more than 60 days
   max_contract_cost: 75.0   # $75 max per contract (for a $500 account)
-  max_iv_percentile: 0.70   # Don't buy when IV is elevated
+  max_iv_percentile: 1.00   # Cost cap handles risk; IV check relaxed
 ```
 
 ### 2. Long Put (Single-leg, Debit)
 
 **What it does**: Buy a put option. Profit if the stock goes down.
 
-**When the bot uses it**: Bearish signal, breakdown below support, negative
-momentum.
+**When the bot uses it**: Bearish signal confirmed by multi-indicator confluence --
+bearish EMA structure (EMA-20 < EMA-50), MACD < 0, RSI < 45, bearish candle
+(close < open), and elevated volume.
 
 **Example**:
 ```
@@ -431,8 +434,8 @@ Scenario B -- Stock drops to $3.00:
 **Bot settings**:
 ```yaml
 cash_secured_put:
-  target_delta: 0.25             # Low probability of assignment
-  max_stock_price: 5.00          # 100 shares x $5 = $500 max (fits the account)
+  target_delta: 0.20             # Low probability of assignment (~80% PoP)
+  max_stock_price: 3.00          # 100 shares x $3 = $300 max (fits $500 account)
   min_annualized_return: 0.15    # At least 15% annualized
 ```
 
@@ -484,9 +487,10 @@ Breakeven: $28.00 - $0.60 = $27.40
 **Bot settings**:
 ```yaml
 credit_put_spread:
-  target_delta: 0.30           # Short put at ~30 delta
-  max_spread_width: 2.50       # Max $2.50 between strikes
+  target_delta: 0.25           # Short put at ~25 delta (~75% PoP)
+  max_spread_width: 1.50       # Max $1.50 between strikes (max loss $150)
   min_credit_pct: 0.30         # Credit must be >= 30% of spread width
+  max_risk: 100.0              # Hard cap: max $100 loss per trade
 ```
 
 ### 6. Debit Call Spread (Multi-leg, Debit)
@@ -544,8 +548,9 @@ If XYZ stalls:
   Option expires worthless. Loss: $15.
 ```
 
-This is the highest risk/reward strategy. Cheap contracts, low delta (0.15-0.45),
-short DTE (2-20 days), massive theta working against you.
+This is the highest risk/reward strategy. Requires full directional confluence --
+stacked EMAs aligned with direction, MACD confirming, volume > 2x average, and
+pre-breakout consolidation. Delta range 0.25-0.45, short DTE (5-20 days).
 
 ---
 

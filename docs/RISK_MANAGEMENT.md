@@ -134,14 +134,14 @@ shares = math.floor(risk_amount / risk_per_share)
 #### Step 4: Concentration limit
 
 ```python
-max_dollar_value = account_equity * max_position_pct   # 30% = $150
+max_dollar_value = account_equity * max_position_pct   # 25% = $125
 if shares * signal.entry_price > max_dollar_value:
     shares = math.floor(max_dollar_value / signal.entry_price)
 ```
 
-Even if the risk calculation says you can buy 20 shares, the total dollar value of the position cannot exceed 30% of equity ($150). At $10/share, 20 shares = $200 which exceeds $150, so shares would be reduced to `floor(150 / 10) = 15`.
+Even if the risk calculation says you can buy 20 shares, the total dollar value of the position cannot exceed 25% of equity ($125). At $10/share, 20 shares = $200 which exceeds $125, so shares would be reduced to `floor(125 / 10) = 12`.
 
-**Why 30%?** This prevents a single stock from dominating the portfolio. If it gaps down overnight (before the stop-loss can trigger), the damage is limited to 30% of the account.
+**Why 25%?** This prevents a single stock from dominating the portfolio. If it gaps down overnight (before the stop-loss can trigger), the damage is limited to 25% of the account.
 
 #### Step 5: Cash constraint
 
@@ -209,11 +209,11 @@ This method stores the value in `self._starting_equity`. If it has not been set 
 #### Check 2: Position Concentration
 
 ```python
-if current_positions_count >= max_open_positions:  # default: 4
+if current_positions_count >= max_open_positions:  # default: 5
     return False, f"max positions reached: {count}/{max}"
 ```
 
-Maximum **4 open positions** at any time. With $500, this means roughly $125 per position (if equally sized).
+Maximum **5 open positions** at any time. With $500, this means roughly $100 per position (if equally sized).
 
 **Why limit positions?** Two reasons:
 1. **Commissions and slippage** eat into profits -- more positions means more friction.
@@ -529,24 +529,49 @@ The news sentiment system scores recent articles for each symbol and modifies th
 After **all** modifiers have been applied (market regime modifier, news modifier, signal aggregation), a final check runs:
 
 ```
-min_conviction_after_mods: 0.35
+min_conviction_after_mods: 0.45
 ```
 
-Any signal with a conviction below **0.35** after all modifiers is rejected. This is the last line of defense -- even if no single modifier was enough to block the trade, the cumulative dampening might push it below the threshold.
+Any signal with a conviction below **0.45** after all modifiers is rejected. This is the last line of defense -- even if no single modifier was enough to block the trade, the cumulative dampening might push it below the threshold.
 
 **Example flow:**
 
 ```
-Raw signal conviction:    0.65
-Market regime (Neutral):  * 0.9  = 0.585
-News sentiment (mildly bearish): * 0.7 = 0.410
-Final conviction:         0.410  (above 0.35 -- trade proceeds)
+Raw signal conviction:    0.75
+Market regime (Neutral):  * 0.9  = 0.675
+News sentiment (mildly bearish): * 0.7 = 0.473
+Final conviction:         0.473  (above 0.45 -- trade proceeds)
 
-Raw signal conviction:    0.55
-Market regime (Bear):     * 0.6  = 0.330
-News sentiment (neutral): * 1.0  = 0.330
-Final conviction:         0.330  (below 0.35 -- REJECTED)
+Raw signal conviction:    0.60
+Market regime (Bear):     * 0.6  = 0.360
+News sentiment (neutral): * 1.0  = 0.360
+Final conviction:         0.360  (below 0.45 -- REJECTED)
 ```
+
+---
+
+## Additional Risk Controls (v1.2.0)
+
+### Conviction Floors
+
+Every strategy uses **additive conviction scoring** (0.50-0.90 range) rather than linear scaling. Two minimum thresholds apply after scoring:
+
+| Threshold | Value | Purpose |
+|-----------|-------|---------|
+| `risk.min_conviction_for_swing` | 0.55 | Minimum conviction for swing trades (post-weighting). Signals below this are filtered out. |
+| `sentiment.min_conviction_after_mods` | 0.45 | Absolute floor after regime + news modifiers are applied. |
+
+### Failed Symbol Blacklist
+
+If an order for a given symbol fails **2 consecutive times** (e.g., due to halts, insufficient liquidity, or API errors), that symbol is excluded from further trading for the rest of the day. This prevents the bot from repeatedly attempting orders on problematic stocks.
+
+### PDT Pre-Check
+
+Before submitting any order that would consume a day-trade slot, the bot calls `pdt.can_day_trade()` first. This prevents order submission failures that previously wasted API calls and logged confusing rejection messages.
+
+### Adaptive Strategy Weighting
+
+The `StrategyWeighter` adjusts each strategy's conviction multiplier based on historical performance. Strategies start at weight 1.0 and adjust after a burn-in period (default 10 closed trades). Poorly-performing strategies are weighted down (minimum 0.3x), while strong performers are weighted up (maximum 2.0x). This is an additional risk control because it automatically reduces exposure to strategies that are losing money.
 
 ---
 
@@ -661,8 +686,8 @@ All values are configured in `config/settings.yaml`.
 | Parameter | Config Key | Default | With $500 Account |
 |-----------|-----------|---------|-------------------|
 | Max risk per trade | `account.max_risk_per_trade_pct` | 2% | $10 |
-| Max single position | `account.max_position_pct` | 30% | $150 |
-| Max open positions | `account.max_open_positions` | 4 | -- |
+| Max single position | `account.max_position_pct` | 25% | $125 |
+| Max open positions | `account.max_open_positions` | 5 | -- |
 | Daily loss limit | `account.daily_loss_limit_pct` | 5% | $25 |
 | Portfolio heat cap | `risk.max_portfolio_heat_pct` | 6% | $30 |
 | Stop loss | `risk.stop_loss_pct` | 3% | -- |
@@ -673,7 +698,8 @@ All values are configured in `config/settings.yaml`.
 | Options max risk | `options.max_single_options_risk_pct` | 12% | $60 |
 | Options capital limit | `options.max_options_capital_pct` | 50% | $250 |
 | Options max positions | `options.max_options_positions` | 3 | -- |
-| Min conviction after mods | `sentiment.min_conviction_after_mods` | 0.35 | -- |
+| Min conviction for swing | `risk.min_conviction_for_swing` | 0.55 | -- |
+| Min conviction after mods | `sentiment.min_conviction_after_mods` | 0.45 | -- |
 | News block threshold | `sentiment.block_on_bearish_news` | -0.5 | -- |
 
 ---
