@@ -80,32 +80,36 @@ class LongPutStrategy(BaseOptionsStrategy):
         macd_hist: float = latest.get("macd_hist", 0.0)
         prev_macd_hist: float = prev.get("macd_hist", 0.0)
 
-        # RSI confirms bearish momentum
-        if rsi > 40:
+        # RSI confirms bearish momentum (relaxed from 40 to 48)
+        if rsi > 48:
+            self._reject(underlying, "rsi_max_bearish", rsi, 48.0, "below")
             return None
 
-        # Price below BOTH moving averages (multi-timeframe downtrend)
-        if price >= ema_20 or price >= ema_50:
+        # Price below EMA-20 (short-term weakness confirmed)
+        if price >= ema_20:
+            self._reject(underlying, "price_below_ema20", price, ema_20, "below")
             return None
 
-        # Bearish EMA structure
-        if ema_20 >= ema_50:
+        # EMA structure: at least EMA-20 weakening
+        ema_struct_ceil = ema_50 * 1.02
+        if ema_20 > ema_struct_ceil:
+            self._reject(underlying, "ema_structure_bearish", ema_20, ema_struct_ceil, "below")
             return None
 
-        # Price below prior 20-day low (technical breakdown)
-        if price > low_20:
+        # MACD not bullish (relaxed from strictly negative)
+        macd_ceil = 0.005 * price
+        if macd_hist > macd_ceil:
+            self._reject(underlying, "macd_not_bullish", macd_hist, macd_ceil, "below")
             return None
 
-        # MACD histogram negative (bearish momentum aligned)
-        if macd_hist >= 0:
-            return None
-
-        # Volume elevated (institutional selling)
-        if rel_vol < 1.5:
+        # Volume at least average (relaxed from 1.5x)
+        if rel_vol < 1.0:
+            self._reject(underlying, "rel_volume_min", rel_vol, 1.0, "above")
             return None
 
         # Bearish candle (sellers in control)
         if price >= open_price:
+            self._reject(underlying, "bearish_candle", price, open_price, "below")
             return None
 
         # ------------------------------------------------------------------

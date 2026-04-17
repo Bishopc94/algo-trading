@@ -9,14 +9,14 @@ Theory:
   MACD histogram has turned positive (divergence is resolving NOW).
 
 Entry conditions (ALL must be true):
-  1. Two swing lows in last 20 bars (>= 4 bars apart)
+  1. Two swing lows in last 25 bars (>= 3 bars apart — relaxed)
   2. Price lower low + MACD higher low (classic divergence)
   3. MACD hist positive NOW AND was negative within last 3 bars (fresh turn)
-  4. RSI > 30 and RSI at recent low > RSI at prior low (double confirmation)
-  5. Close > EMA-50 * 0.97 (not in freefall, near structural support)
-  6. Volume declining on second low (sellers exhausting)
+  4. RSI > 25 (not in total freefall)
+  5. Close > EMA-50 * 0.95 (near structural support — widened from 97%)
 
-Conviction: additive across divergence strength, RSI, EMA proximity, volume.
+Conviction: additive across divergence strength, RSI divergence, volume,
+  EMA proximity. Volume/RSI divergence are conviction factors, not hard gates.
 Hold type: SWING.
 """
 
@@ -80,24 +80,30 @@ class MACDDivergenceStrategy(BaseStrategy):
 
         # ── MACD hist must be positive NOW ──
         if macd_hist <= 0:
+            self._reject(symbol, "macd_hist_positive", macd_hist, 0.0, "above")
             return None
 
         # Was negative within last 3 bars (fresh turn)
         recent_negative = any(float(df.iloc[i]["macd_hist"]) < 0 for i in range(-4, -1))
         if not recent_negative:
+            self._reject(symbol, "recent_macd_negative", 0.0, 1.0, "above")
             return None
 
-        # Not in freefall (near structural support)
-        if close <= ema_50 * 0.97:
+        # Not in freefall (near structural support — widened from 97% to 95%)
+        ema50_floor = ema_50 * 0.95
+        if close <= ema50_floor:
+            self._reject(symbol, "close_above_ema50_95pct", close, ema50_floor, "above")
             return None
 
-        # RSI sanity — not deeply oversold (likely crashing, not bouncing)
-        if rsi_val < 30:
+        # RSI sanity — relaxed from 30 to 25
+        if rsi_val < 25:
+            self._reject(symbol, "rsi_min", rsi_val, 25.0, "above")
             return None
 
-        # ── Find bullish divergence ──
-        swing_indices = _find_swing_lows(df, lookback=lookback, min_gap=4)
+        # ── Find bullish divergence (relaxed: 25-bar lookback, 3-bar min gap) ──
+        swing_indices = _find_swing_lows(df, lookback=max(lookback, 25), min_gap=3)
         if len(swing_indices) < 2:
+            self._reject(symbol, "swing_lows_found", float(len(swing_indices)), 2.0, "above")
             return None
 
         prior_idx = swing_indices[-2]
@@ -112,64 +118,81 @@ class MACDDivergenceStrategy(BaseStrategy):
 
         # Price lower low
         if recent_low >= prior_low:
+            self._reject(symbol, "price_lower_low", recent_low, prior_low, "below")
             return None
         # MACD higher low (divergence)
         if recent_macd <= prior_macd:
+            self._reject(symbol, "macd_higher_low", recent_macd, prior_macd, "above")
             return None
 
-        # Price difference must be meaningful (>= 2%)
-        if abs(recent_low - prior_low) / prior_low < 0.02:
+        # Price difference must be meaningful (relaxed from 2% to 1%)
+        price_diff_pct = abs(recent_low - prior_low) / prior_low
+        if price_diff_pct < 0.01:
+            self._reject(symbol, "price_diff_pct", price_diff_pct, 0.01, "above")
             return None
 
-        # Divergence magnitude filter
+        # Divergence magnitude filter (relaxed from 20% to 10%)
         macd_diff = recent_macd - prior_macd
         macd_range = max(abs(prior_macd), 0.01)
         divergence_strength = min(1.0, abs(macd_diff) / macd_range)
-        if divergence_strength < 0.20:
+        if divergence_strength < 0.10:
+            self._reject(symbol, "divergence_strength", divergence_strength, 0.10, "above")
             return None
 
-        # RSI also showing divergence (double confirmation)
+        # RSI also showing divergence (conviction factor, not hard gate)
         rsi_diverging = recent_rsi > prior_rsi
 
-        # Volume declining on second low (sellers exhausting)
+        # Volume declining on second low (conviction factor, not hard gate)
         prior_vol = float(df.iloc[prior_idx]["volume"])
         recent_vol = float(df.iloc[recent_idx]["volume"])
         volume_declining = recent_vol < prior_vol * 0.9
 
-        # ── Conviction scoring (additive, 0.55–0.85) ──
-        conviction = 0.55
+        # ── Conviction scoring (additive, 0.50–0.90) ──
+        conviction = 0.50
 
-        # +0.10: Divergence magnitude
-        conviction += 0.10 * divergence_strength
+        # +0.12: Divergence magnitude
+        conviction += 0.12 * divergence_strength
 
-        # +0.07: RSI double-divergence confirmation
+        # +0.08: RSI double-divergence confirmation
         if rsi_diverging:
-            conviction += 0.07
+            conviction += 0.08
 
-        # +0.05: Volume declining (seller exhaustion)
+        # +0.06: Volume declining (seller exhaustion)
         if volume_declining:
-            conviction += 0.05
+            conviction += 0.06
+        else:
+            conviction += 0.01  # Partial credit
 
-        # +0.05: Close near EMA-20 support
+        # +0.06: Close near EMA-20 support
         ema_distance_pct = abs(close - ema_20) / ema_20
         if ema_distance_pct < 0.01:
-            conviction += 0.05
+            conviction += 0.06
         elif ema_distance_pct < 0.02:
-            conviction += 0.03
+            conviction += 0.04
+        elif ema_distance_pct < 0.03:
+            conviction += 0.02
 
-        # +0.03: Uptrend structure intact (EMA-20 > EMA-50)
+        # +0.05: Uptrend structure intact (EMA-20 > EMA-50)
         if ema_20 > ema_50:
-            conviction += 0.03
+            conviction += 0.05
+        elif ema_20 > ema_50 * 0.99:
+            conviction += 0.02  # Nearly flat — still okay
 
-        conviction = max(0.55, min(0.85, conviction))
+        conviction = max(0.50, min(0.90, conviction))
 
         entry_price = close
-        stop_loss = entry_price - atr_stop_mult * atr
-        take_profit = entry_price + atr_tp_mult * atr
+        levels = self._plan_long_exit(
+            bars=df, entry_price=entry_price, atr=atr,
+            base_stop_mult=atr_stop_mult, base_tp_mult=atr_tp_mult,
+        )
+        stop_loss = levels.stop_loss
+        take_profit = levels.take_profit
 
         risk = entry_price - stop_loss
         reward = take_profit - entry_price
-        if risk <= 0 or reward / risk < 2.0:
+        rr = reward / risk if risk > 0 else 0.0
+        if risk <= 0 or rr < 2.0:
+            self._reject(symbol, "risk_reward", rr, 2.0, "above")
             return None
 
         logger.info(

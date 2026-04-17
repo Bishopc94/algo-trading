@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import pandas as pd
 
+from ai_trade.data.indicators import add_atr
 from ai_trade.monitoring.logger import get_logger
 from ai_trade.strategy.base import BaseStrategy, HoldType, Signal
 
@@ -46,9 +47,10 @@ class ORBStrategy(BaseStrategy):
 
         opening_minutes: int = getattr(self.config, "opening_range_minutes", 30)
         min_vol_ratio: float = getattr(self.config, "min_volume_ratio", 1.5)
-        min_range_pct: float = getattr(self.config, "min_range_pct", 0.3) / 100.0
+        min_range_pct: float = getattr(self.config, "min_range_pct", 0.2) / 100.0
 
         df = intraday_bars.copy()
+        add_atr(df, period=14)
 
         if len(df) < opening_minutes + 1:
             return None
@@ -78,41 +80,52 @@ class ORBStrategy(BaseStrategy):
 
         # Breakout above opening range high
         if close <= or_high:
+            self._reject(symbol, "close_above_or_high", close, or_high, "above")
             return None
 
-        # Volume confirms breakout
+        # Volume confirms breakout (now conviction factor — hard min at 1.0x)
         vol_ratio = bar_volume / avg_or_volume if avg_or_volume > 0 else 0
-        if vol_ratio < min_vol_ratio:
+        if vol_ratio < 1.0:
+            self._reject(symbol, "vol_ratio_min", vol_ratio, 1.0, "above")
             return None
 
         # Bullish candle (buyers in control)
         if close <= open_price:
+            self._reject(symbol, "bullish_candle", close, open_price, "above")
             return None
 
-        # Close in upper half of bar (sustained push, not just a wick)
+        # Close in upper half of bar (relaxed from 0.5 to 0.4)
         bar_range = high - low
-        if bar_range > 0 and (close - low) / bar_range < 0.5:
+        bar_strength = (close - low) / bar_range if bar_range > 0 else 0.0
+        if bar_range > 0 and bar_strength < 0.4:
+            self._reject(symbol, "bar_strength", bar_strength, 0.4, "above")
             return None
 
         # Trend forming: at least 2 of last 3 bars above OR high
         post_or = df.iloc[opening_minutes:]
         if len(post_or) >= 3:
             recent_3 = post_or.iloc[-3:]
-            bars_above = (recent_3["close"] > or_high).sum()
+            bars_above = float((recent_3["close"] > or_high).sum())
             if bars_above < 2:
+                self._reject(symbol, "bars_above_or_high", bars_above, 2.0, "above")
                 return None
-        # If fewer than 3 post-OR bars, just need the latest (already checked)
 
-        # ── Conviction scoring (0.60-0.90) ──
-        conviction = 0.60
+        # ── Conviction scoring (0.55-0.92) ──
+        conviction = 0.55
 
         # +0.10: Breakout magnitude (how far above OR high as % of range)
         breakout_pct = (close - or_high) / or_range if or_range > 0 else 0
         conviction += min(0.10, breakout_pct * 0.10)
 
-        # +0.08: Volume ratio strength
-        vol_bonus = (vol_ratio - min_vol_ratio) / (3.0 - min_vol_ratio)
-        conviction += 0.08 * min(1.0, max(0, vol_bonus))
+        # +0.10: Volume ratio strength (wider scoring range)
+        if vol_ratio >= 2.5:
+            conviction += 0.10
+        elif vol_ratio >= 1.5:
+            conviction += 0.07
+        elif vol_ratio >= 1.2:
+            conviction += 0.04
+        elif vol_ratio >= 1.0:
+            conviction += 0.01
 
         # +0.07: Bar strength (close position within bar)
         if bar_range > 0:
@@ -121,20 +134,28 @@ class ORBStrategy(BaseStrategy):
 
         # +0.05: Opening range tightness (tighter range = more explosive)
         range_pct = or_range / or_high
-        if range_pct < 0.005:
+        if range_pct < 0.003:
             conviction += 0.05  # Very tight range
-        elif range_pct < 0.01:
+        elif range_pct < 0.006:
             conviction += 0.03
+        elif range_pct < 0.01:
+            conviction += 0.01
 
-        conviction = max(0.60, min(0.90, conviction))
+        conviction = max(0.55, min(0.92, conviction))
 
         entry_price = close
         stop_loss = (or_high + or_low) / 2.0
         take_profit = or_high + 2.0 * or_range
 
+        atr_val = float(df["atr_14"].iloc[-1]) if "atr_14" in df.columns else 0.0
+        if not (atr_val > 0):
+            atr_val = max(entry_price * 0.01, 0.01)
+
         risk = entry_price - stop_loss
         reward = take_profit - entry_price
-        if risk <= 0 or reward / risk < 1.5:
+        rr = reward / risk if risk > 0 else 0.0
+        if risk <= 0 or rr < 1.5:
+            self._reject(symbol, "risk_reward", rr, 1.5, "above")
             return None
 
         logger.info(
@@ -165,6 +186,9 @@ class ORBStrategy(BaseStrategy):
                 "or_range": or_range,
                 "volume_ratio": vol_ratio,
                 "breakout_pct": round(breakout_pct, 4),
+                "atr": atr_val,
+                "stop_method": "or_midpoint",
+                "target_method": "or_range_2x",
             },
         )
 

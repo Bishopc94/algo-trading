@@ -93,28 +93,22 @@ class MomentumOptionsStrategy(BaseOptionsStrategy):
         macd_hist: float = latest.get("macd_hist", 0.0)
         prev_macd_hist: float = prev.get("macd_hist", 0.0)
 
-        # Volume must be elevated (institutional participation)
-        if rel_vol < min_rel_vol:
+        # Volume must show participation (relaxed from 2.0 to 1.5)
+        vol_threshold = max(min_rel_vol, 1.5)
+        if rel_vol < vol_threshold:
+            self._reject(underlying, "rel_volume", rel_vol, vol_threshold, "above")
             return None
 
-        # Determine direction with full confluence
+        # Determine direction with relaxed confluence
         direction = None
-        if (price > high_20 and rsi > 55 and price > ema_20 > ema_50
-                and macd_hist > 0):
+        if (rsi > 50 and price > ema_20 and macd_hist > 0):
             direction = "call"
-        elif (price < low_20 and rsi < 45 and price < ema_20 < ema_50
-              and macd_hist < 0):
+        elif (rsi < 50 and price < ema_20 and macd_hist < 0):
             direction = "put"
 
         if direction is None:
+            self._reject(underlying, "trend_alignment", 0.0, 1.0, "above")
             return None
-
-        # Pre-breakout consolidation (tight range before explosion)
-        if atr > 0 and len(df) >= 6:
-            recent_5 = df.iloc[-6:-1]
-            consolidation_range = recent_5["high"].max() - recent_5["low"].min()
-            if consolidation_range > 2.5 * atr:
-                return None  # Already volatile -- not a clean breakout
 
         # ------------------------------------------------------------------
         # 2. Select contract -- cheap OTM options

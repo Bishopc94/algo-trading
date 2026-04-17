@@ -11,15 +11,22 @@ account:
 pdt:
   max_day_trades: 3
   day_trade_reserve: 1
-  min_conviction_for_day_trade: 0.80
+  min_conviction_for_day_trade: 0.75  # Reduced from 0.80 — let more day signals through
+  # V2 Phase 8: SmartPDTPlanner applies a dynamic nudge on top of this
+  # floor based on day-of-week (Mon stingy, Fri loose), slots remaining
+  # (last slot raises the bar), and recent day-trade win rate.  It also
+  # attempts day->swing conversion for swing-compatible strategies when
+  # a signal misses the dynamic floor -- intraday setups (orb, vwap)
+  # are never converted.
+  smart_pdt_enabled: true
 
 scanner:
-  min_price: 1.00                      # Raised from 2.00 — sub-$5 stocks halt constantly and have huge spreads
+  min_price: 1.00
   max_price: 50.00
   min_avg_volume: 500000
-  min_relative_volume: 1.5
-  min_gap_pct: 2.0
-  max_candidates: 20
+  min_relative_volume: 1.3            # Reduced from 1.5 — catch more candidates
+  min_gap_pct: 1.5                    # Reduced from 2.0 — catch smaller movers
+  max_candidates: 25                  # Increased from 20 — more candidates per scan
   options_universe:
     min_price: 10.0
     max_price: 500.0
@@ -30,26 +37,26 @@ strategies:
   mean_reversion:
     enabled: true
     rsi_period: 14
-    rsi_oversold: 38                # Loosened from 35 — was generating 0 trades
+    rsi_oversold: 42                # V2: Widened from 38 — catches more dips
     rsi_exit: 55
     atr_stop_multiplier: 1.5
-    atr_tp_multiplier: 3.5          # Wider target for better R:R
+    atr_tp_multiplier: 3.5
     hold_type: swing
     lookback_days: 30
 
   momentum:
     enabled: true
-    volume_spike_multiplier: 2.0    # Raised from 1.5 — reduces false breakout signals
+    volume_spike_multiplier: 1.5    # V2: Restored from 2.0 — catches more breakouts
     breakout_lookback: 20
     atr_stop_multiplier: 1.5
-    atr_tp_multiplier: 3.5          # Wider target for better R:R
+    atr_tp_multiplier: 3.5
     hold_type: adaptive
-    min_adr_pct: 2.0
+    min_adr_pct: 1.0                # V2: Reduced from 2.0 — now a conviction factor, not hard gate
 
   vwap:
     enabled: true
     hold_type: day
-    entry_deviation_pct: 0.5
+    entry_deviation_pct: 0.3        # V2: Reduced from 0.5 — lower dip depth required
     exit_deviation_pct: 0.3
 
   ema_crossover:
@@ -57,51 +64,51 @@ strategies:
     fast_period: 9
     slow_period: 20
     trend_period: 50
-    rsi_min: 50
-    rsi_max: 70                         # Tightened from 75 — avoid overbought entries
+    rsi_min: 45                     # V2: Widened from 50 — catch earlier entries
+    rsi_max: 75                     # V2: Widened from 70 — allow stronger momentum
     atr_stop_multiplier: 1.5
     atr_tp_multiplier: 3.0
     hold_type: swing
 
   macd_divergence:
     enabled: true
-    lookback_bars: 20
+    lookback_bars: 25               # V2: Increased from 20 — find more divergences
     atr_stop_multiplier: 1.8
-    atr_tp_multiplier: 3.5              # Wider target for better R:R
+    atr_tp_multiplier: 3.5
     hold_type: swing
 
   bb_squeeze:
     enabled: true
     squeeze_lookback: 5
-    min_relative_volume: 1.5            # Raised from 1.3 — stronger volume confirmation
+    min_relative_volume: 1.0        # V2: Reduced from 1.5 — vol is now conviction factor
     atr_tp_multiplier: 3.5
     hold_type: adaptive
 
   orb:
     enabled: true
     opening_range_minutes: 30
-    min_volume_ratio: 1.5
-    min_range_pct: 0.3                  # Minimum opening range width as % of price
+    min_volume_ratio: 1.0           # V2: Reduced from 1.5 — vol is now conviction factor
+    min_range_pct: 0.2              # V2: Reduced from 0.3 — catch tighter opens
     hold_type: day
 
   pullback:
     enabled: true
-    pullback_tolerance_pct: 0.75        # Tightened from 1.0 — must be closer to EMA
-    rsi_min: 40
-    rsi_max: 53                         # Tightened from 55 — more clearly pulled back
+    pullback_tolerance_pct: 1.5     # V2: Widened from 0.75 — catches more pullbacks
+    rsi_min: 35                     # V2: Widened from 40 — deeper pullbacks allowed
+    rsi_max: 58                     # V2: Widened from 53 — shallower pullbacks too
     atr_stop_multiplier: 0.5
-    atr_tp_multiplier: 3.0              # Raised from 2.5 — better R:R
+    atr_tp_multiplier: 3.0
     hold_type: swing
 
   # ── Options Strategies ──────────────────────────────────
   credit_put_spread:
     enabled: true
-    target_delta: 0.25              # Reduced from 0.30 — ~75% PoP instead of 70%
+    target_delta: 0.25
     min_dte: 20
     max_dte: 45
-    max_spread_width: 1.50          # Reduced from 2.50 — max loss $150 not $250
-    min_credit_pct: 0.30
-    max_risk: 100.0                 # Hard cap: max loss $100 per trade (20% of $500)
+    max_spread_width: 1.50
+    min_credit_pct: 0.25            # V2: Reduced from 0.30 — accept slightly thinner credit
+    max_risk: 100.0
 
   debit_call_spread:
     enabled: true
@@ -109,7 +116,7 @@ strategies:
     short_delta: 0.35
     min_dte: 30
     max_dte: 60
-    max_debit_pct: 0.50             # Reduced from 0.60 — better breakeven probability
+    max_debit_pct: 0.50
 
   long_call:
     enabled: true
@@ -117,7 +124,7 @@ strategies:
     min_dte: 20
     max_dte: 60
     max_contract_cost: 75.0
-    max_iv_percentile: 1.00         # Raised from 0.70 — let cost cap handle it
+    max_iv_percentile: 1.00
 
   long_put:
     enabled: true
@@ -125,63 +132,85 @@ strategies:
     min_dte: 20
     max_dte: 60
     max_contract_cost: 75.0
-    breakdown_lookback: 10          # Reduced from 20 — less restrictive breakdown
+    breakdown_lookback: 10
 
   cash_secured_put:
     enabled: true
-    target_delta: 0.20              # Reduced from 0.25 — ~80% PoP, safer on $500
+    target_delta: 0.20
     min_dte: 20
     max_dte: 45
-    min_annualized_return: 0.15
-    max_stock_price: 3.00           # Reduced from 5.00 — max collateral $300 not $500
+    min_annualized_return: 0.12     # V2: Reduced from 0.15 ��� accept lower return
+    max_stock_price: 5.00           # V2: Increased from 3.00 — more stocks eligible
 
   momentum_options:
     enabled: true
-    min_dte: 5                      # Raised from 2 — avoids pure theta-burn lottery tickets
+    min_dte: 5
     max_dte: 20
-    min_delta: 0.25                 # Raised from 0.15 — better odds of profiting
+    min_delta: 0.25
     max_delta: 0.45
-    max_contract_cost: 75.0         # Reduced from 100 — 15% of account cap
-    min_relative_volume: 2.0        # Raised from 1.5 — stronger confirmation
+    max_contract_cost: 75.0
+    min_relative_volume: 1.5        # V2: Reduced from 2.0
     breakout_lookback: 20
-    min_roi_pct: 0.30               # Raised from 0.25 — higher bar for short-DTE bets
+    min_roi_pct: 0.25               # V2: Reduced from 0.30
+
+  # V2 Phase 10: 0DTE (same-day expiration) options on liquid underlyings.
+  # High-risk/high-reward gamma plays. Position monitor job manages intraday
+  # lifecycle (loss cut, trailing, hard time exit at 15:30 ET).
+  zero_dte:
+    enabled: true
+    min_delta: 0.15
+    max_delta: 0.40
+    max_contract_cost: 50.0         # Max premium per contract ($)
+    min_relative_volume: 1.5
+    min_roi_pct: 0.50               # Need 50%+ ROI potential (gamma leverage)
+    # liquid_underlyings: override list, or use defaults (SPY, QQQ, AAPL, etc.)
 
   covered_call:
     enabled: true
     target_delta: 0.30
     min_dte: 20
     max_dte: 45
-    min_annualized_return: 0.12
-    max_stock_price: 3.00           # Reduced from 5.00 — 100 shares = $300 max
+    min_annualized_return: 0.10     # V2: Reduced from 0.12
+    max_stock_price: 5.00           # V2: Increased from 3.00
 
   covered_straddle:
-    enabled: false                  # Disabled — requires $600-1000 capital (impossible on $500)
+    enabled: false                  # Still disabled — requires too much capital
     min_dte: 20
     max_dte: 45
-    max_stock_price: 3.00
-    min_total_credit_pct: 0.06      # Raised from 0.04 — require 6% premium to justify risk
-    max_bb_width: 0.06              # Tightened from 0.10 — truly range-bound only
+    max_stock_price: 5.00           # V2: Increased from 3.00
+    min_total_credit_pct: 0.05      # V2: Reduced from 0.06
+    max_bb_width: 0.08              # V2: Widened from 0.06
 
 sentiment:
   enabled: true
   news_lookback_hours: 36
   news_max_articles: 10
-  min_conviction_after_mods: 0.45       # Raised from 0.35 — post-regime/news conviction floor
+  news_cache_ttl_seconds: 900       # V2 Phase 11: 15-min TTL for news cache (avoid redundant API calls)
+  min_conviction_after_mods: 0.40   # V2: Reduced from 0.45 — let more signals through
   block_on_bearish_news: -0.5
+  # V2 Phase 11: Earnings proximity guard — block entries when news indicates
+  # upcoming or just-released earnings to avoid binary event risk.
+  block_near_earnings: true
+  earnings_block_days_before: 1
+  earnings_block_days_after: 1
 
 options:
   enabled: true
   max_options_positions: 3
   max_options_capital_pct: 0.50
-  max_single_options_risk_pct: 0.12
+  max_single_options_risk_pct: 0.15  # V2: Increased from 0.12 — allow slightly larger options bets
+  # V2 Phase 10: 0DTE risk management (position monitor job parameters)
+  zero_dte_loss_cut_pct: -0.50      # Close at -50% of premium
+  zero_dte_trail_threshold: 1.00    # Start trailing once +100% profit
+  zero_dte_trail_pct: 0.50          # Exit if retraces 50% from peak profit
 
 strategy_weighting:
   enabled: true
   min_weight: 0.3
   max_weight: 2.0
-  burn_in_trades: 10
-  recalc_interval_trades: 5
-  recency_halflife_trades: 20
+  burn_in_trades: 5                 # V2: Reduced from 10 — start weighting sooner
+  recalc_interval_trades: 3         # V2: Reduced from 5 — adapt faster
+  recency_halflife_trades: 15       # V2: Reduced from 20 — weight recent trades more
 
 risk:
   stop_loss_pct: 0.03
@@ -189,13 +218,33 @@ risk:
   take_profit_pct: 0.06
   position_sizing: fractional
   kelly_fraction: 0.25
-  max_portfolio_heat_pct: 0.06
-  min_conviction_for_swing: 0.55       # Minimum conviction for swing trades (post-weighting)
+  max_portfolio_heat_pct: 0.08      # V2: Increased from 0.06 — allow more concurrent risk
+  min_conviction_for_swing: 0.50    # V2: Reduced from 0.55 — let more swing signals through
+
+  # V2 Phase 7: dynamic risk tolerance.  The DynamicRiskController composes
+  # conviction, streak, regime, and drawdown into runtime sizing multipliers.
+  # Defaults are baked into risk/dynamic_risk.py as module constants; this
+  # block is here for visibility and future overrides.
+  dynamic:
+    enabled: true
+    high_conviction_min: 0.90       # conviction >= 0.90 unlocks 50% concentration cap
+    high_conviction_position_pct: 0.50
+    streak_window: 10               # last N closed trades
+    streak_win_threshold: 0.60      # > 60% wins -> +0.5x
+    streak_loss_threshold: 0.35     # < 35% wins -> -0.5x
+    drawdown_tier1_pct: 0.03        # half-size
+    drawdown_tier2_pct: 0.05        # halt new entries
+    drawdown_tier3_pct: 0.15        # halt + require manual ack
 
 schedule:
   premarket_scan: "09:00"
   market_open: "09:30"
-  scan_interval_minutes: 15            # Scan & evaluate every 15 min (9:45 AM - 3:45 PM)
+  scan_interval_minutes: 15
   options_expiry_check: "15:30"
   eod_close_day_trades: "15:50"
   eod_review: "16:05"
+  eod_analysis: "16:10"            # V2 Phase 6: loss-pattern + optimizer sweep
+  ml_training: "17:00"             # V2 Phase 5: retrain signal-quality classifier
+
+analysis:
+  apply_parameter_changes: false   # V2 Phase 6: set true to let optimizer write parameter_overrides

@@ -29,8 +29,42 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum
+from typing import ClassVar
 
 import pandas as pd
+
+
+@dataclass
+class Rejection:
+    """Structured rejection from a strategy's evaluate() method.
+
+    Captures which filter failed, the actual vs threshold values, and
+    whether the rejection was a near-miss (close to passing).
+    """
+    symbol: str
+    strategy: str
+    filter_name: str
+    actual: float
+    threshold: float
+    direction: str = "above"  # "above" = needed actual > threshold; "below" = needed actual < threshold
+    miss_pct: float | None = None  # % distance from passing; set automatically
+
+    NEAR_MISS_PCT: ClassVar[float] = 15.0  # anything within 15% of threshold is a near-miss
+
+    def __post_init__(self) -> None:
+        if self.threshold != 0:
+            self.miss_pct = abs(self.actual - self.threshold) / abs(self.threshold) * 100
+        else:
+            self.miss_pct = None
+
+    @property
+    def is_near_miss(self) -> bool:
+        return self.miss_pct is not None and self.miss_pct <= self.NEAR_MISS_PCT
+
+    def to_reasoning(self) -> str:
+        dir_word = "needed >=" if self.direction == "above" else "needed <="
+        miss = f" (miss by {self.miss_pct:.1f}%)" if self.miss_pct is not None else ""
+        return f"{self.filter_name}: {self.actual:.4g} {dir_word} {self.threshold:.4g}{miss}"
 
 
 class HoldType(Enum):
@@ -90,9 +124,56 @@ class BaseStrategy(ABC):
 
     def __init__(self, config):
         self.config = config
-        # getattr() with a default is used because the config may not
-        # always have an "enabled" key (defensive programming).
         self.enabled = getattr(config, "enabled", True)
+        self._rejections: list[Rejection] = []
+        # Optional market context (VIX, regime) set by the aggregator before
+        # each evaluate() call. Strategies read it to scale stop/target widths.
+        self.market_context = None
+
+    def _reject(
+        self, symbol: str, filter_name: str,
+        actual: float, threshold: float, direction: str = "above",
+    ) -> None:
+        """Record a rejection with the filter that failed."""
+        self._rejections.append(Rejection(
+            symbol=symbol,
+            strategy=type(self).__name__,
+            filter_name=filter_name,
+            actual=actual,
+            threshold=threshold,
+            direction=direction,
+        ))
+
+    def drain_rejections(self) -> list[Rejection]:
+        """Return and clear all buffered rejections."""
+        rej = self._rejections
+        self._rejections = []
+        return rej
+
+    def _plan_long_exit(
+        self,
+        bars: pd.DataFrame,
+        entry_price: float,
+        atr: float,
+        base_stop_mult: float,
+        base_tp_mult: float,
+    ):
+        """Compute S/R-aware stop + target using the shared ExitPlanner.
+
+        Pulls VIX/regime from self.market_context when available, so per-trade
+        widths adapt to volatility and regime without threading ctx through
+        every strategy signature.
+        """
+        from ai_trade.strategy.exit_planner import plan_long_exit
+        ctx = self.market_context
+        vix = getattr(ctx, "vix_level", None) if ctx else None
+        regime_enum = getattr(ctx, "regime", None) if ctx else None
+        regime = getattr(regime_enum, "value", None) if regime_enum else None
+        return plan_long_exit(
+            bars=bars, entry_price=entry_price, atr=atr,
+            base_stop_mult=base_stop_mult, base_tp_mult=base_tp_mult,
+            vix=vix, regime=regime,
+        )
 
     @abstractmethod
     def evaluate(

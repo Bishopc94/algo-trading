@@ -213,6 +213,56 @@ def add_volume_profile(df: pd.DataFrame, period: int = 20) -> pd.DataFrame:
 # Standalone computations (return a value, don't modify the DataFrame)
 # ---------------------------------------------------------------------------
 
+def add_momentum_prediction(df: pd.DataFrame, roc_period: int = 3) -> pd.DataFrame:
+    """Add momentum prediction columns for rate-of-change analysis.
+
+    Columns added:
+        rsi_roc_3    — 3-bar rate of change of RSI (predicts RSI direction)
+        macd_accel   — acceleration of MACD histogram (2nd derivative)
+        ema_9_slope  — slope of EMA-9 over last 3 bars (normalized by price)
+        ema_20_slope — slope of EMA-20 over last 3 bars
+        price_roc_5  — 5-bar price rate of change (%)
+        volume_trend — 3-bar average relative volume trend
+    """
+    if "rsi_roc_3" in df.columns:
+        return df
+
+    # RSI rate of change — predicts where RSI will be in 1-3 bars
+    if "rsi_14" in df.columns:
+        df["rsi_roc_3"] = df["rsi_14"].diff(roc_period)
+    else:
+        df["rsi_roc_3"] = 0.0
+
+    # MACD histogram acceleration (2nd derivative)
+    if "macd_hist" in df.columns:
+        df["macd_accel"] = df["macd_hist"].diff()
+    else:
+        df["macd_accel"] = 0.0
+
+    # EMA slopes (normalized by price to make cross-stock comparable)
+    price = df["close"]
+    if "ema_9" in df.columns:
+        df["ema_9_slope"] = (df["ema_9"].diff(roc_period) / price) * 100
+    else:
+        df["ema_9_slope"] = 0.0
+
+    if "ema_20" in df.columns:
+        df["ema_20_slope"] = (df["ema_20"].diff(roc_period) / price) * 100
+    else:
+        df["ema_20_slope"] = 0.0
+
+    # Price rate of change (5-bar)
+    df["price_roc_5"] = df["close"].pct_change(5) * 100
+
+    # Volume trend (is volume increasing or decreasing?)
+    if "relative_volume" in df.columns:
+        df["volume_trend"] = df["relative_volume"].rolling(3).mean().diff()
+    else:
+        df["volume_trend"] = 0.0
+
+    return df
+
+
 def compute_adr(df: pd.DataFrame, period: int = 14) -> float:
     """Compute Average Daily Range % over the last *period* days.
 
@@ -254,6 +304,7 @@ def add_all(df: pd.DataFrame, intraday: bool = False) -> pd.DataFrame:
     add_bollinger(df)
     add_macd(df)
     add_volume_profile(df)
+    add_momentum_prediction(df)
     if intraday:
         add_vwap(df)
     return df

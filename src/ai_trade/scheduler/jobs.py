@@ -261,6 +261,19 @@ def create_scheduler(bot: TradingBot) -> BackgroundScheduler:
         name="Sync positions with Alpaca",
     )
 
+    # ── Job 14: Trailing stop update (every 5 min during market hours) ──
+    # Walks open stock trades and tightens bracket-order stops when price
+    # has moved in our favor (breakeven trigger or chandelier trail).
+    # See main.py::job_update_trailing_stops for the logic.
+    scheduler.add_job(
+        bot.job_update_trailing_stops,
+        CronTrigger(
+            hour="9-15", minute="*/5", day_of_week="mon-fri", timezone=ET,
+        ),
+        id="trailing_stops",
+        name="Advance trailing stops on open winners",
+    )
+
     # ── Job 13: Options position sync (every 5 min during market hours) ──
     # Reconciles options positions with Alpaca's broker-side state.
     # Less frequent than stock sync (every minute) since options fills
@@ -272,6 +285,61 @@ def create_scheduler(bot: TradingBot) -> BackgroundScheduler:
         ),
         id="options_position_sync",
         name="Sync options positions with Alpaca",
+    )
+
+    # ── Job 16: Self-learning analysis sweep (V2 Phase 6) ──
+    # Post-close loss-pattern scan + parameter optimizer review.  Runs
+    # after eod_review so the freshly-closed trades and today's snapshot
+    # are already committed to the database.  Proposals are logged
+    # regardless; they only become active on next restart when the
+    # ``apply_parameter_changes`` toggle is enabled in config.
+    eod_analysis_time = getattr(cfg, "eod_analysis", "16:10")
+    h, m = _parse_time(eod_analysis_time)
+    scheduler.add_job(
+        bot.job_eod_analysis,
+        CronTrigger(hour=h, minute=m, day_of_week="mon-fri", timezone=ET),
+        id="eod_analysis",
+        name="Self-learning trade analysis sweep",
+    )
+
+    # ── Job 15: ML training (post-close, V2 Phase 5) ──
+    # Retrains the signal-quality classifier after the market closes
+    # using all closed-trade feature snapshots captured during the
+    # session.  Cold-start safe — returns insufficient_data until the
+    # training set has at least 30 labelled trades.  The predictor
+    # does NOT swap models mid-session; the next bot restart picks up
+    # the newly active version.
+    ml_training_time = getattr(cfg, "ml_training", "17:00")
+    h, m = _parse_time(ml_training_time)
+    scheduler.add_job(
+        bot.job_train_ml_models,
+        CronTrigger(hour=h, minute=m, day_of_week="mon-fri", timezone=ET),
+        id="ml_training",
+        name="Retrain ML signal-quality classifier",
+    )
+
+    # ── Job 17: 0DTE position monitor (every 2 min during market hours) ──
+    # Manages intraday lifecycle of 0DTE options: hard time exit at 15:30,
+    # loss cut at -50%, trailing stop at 50% of peak profit.
+    scheduler.add_job(
+        bot.job_monitor_zero_dte,
+        CronTrigger(
+            hour="9-15", minute="*/2", day_of_week="mon-fri", timezone=ET,
+        ),
+        id="zero_dte_monitor",
+        name="Monitor 0DTE options positions",
+    )
+
+    # ── Job 18: Database cleanup (weekly Sunday midnight) ──
+    # Purges high-volume tables (decisions, scanner_results, ml_features,
+    # ml_predictions) older than 90 days to keep the DB lean.
+    scheduler.add_job(
+        bot.job_cleanup_database,
+        CronTrigger(
+            hour=0, minute=0, day_of_week="sun", timezone=ET,
+        ),
+        id="db_cleanup",
+        name="Database cleanup (90-day retention)",
     )
 
     log.info("scheduler_configured", job_count=len(scheduler.get_jobs()))

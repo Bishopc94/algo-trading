@@ -41,7 +41,8 @@ import signal
 import sys
 import time
 import traceback
-from datetime import datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -53,6 +54,21 @@ from ai_trade.clients import init_clients, get_trading_client, get_account
 from ai_trade.data.historical import fetch_bars_multi
 from ai_trade.data.indicators import add_all
 from ai_trade.monitoring.database import Database
+from ai_trade.state_persistence import (
+    apply_parameter_overrides,
+    detect_offline_gap,
+    get_current_regime,
+    log_boot_summary,
+    record_current_regime,
+    record_shutdown,
+    record_startup,
+)
+from ai_trade.ml.predictor import SignalQualityPredictor
+from ai_trade.ml.features import extract_features
+from ai_trade.ml.trainer import train_signal_quality_model
+from ai_trade.analysis.post_trade import analyze_and_persist as analyze_closed_trade_and_persist
+from ai_trade.analysis.loss_patterns import scan_loss_patterns
+from ai_trade.analysis.parameter_optimizer import review_and_adjust as review_parameter_adjustments
 from ai_trade.monitoring.logger import setup_logging, get_logger
 from ai_trade.monitoring import console as con
 from ai_trade.monitoring.notifier import (
@@ -60,11 +76,15 @@ from ai_trade.monitoring.notifier import (
     notify_options_order,
     notify_stock_order,
     notify_stock_order_failed,
+    notify_trade_exit,
+    notify_trailing_stop_update,
 )
 from ai_trade.monitoring.performance import PerformanceTracker
+from ai_trade.risk.dynamic_risk import DynamicRiskController
 from ai_trade.risk.pdt_manager import PDTManager
 from ai_trade.risk.position_sizer import PositionSizer
 from ai_trade.risk.risk_manager import RiskManager
+from ai_trade.risk.smart_pdt import SmartPDTPlanner
 from ai_trade.execution.order_manager import OrderManager
 from ai_trade.scanner.screener import StockScreener
 from ai_trade.strategy.base import HoldType
@@ -91,10 +111,30 @@ from ai_trade.strategy.options.cash_secured_put import CashSecuredPutStrategy
 from ai_trade.strategy.options.covered_call import CoveredCallStrategy
 from ai_trade.strategy.options.covered_straddle import CoveredStraddleStrategy
 from ai_trade.strategy.options.momentum_options import MomentumOptionsStrategy
+from ai_trade.strategy.options.zero_dte import ZeroDTEStrategy
 
 # Sentiment imports
 from ai_trade.sentiment.market_regime import MarketRegimeAnalyzer, MarketRegime
 from ai_trade.sentiment.news_sentiment import NewsSentimentScanner
+from ai_trade.sentiment.earnings_guard import EarningsGuard
+from ai_trade.sentiment.economic_calendar import (
+    get_events_for_date,
+    get_high_impact_events,
+    is_high_impact_day,
+    conviction_modifier_for_events,
+)
+
+# V2: Decision audit trail
+from ai_trade.monitoring.decision_logger import DecisionLogger
+
+# V2 Phase 13: Cycle timing
+from ai_trade.monitoring.cycle_timer import CycleTimer
+
+# V2 Phase 12: Market prediction
+from ai_trade.analysis.market_prediction import (
+    compute_momentum_score,
+    momentum_conviction_modifier,
+)
 
 log = get_logger(__name__)
 
@@ -128,10 +168,30 @@ class TradingBot:
 
         # ── Core components ──
         self.db = Database()                                    # SQLite persistence
+        self.decisions = DecisionLogger(self.db)                # V2: Decision audit trail
+
+        # V2 Phase 4: Restart-safe state loading.
+        # Parameter overrides must be applied BEFORE strategies are
+        # instantiated so each strategy sees the patched config values.
+        # The applied list is cached so `start()` can include it in the
+        # boot summary log.
+        boot_regime = get_current_regime(self.db) or None
+        self._applied_overrides = apply_parameter_overrides(self.cfg, self.db, regime=boot_regime)
+        self._offline_gap = detect_offline_gap(self.db)
+
         self.screener = StockScreener(self.cfg.scanner)         # Pre-market scanner
         self.pdt = PDTManager(self.cfg.pdt, self.db)            # Day-trade tracking
+        # V2 Phase 8: smart PDT planner -- dynamic day-trade threshold
+        # + day->swing conversion for eligible strategies.
+        self.smart_pdt = SmartPDTPlanner(self.cfg.pdt, self.db)
         self.sizer = PositionSizer(merged_cfg)                  # Position sizing
-        self.risk = RiskManager(merged_cfg, self.db)            # Risk gate
+        # V2 Phase 7: dynamic risk tolerance — composes conviction +
+        # streak + regime + drawdown into runtime sizing multipliers that
+        # RiskManager and SignalAggregator consume.
+        self.dynamic_risk = DynamicRiskController(merged_cfg, self.db)
+        self.risk = RiskManager(
+            merged_cfg, self.db, dynamic_controller=self.dynamic_risk
+        )                                                        # Risk gate
         self.orders = OrderManager(self.db)                     # Stock order execution
         self.options_orders = OptionsOrderManager(self.db)      # Options order execution
         self.perf = PerformanceTracker(self.db)                 # P&L metrics
@@ -164,6 +224,11 @@ class TradingBot:
         if weighter_cfg and getattr(weighter_cfg, "enabled", False):
             self.weighter = StrategyWeighter(self.db, weighter_cfg)
 
+        # V2 Phase 5: ML signal-quality predictor.  Cold-start safe —
+        # returns None from predict() when no model is loaded, which
+        # leaves the rule-based conviction untouched.
+        self.ml_predictor = SignalQualityPredictor(self.db)
+
         # The signal aggregator is the "brain" — it collects signals from
         # all strategies, ranks them, and builds the execution queue.
         self.aggregator = SignalAggregator(
@@ -172,6 +237,10 @@ class TradingBot:
             risk_manager=self.risk,
             position_sizer=self.sizer,
             weighter=self.weighter,
+            decision_logger=self.decisions,
+            ml_predictor=self.ml_predictor,
+            dynamic_risk=self.dynamic_risk,
+            smart_pdt=self.smart_pdt,
         )
 
         # ── Options strategies ──
@@ -194,10 +263,23 @@ class TradingBot:
                 self.options_strategies.append(CoveredStraddleStrategy(strat_cfg.covered_straddle))
             if getattr(strat_cfg, "momentum_options", None) and strat_cfg.momentum_options.enabled:
                 self.options_strategies.append(MomentumOptionsStrategy(strat_cfg.momentum_options))
+            if getattr(strat_cfg, "zero_dte", None) and strat_cfg.zero_dte.enabled:
+                self.options_strategies.append(ZeroDTEStrategy(strat_cfg.zero_dte))
 
         # ── Sentiment layer ──
         self.regime_analyzer = MarketRegimeAnalyzer()
-        self.news_scanner = NewsSentimentScanner(lookback_hours=24, max_articles=10)
+        news_lookback = getattr(self.cfg.sentiment, "news_lookback_hours", 24)
+        news_max = getattr(self.cfg.sentiment, "news_max_articles", 10)
+        news_cache_ttl = getattr(self.cfg.sentiment, "news_cache_ttl_seconds", 900)
+        self.news_scanner = NewsSentimentScanner(
+            lookback_hours=news_lookback,
+            max_articles=news_max,
+            cache_ttl_seconds=news_cache_ttl,
+        )
+        self.earnings_guard = EarningsGuard(
+            block_days_before=getattr(self.cfg.sentiment, "earnings_block_days_before", 1),
+            block_days_after=getattr(self.cfg.sentiment, "earnings_block_days_after", 1),
+        )
         self._market_context = None  # Set at market open by _analyze_market_regime()
 
         # ── State ──
@@ -206,6 +288,10 @@ class TradingBot:
         self._running = False
         self._failed_symbols: dict[str, str] = {}  # symbol -> reason (untradable, halted, etc.)
         self._failed_symbol_counts: dict[str, int] = {}  # symbol -> consecutive fail count
+        self._scan_counts: dict[str, int] = {"momentum": 0, "mean_reversion": 0, "vwap": 0}
+
+        # V2 Phase 13: Per-cycle timing budget (10s default)
+        self._cycle_timer = CycleTimer()
 
     # ══════════════════════════════════════════════════════════
     # Lifecycle
@@ -245,6 +331,15 @@ class TradingBot:
             day_trade_count=account.daytrade_count,
             paper=self.cfg.alpaca.paper,
         )
+
+        # V2 Phase 4: emit structured boot summary of restored state.
+        weighter_rows_loaded = len(self.weighter._weights) if self.weighter else 0
+        log_boot_summary(
+            weighter_rows=weighter_rows_loaded,
+            overrides_applied=self._applied_overrides,
+            gap=self._offline_gap,
+        )
+        record_startup(self.db)
 
         # Reconcile any positions from a previous run (e.g. if the bot
         # was restarted mid-day, positions may still be open on Alpaca).
@@ -314,11 +409,23 @@ class TradingBot:
         Server-side bracket orders (stop-loss + take-profit) remain active
         on Alpaca's servers even after the bot shuts down.  This is a key
         safety feature — your stops protect you even if the bot crashes.
+
+        V2 Phase 4: flushes the decision logger and writes a shutdown
+        timestamp to `bot_state` so the next startup can measure the
+        offline gap.
         """
         log.info("bot_stopping", version=__version__)
         self._running = False
         if hasattr(self, "_scheduler"):
             self._scheduler.shutdown(wait=False)
+        try:
+            self.decisions.flush()
+        except Exception:
+            log.exception("shutdown_decisions_flush_failed")
+        try:
+            record_shutdown(self.db)
+        except Exception:
+            log.exception("shutdown_record_failed")
         print(con.stopped())
 
     # ══════════════════════════════════════════════════════════
@@ -507,6 +614,7 @@ class TradingBot:
                 log.debug("vix_fetch_failed", error=str(e))
 
             self._market_context = self.regime_analyzer.analyze(spy_bars, qqq_bars, vix_bars)
+            record_current_regime(self.db, self._market_context.regime.value)
             log.info(
                 "market_regime_result",
                 regime=self._market_context.regime.value,
@@ -622,6 +730,7 @@ class TradingBot:
 
             # Find DB trades that are no longer in broker positions
             broker_syms = {pos.symbol for pos in broker_positions}
+            any_closed = False
             for trade in open_db_trades:
                 trade_legs = trade.get("legs", "")
                 # Check if any leg symbol is still held at the broker
@@ -635,8 +744,183 @@ class TradingBot:
                         exit_time=datetime.now(ET).isoformat(),
                         close_reason="filled_or_expired",
                     )
+                    self._log_options_trade_exit(trade, close_reason="filled_or_expired")
+                    any_closed = True
+            if any_closed:
+                self.decisions.flush()
         except Exception as e:
             log.debug("options_position_sync_failed", error=str(e))
+
+    def _log_options_trade_exit(self, trade: dict, close_reason: str) -> None:
+        """Emit exit + review decisions for a closed options trade."""
+        underlying = trade.get("underlying", "")
+        strategy = trade.get("strategy", "")
+        entry_debit = trade.get("entry_debit") or 0
+        entry_credit = trade.get("entry_credit") or 0
+        max_loss = trade.get("max_loss") or 0
+        max_profit = trade.get("max_profit") or 0
+
+        self.decisions.log_exit(
+            underlying, strategy,
+            reasoning=f"options closed via {close_reason}: debit=${entry_debit:.2f} credit=${entry_credit:.2f} max_loss=${max_loss:.2f} max_profit=${max_profit:.2f}",
+            factors={
+                "trade_id": trade.get("id"),
+                "close_reason": close_reason,
+                "entry_debit": entry_debit,
+                "entry_credit": entry_credit,
+                "max_loss": max_loss,
+                "max_profit": max_profit,
+                "expiration": trade.get("expiration"),
+                "strikes": trade.get("strikes"),
+            },
+        )
+        self.decisions.log_review(
+            underlying, strategy,
+            reasoning=f"options trade closed via {close_reason}; review whether legs behaved as expected",
+            factors={"outcome": close_reason},
+        )
+
+    def job_monitor_zero_dte(self) -> None:
+        """Every 2 min during market hours -- manage open 0DTE options.
+
+        For each open 0DTE position:
+          - Hard time exit at 15:30 ET (30 min before close).
+          - Loss cut at -50% of premium paid.
+          - Trailing stop: once profit exceeds 100% of premium, trail at
+            50% of peak profit (lock in at least half the gains).
+        """
+        if not self.options_enabled:
+            return
+        try:
+            open_opts = self.db.get_open_options_trades()
+            zero_dte_trades = [
+                t for t in open_opts
+                if "zero_dte" in (t.get("strategy") or "")
+            ]
+            if not zero_dte_trades:
+                return
+
+            now_et = datetime.now(ET)
+            time_exit = now_et.hour * 60 + now_et.minute >= 15 * 60 + 30
+
+            from ai_trade.data.options_chain import get_options_snapshot
+
+            for trade in zero_dte_trades:
+                legs_str = trade.get("legs", "")
+                if not legs_str:
+                    continue
+
+                leg_symbols = [s.strip() for s in legs_str.split(",") if s.strip()]
+                if not leg_symbols:
+                    continue
+
+                if time_exit:
+                    log.info(
+                        "zero_dte_time_exit",
+                        trade_id=trade["id"],
+                        underlying=trade.get("underlying", ""),
+                    )
+                    for sym in leg_symbols:
+                        self.options_orders.close_options_position(sym)
+                    self.db.update_options_trade(
+                        trade["id"], status="closed",
+                        exit_time=now_et.isoformat(),
+                        close_reason="zero_dte_time_exit",
+                    )
+                    self._log_options_trade_exit(trade, close_reason="zero_dte_time_exit")
+                    continue
+
+                snaps = get_options_snapshot(leg_symbols)
+                if not snaps:
+                    continue
+
+                entry_cost = abs(trade.get("entry_debit", 0) or 0) * 100
+                if entry_cost <= 0:
+                    entry_cost = abs(trade.get("max_loss", 0) or 0)
+                if entry_cost <= 0:
+                    continue
+
+                current_value = 0.0
+                for sym in leg_symbols:
+                    snap = snaps.get(sym, {})
+                    mid = snap.get("mid_price", 0.0)
+                    current_value += mid * 100
+
+                pnl_pct = (current_value - entry_cost) / entry_cost if entry_cost > 0 else 0.0
+
+                loss_cut_pct = getattr(self.cfg, "options", None)
+                loss_cut_pct = getattr(loss_cut_pct, "zero_dte_loss_cut_pct", -0.50) if loss_cut_pct else -0.50
+
+                if pnl_pct <= loss_cut_pct:
+                    log.info(
+                        "zero_dte_loss_cut",
+                        trade_id=trade["id"],
+                        underlying=trade.get("underlying", ""),
+                        pnl_pct=round(pnl_pct, 3),
+                    )
+                    for sym in leg_symbols:
+                        self.options_orders.close_options_position(sym)
+                    self.db.update_options_trade(
+                        trade["id"], status="closed",
+                        exit_time=now_et.isoformat(),
+                        close_reason="zero_dte_loss_cut",
+                    )
+                    self._log_options_trade_exit(trade, close_reason="zero_dte_loss_cut")
+                    continue
+
+                trail_threshold = getattr(
+                    getattr(self.cfg, "options", None), "zero_dte_trail_threshold", 1.0,
+                )
+                trail_pct = getattr(
+                    getattr(self.cfg, "options", None), "zero_dte_trail_pct", 0.50,
+                )
+
+                if pnl_pct >= trail_threshold:
+                    peak_key = f"zero_dte.peak.{trade['id']}"
+                    prev_peak = float(self.db.get_state(peak_key, "0") or "0")
+                    peak = max(prev_peak, current_value)
+                    if current_value > prev_peak:
+                        self.db.set_state(peak_key, str(current_value))
+
+                    drawdown_from_peak = (peak - current_value) / peak if peak > 0 else 0.0
+                    if drawdown_from_peak >= trail_pct and prev_peak > 0:
+                        log.info(
+                            "zero_dte_trail_exit",
+                            trade_id=trade["id"],
+                            underlying=trade.get("underlying", ""),
+                            pnl_pct=round(pnl_pct, 3),
+                            peak=round(peak, 2),
+                            current=round(current_value, 2),
+                        )
+                        for sym in leg_symbols:
+                            self.options_orders.close_options_position(sym)
+                        self.db.update_options_trade(
+                            trade["id"], status="closed",
+                            exit_time=now_et.isoformat(),
+                            close_reason="zero_dte_trail_exit",
+                        )
+                        self._log_options_trade_exit(trade, close_reason="zero_dte_trail_exit")
+
+        except Exception as e:
+            log.debug("zero_dte_monitor_failed", error=str(e))
+
+    def job_cleanup_database(self) -> None:
+        """Weekly (Sunday midnight) — purge old rows from high-volume tables.
+
+        Keeps the SQLite database lean by removing decisions, scanner results,
+        and ML tables older than 90 days.  Core tables (trades, trade_analysis,
+        parameter_history) are kept indefinitely for the self-learning loop.
+        """
+        try:
+            deleted = self.db.cleanup_old_data(retention_days=90)
+            total = sum(deleted.values())
+            if total > 0:
+                log.info("db_cleanup_done", deleted=deleted, total_rows=total)
+                print(con.detail(f"DB cleanup: {total} old rows removed."))
+            else:
+                log.info("db_cleanup_nothing_to_do")
+        except Exception as e:
+            log.warning("db_cleanup_failed", error=str(e))
 
     def job_eod_close_day_trades(self) -> None:
         """3:50 PM ET — Force-close any open day-trade positions.
@@ -708,6 +992,58 @@ class TradingBot:
         except Exception as e:
             log.error("eod_review_failed", error=str(e))
 
+    def job_eod_analysis(self) -> None:
+        """Post-close self-learning sweep — loss patterns + parameter review.
+
+        Runs after eod_review.  Scans recent closed trades for loss
+        clusters across strategy/hour/regime/stop-quality axes and asks
+        the parameter optimizer to propose bounded adjustments.  When
+        ``analysis.apply_parameter_changes`` is true in config, the
+        optimizer writes new ``parameter_overrides`` rows which take
+        effect on the next bot restart (never mid-session).
+        """
+        log.info("job_start", job="eod_analysis")
+        try:
+            clusters = scan_loss_patterns(self.db, lookback=50)
+            self.db.set_state(
+                "analysis.last_pattern_scan",
+                datetime.now(timezone.utc).isoformat(),
+            )
+            self.db.set_state(
+                "analysis.last_pattern_clusters", str(len(clusters))
+            )
+            for c in clusters[:5]:
+                log.info("loss_cluster", **c)
+
+            apply_changes = bool(
+                getattr(
+                    getattr(self.cfg, "analysis", None),
+                    "apply_parameter_changes",
+                    False,
+                )
+            )
+            proposals = review_parameter_adjustments(
+                database=self.db,
+                cfg=self.cfg,
+                apply_changes=apply_changes,
+            )
+            self.db.set_state(
+                "analysis.last_optimizer_run",
+                datetime.now(timezone.utc).isoformat(),
+            )
+            self.db.set_state(
+                "analysis.last_optimizer_proposals", str(len(proposals))
+            )
+            if proposals:
+                log.info(
+                    "parameter_review_complete",
+                    proposals=len(proposals),
+                    applied=sum(1 for p in proposals if p.get("applied")),
+                    apply_changes=apply_changes,
+                )
+        except Exception:
+            log.exception("eod_analysis_failed")
+
     def job_sync_positions(self) -> None:
         """Every 60 seconds — Reconcile Alpaca positions with local DB.
 
@@ -716,9 +1052,362 @@ class TradingBot:
         Without this sync, the DB would show stale "open" trades.
         """
         try:
-            self.orders.sync_positions()
+            summary = self.orders.sync_positions()
+            closed = summary.get("closed_trades", []) if summary else []
+            for t in closed:
+                self._log_stock_trade_exit(t)
+            if closed:
+                self.decisions.flush()
         except Exception as e:
             log.warning("sync_failed", error=str(e))
+
+    def job_update_trailing_stops(self) -> None:
+        """Every 5 minutes — advance stop-losses on open winners.
+
+        For each open stock trade:
+          1. Fetch current price via snapshot
+          2. Look up stored ATR (or fall back to a % move)
+          3. Ask ExitPlanner.compute_trailing_stop_long for a tighter stop
+          4. Replace the Alpaca stop-loss leg if the proposal improves it
+        """
+        try:
+            from ai_trade.data.historical import fetch_snapshots
+            from ai_trade.strategy.exit_planner import compute_trailing_stop_long
+
+            open_trades = self.db.get_open_trades()
+            open_trades = [t for t in open_trades if t.get("side") == "long"]
+            if not open_trades:
+                return
+
+            symbols = sorted({t.get("symbol", "") for t in open_trades if t.get("symbol")})
+            if not symbols:
+                return
+            snaps = fetch_snapshots(symbols)
+
+            updated = 0
+            for t in open_trades:
+                sym = t.get("symbol", "")
+                buy_order_id = t.get("buy_order_id")
+                if not sym or not buy_order_id:
+                    continue
+
+                snap = snaps.get(sym)
+                if not snap:
+                    continue
+                current_price = None
+                if hasattr(snap, "latest_trade") and snap.latest_trade:
+                    current_price = float(snap.latest_trade.price)
+                elif hasattr(snap, "daily_bar") and snap.daily_bar:
+                    current_price = float(snap.daily_bar.close)
+                if current_price is None or current_price <= 0:
+                    continue
+
+                entry_price = float(t.get("entry_price") or 0)
+                current_stop = float(t.get("stop_loss") or 0)
+                if entry_price <= 0 or current_stop <= 0:
+                    continue
+
+                atr = t.get("atr")
+                if atr is None or atr <= 0:
+                    # NOTE: do NOT use (entry - current_stop) as a proxy --
+                    # the stop may itself have been set tight (e.g. VWAP
+                    # reclaim), which would circularly yield a tiny ATR
+                    # and trigger a hair-trigger breakeven ratchet.
+                    # 2% of entry price is a conservative floor.
+                    atr = max(0.01, entry_price * 0.02)
+                else:
+                    atr = float(atr)
+
+                try:
+                    conviction = float(t.get("conviction") or 0.0)
+                except (TypeError, ValueError):
+                    conviction = 0.0
+
+                hi = t.get("high_since_entry")
+                hi = float(hi) if hi not in (None, 0) else None
+                if hi is None or current_price > hi:
+                    hi = current_price
+
+                lo = t.get("low_since_entry")
+                lo = float(lo) if lo not in (None, 0) else None
+                if lo is None or current_price < lo:
+                    lo = current_price
+
+                new_stop, mode = compute_trailing_stop_long(
+                    entry_price=entry_price,
+                    current_price=current_price,
+                    current_stop=current_stop,
+                    atr=atr,
+                    high_since_entry=hi,
+                    conviction=conviction,
+                )
+
+                # Time-based rule: day trades that aren't profitable after
+                # 60 min tighten to just under entry. Exit happens naturally
+                # if price ticks down into the new stop.
+                if t.get("hold_type") == "day" and current_price <= entry_price:
+                    entry_time_str = t.get("entry_time", "")
+                    try:
+                        from datetime import datetime as _dt, timezone as _tz
+                        entry_dt = _dt.fromisoformat(entry_time_str.replace("Z", "+00:00"))
+                        if entry_dt.tzinfo is None:
+                            entry_dt = entry_dt.replace(tzinfo=_tz.utc)
+                        age_min = (_dt.now(_tz.utc) - entry_dt).total_seconds() / 60
+                    except Exception:
+                        age_min = 0
+                    if age_min >= 60:
+                        time_stop = round(entry_price * 0.9995, 2)
+                        if time_stop > current_stop and (new_stop is None or time_stop > new_stop):
+                            if time_stop < current_price - 0.01:
+                                new_stop, mode = time_stop, "time_breakeven"
+
+                if new_stop is None:
+                    if hi != t.get("high_since_entry") or lo != t.get("low_since_entry"):
+                        try:
+                            self.db.update_trade(
+                                t["id"], high_since_entry=hi, low_since_entry=lo,
+                            )
+                        except Exception:
+                            pass
+                    continue
+
+                stop_order_id = self.orders.find_stop_leg_id(str(buy_order_id))
+                if not stop_order_id:
+                    continue
+
+                if self.orders.replace_stop_price(stop_order_id, new_stop):
+                    try:
+                        self.db.update_trade(
+                            t["id"], stop_loss=new_stop,
+                            high_since_entry=hi, low_since_entry=lo,
+                        )
+                    except Exception as e:
+                        log.debug("trailing_db_update_failed", trade_id=t["id"], error=str(e))
+                    self.decisions.log_evaluate(
+                        sym, "trailing_stop", "tightened",
+                        reasoning=f"{mode}: stop {current_stop:.2f} -> {new_stop:.2f} (price {current_price:.2f})",
+                        factors={
+                            "mode": mode,
+                            "old_stop": current_stop,
+                            "new_stop": new_stop,
+                            "current_price": current_price,
+                            "high_since_entry": hi,
+                            "atr": atr,
+                            "conviction": conviction,
+                        },
+                    )
+                    try:
+                        notify_trailing_stop_update(
+                            symbol=sym,
+                            strategy=str(t.get("strategy") or ""),
+                            old_stop=current_stop,
+                            new_stop=new_stop,
+                            entry_price=entry_price,
+                            current_price=current_price,
+                            high_since_entry=hi,
+                            mode=mode,
+                            conviction=conviction,
+                            atr=atr,
+                            take_profit=float(t.get("take_profit") or 0.0) or None,
+                        )
+                    except Exception as e:
+                        log.debug("trailing_email_failed", symbol=sym, error=str(e))
+                    updated += 1
+            if updated:
+                self.decisions.flush()
+                log.info("trailing_stops_updated", count=updated)
+        except Exception as e:
+            log.warning("trailing_stops_job_failed", error=str(e))
+
+    def job_train_ml_models(self) -> None:
+        """Retrain the signal-quality classifier on all closed trades.
+
+        Runs after market close.  Cold-start safe: if we haven't
+        accumulated enough closed trades with feature snapshots, the
+        trainer returns `insufficient_data` and this job is a no-op.
+        Successful training writes a new row to `ml_models` with
+        is_active=1 and deactivates prior versions — the next bot
+        restart will pick up the new model.
+        """
+        try:
+            result = train_signal_quality_model(self.db)
+            log.info("ml_training_job_result", **result)
+            # Record the last training attempt timestamp for observability.
+            self.db.set_state(
+                "ml.last_training_run",
+                datetime.now(timezone.utc).isoformat(),
+            )
+            if result.get("status") == "ok":
+                self.db.set_state(
+                    "ml.last_training_success",
+                    datetime.now(timezone.utc).isoformat(),
+                )
+                self.db.set_state(
+                    "ml.active_model_version", str(result.get("version", ""))
+                )
+        except Exception:
+            log.exception("ml_training_job_failed")
+
+    def _snapshot_features_for_trade(self, sig, order_id: str) -> None:
+        """Persist the ML feature vector for a just-executed trade.
+
+        Called after a bracket order submits successfully.  Looks up
+        the newly inserted trade row by `buy_order_id` so we can key
+        the `ml_features` row to `trade_id` without changing the
+        order manager's return signature.  Best-effort: failures are
+        logged but never block the execution path.
+        """
+        try:
+            with self.db._conn() as conn:  # noqa: SLF001
+                row = conn.execute(
+                    "SELECT id FROM trades WHERE buy_order_id = ? ORDER BY id DESC LIMIT 1",
+                    (str(order_id),),
+                ).fetchone()
+            if row is None:
+                log.debug("ml_feature_snapshot_no_trade_row", order_id=str(order_id))
+                return
+            trade_id = int(row["id"])
+            feats = extract_features(sig, self._market_context)
+            self.db.insert_ml_features(
+                trade_id=trade_id,
+                features=json.dumps(feats),
+            )
+        except Exception:
+            log.exception("ml_feature_snapshot_failed", symbol=sig.symbol)
+
+    def _log_stock_trade_exit(self, t: dict) -> None:
+        """Emit exit + review decisions for a closed stock trade."""
+        from ai_trade.strategy.exit_planner import score_stop_quality
+
+        symbol = t.get("symbol", "")
+        strategy = t.get("strategy", "")
+        pnl = t.get("pnl")
+        pnl_pct = t.get("pnl_pct")
+        exit_price = t.get("exit_price")
+        entry_price = t.get("entry_price")
+        stop = t.get("stop_loss")
+        target = t.get("take_profit")
+        high_since = t.get("high_since_entry")
+        low_since = t.get("low_since_entry")
+
+        exit_reason = "unknown"
+        if exit_price is not None and entry_price is not None:
+            if stop is not None and abs(exit_price - stop) / max(stop, 0.01) < 0.01:
+                exit_reason = "stop_loss"
+            elif target is not None and abs(exit_price - target) / max(target, 0.01) < 0.01:
+                exit_reason = "take_profit"
+            elif pnl is not None:
+                exit_reason = "win" if pnl > 0 else "loss"
+
+        stop_quality = "not_hit"
+        if entry_price and stop:
+            try:
+                stop_quality = score_stop_quality(
+                    exit_reason=exit_reason,
+                    entry_price=float(entry_price),
+                    stop_price=float(stop),
+                    max_favorable_price=float(high_since) if high_since else None,
+                    max_adverse_price=float(low_since) if low_since else None,
+                    direction="long",
+                    stop_method=t.get("stop_method"),
+                    target_price=float(target) if target else None,
+                )
+            except Exception:
+                stop_quality = "not_hit"
+            if stop_quality != "not_hit":
+                try:
+                    self.db.update_trade(t.get("trade_id"), stop_quality=stop_quality)
+                except Exception:
+                    pass
+
+        try:
+            if exit_price is not None and entry_price is not None and pnl is not None:
+                notify_trade_exit(
+                    symbol=symbol,
+                    strategy=strategy,
+                    exit_reason=exit_reason,
+                    entry_price=float(entry_price),
+                    exit_price=float(exit_price),
+                    shares=int(t.get("shares") or 0),
+                    pnl=float(pnl),
+                    pnl_pct=float(pnl_pct) / 100.0 if pnl_pct is not None else 0.0,
+                    hold_type=str(t.get("hold_type") or ""),
+                    conviction=float(t.get("conviction")) if t.get("conviction") is not None else None,
+                    stop_quality=stop_quality if stop_quality != "not_hit" else None,
+                    high_since_entry=float(high_since) if high_since else None,
+                    take_profit=float(target) if target else None,
+                )
+        except Exception as e:
+            log.debug("exit_email_failed", symbol=symbol, error=str(e))
+
+        pnl_str = f"${pnl:+.2f} ({pnl_pct:+.2f}%)" if pnl is not None and pnl_pct is not None else "pnl=unknown"
+        self.decisions.log_exit(
+            symbol, strategy,
+            reasoning=f"closed via {exit_reason}: entry=${entry_price} exit=${exit_price} {pnl_str}",
+            factors={
+                "trade_id": t.get("trade_id"),
+                "entry_price": entry_price,
+                "exit_price": exit_price,
+                "shares": t.get("shares"),
+                "pnl": pnl,
+                "pnl_pct": pnl_pct,
+                "exit_reason": exit_reason,
+                "hold_type": t.get("hold_type"),
+                "stop_quality": stop_quality,
+                "max_favorable": high_since,
+                "max_adverse": low_since,
+            },
+        )
+
+        if pnl is not None:
+            outcome = "win" if pnl > 0 else ("loss" if pnl < 0 else "flat")
+            try:
+                analysis = analyze_closed_trade_and_persist(
+                    database=self.db,
+                    trade=t,
+                    market_context=self._market_context,
+                )
+            except Exception:
+                log.exception("post_trade_analysis_failed", trade_id=t.get("trade_id"))
+                analysis = None
+
+            lesson = (
+                analysis.get("lesson")
+                if analysis and analysis.get("lesson")
+                else self._review_trade_lesson(t, exit_reason, outcome)
+            )
+            review_factors = {
+                "outcome": outcome,
+                "pnl": pnl,
+                "pnl_pct": pnl_pct,
+                "exit_reason": exit_reason,
+            }
+            if analysis:
+                review_factors.update({
+                    "entry_quality": analysis.get("entry_quality"),
+                    "stop_quality": analysis.get("stop_quality"),
+                    "exit_quality": analysis.get("exit_quality"),
+                    "regime_at_entry": analysis.get("market_regime"),
+                    "regime_at_exit": analysis.get("regime_at_exit"),
+                })
+            self.decisions.log_review(
+                symbol, strategy,
+                reasoning=lesson,
+                factors=review_factors,
+            )
+
+    def _review_trade_lesson(self, t: dict, exit_reason: str, outcome: str) -> str:
+        """Derive a short post-trade insight for the review log entry."""
+        pnl_pct = t.get("pnl_pct") or 0
+        if outcome == "win" and exit_reason == "take_profit":
+            return f"take-profit hit cleanly (+{pnl_pct:.2f}%); target sizing worked"
+        if outcome == "win":
+            return f"winner +{pnl_pct:.2f}% via {exit_reason}; exit happened before target"
+        if outcome == "loss" and exit_reason == "stop_loss":
+            return f"stop-loss hit ({pnl_pct:+.2f}%); check if entry was late or stop too tight"
+        if outcome == "loss":
+            return f"loser {pnl_pct:+.2f}% via {exit_reason}; bailed before stop — review exit logic"
+        return f"flat close via {exit_reason}"
 
     # ══════════════════════════════════════════════════════════
     # Core Logic: Stock evaluation pipeline
@@ -740,11 +1429,13 @@ class TradingBot:
                 seen[sym] = c
         self._candidates = list(seen.values())
 
-        return {
+        counts = {
             "momentum": len(momentum_candidates),
             "mean_reversion": len(mr_candidates),
             "vwap": len(vwap_candidates),
         }
+        self._scan_counts = counts
+        return counts
 
     def _run_evaluation_cycle(self) -> None:
         """Run both stock and options evaluation pipelines."""
@@ -821,7 +1512,6 @@ class TradingBot:
                 log.warning("trading_halted", reason=reason)
                 return
 
-            # Fetch 60 days of daily bars for all candidates at once
             # Filter out symbols that have repeatedly failed orders (halted, untradable, etc.)
             symbols = [c["symbol"] for c in self._candidates if c["symbol"] not in self._failed_symbols]
             if len(self._failed_symbols) > 0:
@@ -829,51 +1519,105 @@ class TradingBot:
             end = datetime.now(ET)
             start = end - timedelta(days=60)
 
-            daily_bars = fetch_bars_multi(symbols, TimeFrame.Day, start, end)
+            # V2 Phase 13: Parallel data fetching — daily bars, intraday bars, and
+            # news are independent data sources. Fetch them concurrently to cut the
+            # data-fetch phase wall-clock time by ~2-3x.
+            self._cycle_timer.reset()
+
+            daily_bars: dict[str, pd.DataFrame] = {}
+            intraday_bars: dict[str, pd.DataFrame] = {}
+            news_sentiment: dict = {}
+
+            with self._cycle_timer.phase("fetch"):
+                intraday_start = end - timedelta(hours=2)
+
+                def _fetch_daily():
+                    return fetch_bars_multi(symbols, TimeFrame.Day, start, end)
+
+                def _fetch_intraday():
+                    return fetch_bars_multi(symbols, TimeFrame.Minute, intraday_start, end)
+
+                def _fetch_news():
+                    return self.news_scanner.scan_symbols(symbols)
+
+                with ThreadPoolExecutor(max_workers=3, thread_name_prefix="fetch") as pool:
+                    fut_daily = pool.submit(_fetch_daily)
+                    fut_intraday = pool.submit(_fetch_intraday)
+                    fut_news = pool.submit(_fetch_news)
+
+                    # Collect results — each task is independent, so partial failures
+                    # don't block the others.
+                    try:
+                        daily_bars = fut_daily.result(timeout=30)
+                    except Exception as e:
+                        log.warning("daily_bars_fetch_failed", error=str(e))
+                        daily_bars = {s: pd.DataFrame() for s in symbols}
+
+                    try:
+                        intraday_bars = fut_intraday.result(timeout=30)
+                    except Exception as e:
+                        log.warning("intraday_bars_fetch_failed", error=str(e))
+
+                    try:
+                        news_sentiment = fut_news.result(timeout=30)
+                    except Exception as e:
+                        log.warning("news_scan_failed", error=str(e))
 
             # Log data availability for debugging
             bars_empty = [s for s, df in daily_bars.items() if df.empty]
             bars_ok = [s for s, df in daily_bars.items() if not df.empty]
             log.info("bars_fetched", symbols_with_data=len(bars_ok), symbols_empty=len(bars_empty),
                       empty_symbols=bars_empty[:10] if bars_empty else [])
+            intraday_ok = [s for s, df in intraday_bars.items() if not df.empty]
+            if intraday_ok:
+                log.info("intraday_bars_fetched", symbols_with_data=len(intraday_ok))
 
             # Add technical indicators to all DataFrames.
             # Need at least 21 bars for Bollinger Bands (20-period window + 1).
-            insufficient = []
-            for sym, df in list(daily_bars.items()):
-                if df.empty:
-                    continue
-                if len(df) < _MIN_BARS:
-                    insufficient.append(f"{sym}({len(df)})")
-                    daily_bars[sym] = pd.DataFrame()  # Mark as empty so strategies skip
-                    continue
-                try:
-                    add_all(df, intraday=False)
-                except Exception as e:
-                    log.warning("indicator_failed", symbol=sym, rows=len(df), error=str(e))
-                    daily_bars[sym] = pd.DataFrame()
-            if insufficient:
-                log.info("bars_insufficient", symbols=insufficient)
+            with self._cycle_timer.phase("indicators"):
+                insufficient = []
+                for sym, df in list(daily_bars.items()):
+                    if df.empty:
+                        continue
+                    if len(df) < _MIN_BARS:
+                        insufficient.append(f"{sym}({len(df)})")
+                        daily_bars[sym] = pd.DataFrame()  # Mark as empty so strategies skip
+                        continue
+                    try:
+                        add_all(df, intraday=False)
+                    except Exception as e:
+                        log.warning("indicator_failed", symbol=sym, rows=len(df), error=str(e))
+                        daily_bars[sym] = pd.DataFrame()
+                if insufficient:
+                    log.info("bars_insufficient", symbols=insufficient)
 
-            # Fetch 2 hours of minute bars for the VWAP strategy
-            intraday_bars: dict[str, pd.DataFrame] = {}
-            try:
-                intraday_start = end - timedelta(hours=2)
-                intraday_bars = fetch_bars_multi(symbols, TimeFrame.Minute, intraday_start, end)
-                intraday_ok = [s for s, df in intraday_bars.items() if not df.empty]
-                log.info("intraday_bars_fetched", symbols_with_data=len(intraday_ok))
-            except Exception as e:
-                log.warning("intraday_bars_failed", error=str(e))
-
-            # Scan news sentiment for all candidates
-            news_sentiment = {}
-            try:
-                news_sentiment = self.news_scanner.scan_symbols(symbols)
+            # Log news catalysts and earnings proximity
+            if news_sentiment:
                 catalysts = [s for s, ns in news_sentiment.items() if ns.catalyst_detected]
                 if catalysts:
                     log.info("news_catalysts_detected", symbols=catalysts)
+                earnings_flagged = [
+                    s for s, ns in news_sentiment.items()
+                    if ns.earnings_status != "clear"
+                ]
+                if earnings_flagged:
+                    log.info("earnings_proximity_detected", symbols=earnings_flagged)
+
+            # V2 Phase 11: Economic calendar awareness
+            econ_events = []
+            econ_modifier = 1.0
+            try:
+                econ_events = get_events_for_date()
+                if econ_events:
+                    econ_modifier = conviction_modifier_for_events(econ_events)
+                    event_names = [e.name for e in econ_events]
+                    log.info(
+                        "economic_events_today",
+                        events=event_names,
+                        conviction_modifier=econ_modifier,
+                    )
             except Exception as e:
-                log.warning("news_scan_failed", error=str(e))
+                log.warning("economic_calendar_failed", error=str(e))
 
             # Build the set of symbols we already hold to prevent duplicates
             held_symbols = set()
@@ -893,14 +1637,16 @@ class TradingBot:
 
             # The "brain": collect signals from all strategies, rank them,
             # and build the execution queue
-            execution_queue = self.aggregator.collect_and_rank(
-                candidates=symbols,
-                daily_bars_dict=daily_bars,
-                intraday_bars_dict=intraday_bars,
-                account_equity=equity,
-                available_cash=cash,
-                held_symbols=held_symbols,
-            )
+            self.aggregator.set_market_context(self._market_context)
+            with self._cycle_timer.phase("evaluate"):
+                execution_queue = self.aggregator.collect_and_rank(
+                    candidates=symbols,
+                    daily_bars_dict=daily_bars,
+                    intraday_bars_dict=intraday_bars,
+                    account_equity=equity,
+                    available_cash=cash,
+                    held_symbols=held_symbols,
+                )
 
             if not execution_queue:
                 log.info("no_stock_signals_passed_filters",
@@ -908,6 +1654,8 @@ class TradingBot:
                           bars_with_data=len(bars_ok),
                           pdt_remaining=self.pdt.day_trades_remaining())
                 print(con.detail(f"No signals passed filters ({len(symbols)} candidates, {self.pdt.day_trades_remaining()} PDT slots left)."))
+                self._print_cycle_summary([], equity, cash, len(open_positions), ctx)
+                self.decisions.flush()
                 return
 
             log.info(
@@ -916,8 +1664,22 @@ class TradingBot:
                 symbols=[item["signal"].symbol for item in execution_queue],
                 strategies=[item["signal"].strategy_name for item in execution_queue],
             )
-            for item in execution_queue:
+
+            # V2: Log ranked signals
+            for rank, item in enumerate(execution_queue, 1):
                 s = item["signal"]
+                risk = s.entry_price - s.stop_loss_price
+                reward = s.take_profit_price - s.entry_price
+                rr = reward / risk if risk > 0 else 0
+                self.decisions.log_rank(
+                    s.symbol, s.strategy_name, s.conviction, rank,
+                    reasoning=f"entry=${s.entry_price:.2f} stop=${s.stop_loss_price:.2f} target=${s.take_profit_price:.2f} R:R=1:{rr:.1f}",
+                    factors={
+                        "entry": s.entry_price, "stop": s.stop_loss_price,
+                        "target": s.take_profit_price, "shares": item.get("shares", 0),
+                        "hold_type": s.hold_type.value, "rr_ratio": round(rr, 2),
+                    },
+                )
                 print(con.signal_line(
                     symbol=s.symbol, strategy=s.strategy_name,
                     conviction=s.conviction, hold_type=s.hold_type.value,
@@ -925,21 +1687,111 @@ class TradingBot:
                     target=s.take_profit_price,
                 ))
 
-            # Submit orders — apply sentiment modifiers before execution
-            for item in execution_queue:
-                self._submit_stock_signal(item, ctx, news_sentiment)
+            # V2 Phase 12: Compute momentum scores for queued symbols
+            momentum_scores = {}
+            try:
+                for item in execution_queue:
+                    sym = item["signal"].symbol
+                    if sym in daily_bars and sym not in momentum_scores:
+                        ms = compute_momentum_score(daily_bars[sym], sym)
+                        momentum_scores[sym] = ms
+            except Exception as e:
+                log.debug("momentum_scoring_failed", error=str(e))
+
+            # Submit orders — apply sentiment + momentum modifiers before execution
+            with self._cycle_timer.phase("execute"):
+                for item in execution_queue:
+                    self._submit_stock_signal(
+                        item, ctx, news_sentiment, econ_modifier, momentum_scores
+                    )
+
+            # V2: Rich cycle summary (regime, signals, near-misses, portfolio)
+            self._print_cycle_summary(
+                execution_queue, equity, cash, len(open_positions), ctx
+            )
+
+            # V2 Phase 13: Log cycle timing summary
+            self._cycle_timer.log_summary()
+            timing_line = self._cycle_timer.summary_line()
+            if timing_line:
+                print(con.detail(f"Cycle timing: {timing_line}"))
+
+            # V2: Flush all buffered decisions to DB
+            self.decisions.flush()
 
         except Exception as e:
             log.error("stock_evaluate_failed", error=str(e), error_type=type(e).__name__)
-
             log.debug("stock_evaluate_traceback", tb=traceback.format_exc())
+            self._cycle_timer.log_summary()  # Log timing even on error
+            self.decisions.flush()  # Flush even on error
 
-    def _submit_stock_signal(self, item: dict, ctx, news_sentiment: dict) -> None:
+    def _print_cycle_summary(
+        self, execution_queue: list[dict], equity: float, cash: float,
+        open_positions: int, ctx,
+    ) -> None:
+        """V2: Print rich cycle summary with regime, signals, near-misses."""
+        try:
+            signals_data: list[dict] = []
+            for item in execution_queue:
+                s = item["signal"]
+                signals_data.append({
+                    "symbol": s.symbol,
+                    "strategy": s.strategy_name,
+                    "conviction": s.conviction,
+                    "entry": s.entry_price,
+                    "stop": s.stop_loss_price,
+                    "target": s.take_profit_price,
+                    "hold_type": s.hold_type.value,
+                    "shares": item.get("shares", 0),
+                    "action": "QUEUED",
+                })
+
+            near_misses = self.aggregator.get_near_misses() if self.aggregator else []
+
+            # Portfolio heat = total risk / equity
+            heat_pct = 0.0
+            try:
+                open_trades = self.db.get_open_trades()
+                total_risk = sum(
+                    abs(t.get("entry_price", 0) - t.get("stop_loss_price", 0)) * t.get("shares", 0)
+                    for t in open_trades
+                )
+                heat_pct = (total_risk / equity * 100) if equity > 0 else 0.0
+            except Exception:
+                pass
+
+            vix = getattr(ctx, "vix", 0.0) if ctx else 0.0
+            regime = ctx.regime.value if ctx else "unknown"
+            pdt_used = 3 - self.pdt.day_trades_remaining()
+
+            summary = con.cycle_summary(
+                regime=regime,
+                vix=vix,
+                pdt_used=pdt_used,
+                pdt_max=3,
+                candidates=len(self._candidates),
+                momentum=self._scan_counts.get("momentum", 0),
+                mean_rev=self._scan_counts.get("mean_reversion", 0),
+                vwap=self._scan_counts.get("vwap", 0),
+                signals=signals_data,
+                near_misses=near_misses,
+                equity=equity,
+                cash=cash,
+                open_positions=open_positions,
+                heat_pct=heat_pct,
+            )
+            print(summary)
+        except Exception as e:
+            log.debug("cycle_summary_failed", error=str(e))
+
+    def _submit_stock_signal(self, item: dict, ctx, news_sentiment: dict,
+                             econ_modifier: float = 1.0,
+                             momentum_scores: dict | None = None) -> None:
         """Apply sentiment modifiers and submit a single stock order.
 
         Extracted from _evaluate_and_trade() to keep the main loop readable.
-        Handles regime/news modifiers, conviction gating, dry-run mode,
-        and PDT tracking.
+        Handles regime/news modifiers, earnings guard, economic calendar,
+        momentum prediction, conviction gating, dry-run mode, and PDT tracking.
         """
         sig = item["signal"]
         shares = item["shares"]
@@ -950,11 +1802,31 @@ class TradingBot:
             sig.conviction = min(1.0, sig.conviction * ctx.conviction_modifier)
             shares = max(1, int(shares * ctx.position_size_modifier))
 
-        # Apply news sentiment modifier to conviction
+        # V2 Phase 11: Earnings proximity guard — block entries near earnings
         ns = news_sentiment.get(sig.symbol)
+        if ns and ns.earnings_status != "clear":
+            earnings_block = getattr(self.cfg.sentiment, "block_near_earnings", True)
+            if earnings_block:
+                reason = f"earnings {ns.earnings_status} — binary event risk"
+                log.info(
+                    "trade_blocked_by_earnings",
+                    symbol=sig.symbol,
+                    earnings_status=ns.earnings_status,
+                )
+                print(con.skip(f"{sig.symbol}: blocked — {reason}"))
+                self.db.update_signal_action(sig.symbol, sig.strategy_name, "blocked_earnings")
+                self.decisions.log_reject(
+                    sig.symbol, sig.strategy_name, reason,
+                    conviction=sig.conviction,
+                    factors={"earnings_status": ns.earnings_status},
+                )
+                return
+
+        # Apply news sentiment modifier to conviction
         if ns:
             sig.conviction = min(1.0, sig.conviction * ns.conviction_modifier)
-            if ns.net_score < -0.5 and not ns.catalyst_detected:
+            block_threshold = getattr(self.cfg.sentiment, "block_on_bearish_news", -0.5)
+            if ns.net_score < block_threshold and not ns.catalyst_detected:
                 log.info(
                     "trade_blocked_by_news",
                     symbol=sig.symbol,
@@ -963,7 +1835,25 @@ class TradingBot:
                 )
                 print(con.skip(f"{sig.symbol}: blocked by bearish news ({ns.net_score:+.2f}) — \"{ns.top_headline[:60]}\""))
                 self.db.update_signal_action(sig.symbol, sig.strategy_name, "blocked_bearish_news")
+                self.decisions.log_reject(
+                    sig.symbol, sig.strategy_name,
+                    f"blocked by bearish news (score={ns.net_score:+.2f}): {ns.top_headline[:60]}",
+                    conviction=sig.conviction,
+                    factors={"news_score": ns.net_score},
+                )
                 return
+
+        # V2 Phase 11: Economic calendar conviction reduction
+        if econ_modifier < 1.0:
+            sig.conviction = min(1.0, sig.conviction * econ_modifier)
+
+        # V2 Phase 12: Momentum prediction modifier
+        if momentum_scores:
+            ms = momentum_scores.get(sig.symbol)
+            if ms:
+                mm = momentum_conviction_modifier(ms)
+                if mm != 1.0:
+                    sig.conviction = min(1.0, sig.conviction * mm)
 
         # Final conviction gate after all modifiers
         min_post_mod = getattr(self.cfg.sentiment, "min_conviction_after_mods", 0.50)
@@ -976,6 +1866,12 @@ class TradingBot:
             )
             print(con.skip(f"{sig.symbol}: conviction too low after modifiers ({original_conviction:.2f} -> {sig.conviction:.2f})"))
             self.db.update_signal_action(sig.symbol, sig.strategy_name, "rejected_low_conviction")
+            self.decisions.log_reject(
+                sig.symbol, sig.strategy_name,
+                f"conviction too low after modifiers: {original_conviction:.2f} -> {sig.conviction:.2f} (min={min_post_mod})",
+                conviction=sig.conviction,
+                factors={"original_conviction": original_conviction, "min_required": min_post_mod},
+            )
             return
 
         # Email alert for high-conviction signals (>= 0.70)
@@ -1011,21 +1907,46 @@ class TradingBot:
 
         # Pre-check: skip if this symbol is already blacklisted
         if sig.symbol in self._failed_symbols:
+            self.decisions.log_reject(
+                sig.symbol, sig.strategy_name,
+                f"symbol blacklisted: {self._failed_symbols[sig.symbol]}",
+                conviction=sig.conviction,
+            )
             return
 
-        # Pre-check: verify PDT budget before submitting — Alpaca may classify
-        # even swing trades as day trades if the same symbol was closed today.
+        # Pre-check: verify PDT budget before submitting
         if self.pdt.would_be_day_trade(sig.hold_type) and not self.pdt.can_day_trade():
             log.info("order_skipped_pdt_exhausted", symbol=sig.symbol)
             print(con.skip(f"{sig.symbol}: PDT slots exhausted, skipping day trade."))
+            self.decisions.log_reject(
+                sig.symbol, sig.strategy_name,
+                f"PDT slots exhausted ({self.pdt.get_day_trades_used()}/{self.cfg.pdt.max_day_trades} used)",
+                conviction=sig.conviction,
+                factors={"hold_type": sig.hold_type.value, "pdt_used": self.pdt.get_day_trades_used()},
+            )
             return
 
         # Submit the bracket order to Alpaca
         order_id = self.orders.submit_bracket_order(sig, shares)
         if order_id:
             self.db.update_signal_action(sig.symbol, sig.strategy_name, "executed")
-            trade_type = sig.hold_type.value.upper()
             cost = shares * sig.entry_price
+            risk_amount = shares * abs(sig.entry_price - sig.stop_loss_price)
+            self.decisions.log_execute(
+                sig.symbol, sig.strategy_name, sig.conviction,
+                reasoning=f"{shares} shares @ ${sig.entry_price:.2f} = ${cost:.2f}, risk=${risk_amount:.2f}, order={order_id}",
+                factors={
+                    "shares": shares, "entry": sig.entry_price, "cost": cost,
+                    "risk_amount": risk_amount, "order_id": str(order_id),
+                    "hold_type": sig.hold_type.value,
+                    "stop": sig.stop_loss_price, "target": sig.take_profit_price,
+                },
+            )
+            # V2 Phase 5: snapshot the feature vector for ML training.
+            # We look up the newly inserted trade row by buy_order_id
+            # instead of changing submit_bracket_order's return type.
+            self._snapshot_features_for_trade(sig, order_id)
+            trade_type = sig.hold_type.value.upper()
             log.info(
                 "stock_order_submitted",
                 symbol=sig.symbol,
@@ -1295,6 +2216,21 @@ class TradingBot:
                         net_theta=signal.net_theta,
                         order_id=str(order_id),
                     )
+                    self.decisions.log_execute(
+                        signal.underlying, signal.strategy_name, signal.conviction,
+                        reasoning=f"options order {order_id}: {len(signal.legs)} legs, max_loss=${signal.max_loss:.2f}, max_profit=${signal.max_profit:.2f}, ROI={_options_roi(signal):.2f}",
+                        factors={
+                            "order_id": str(order_id),
+                            "legs": len(signal.legs),
+                            "max_loss": signal.max_loss,
+                            "max_profit": signal.max_profit,
+                            "expiration": signal.expiration,
+                            "strikes": signal.strikes,
+                            "net_delta": signal.net_delta,
+                            "net_theta": signal.net_theta,
+                            "roi": _options_roi(signal),
+                        },
+                    )
                     # Deduct from budget and increment position count
                     options_budget -= signal.max_loss
                     positions_filled += 1
@@ -1347,6 +2283,22 @@ class TradingBot:
                     log.debug("options_strategy_error", strategy=strat_name,
                               symbol=symbol, error=str(e))
                     continue
+
+                # Drain rejections (whether signal was produced or not)
+                for r in strategy.drain_rejections():
+                    self.decisions.log_evaluate(
+                        symbol=r.symbol,
+                        strategy=r.strategy,
+                        action="near_miss" if r.is_near_miss else "reject",
+                        reasoning=r.to_reasoning(),
+                        factors={
+                            "filter": r.filter_name,
+                            "actual": r.actual,
+                            "threshold": r.threshold,
+                            "direction": r.direction,
+                            "miss_pct": r.miss_pct,
+                        },
+                    )
 
                 if signal is not None:
                     signals.append(signal)
