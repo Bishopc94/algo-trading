@@ -50,9 +50,16 @@ class ORBStrategy(BaseStrategy):
         min_range_pct: float = getattr(self.config, "min_range_pct", 0.2) / 100.0
 
         df = intraday_bars.copy()
-        add_atr(df, period=14)
 
         if len(df) < opening_minutes + 1:
+            return None
+
+        # ATR needs at least 14 bars — use daily ATR as fallback
+        if len(df) >= 14:
+            add_atr(df, period=14)
+        elif not daily_bars.empty and "atr_14" in daily_bars.columns:
+            df["atr_14"] = daily_bars["atr_14"].iloc[-1]
+        else:
             return None
 
         # Define opening range

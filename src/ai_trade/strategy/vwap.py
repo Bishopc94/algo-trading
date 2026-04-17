@@ -41,10 +41,17 @@ class VWAPStrategy(BaseStrategy):
 
         df = intraday_bars.copy()
         add_vwap(df)
-        add_atr(df, period=14)
 
         lookback: int = 10
         if len(df) < lookback + 1:
+            return None
+
+        # ATR needs at least 14 bars — use daily ATR as fallback
+        if len(df) >= 14:
+            add_atr(df, period=14)
+        elif not daily_bars.empty and "atr_14" in daily_bars.columns:
+            df["atr_14"] = daily_bars["atr_14"].iloc[-1]
+        else:
             return None
 
         latest = df.iloc[-1]
