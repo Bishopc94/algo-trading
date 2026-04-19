@@ -121,6 +121,7 @@ from ai_trade.backtest.options_pricing import (
     price_option_at_expiration, # Intrinsic value at expiration
 )
 from ai_trade.data.indicators import add_all  # Adds technical indicators (RSI, Bollinger, ATR, etc.)
+from ai_trade.ml.features import extract_features
 from ai_trade.monitoring.logger import get_logger
 from ai_trade.sentiment.market_regime import MarketRegimeAnalyzer, MarketContext
 from ai_trade.strategy.base import BaseStrategy, HoldType, Signal
@@ -332,6 +333,13 @@ class BacktestEngine:
         self._pending_stock_orders: list[tuple] = []          # (Signal, shares) queued for next-bar fill
         self._vol_cache: dict[str, float] = {}                # Per-symbol-per-day volatility cache
 
+        # ---- ML feature capture (for training from backtest data) ----
+        # Features are captured at entry and paired with PnL at close.
+        # Key: "symbol:entry_date" → feature dict from extract_features()
+        self._ml_feature_store: dict[str, dict] = {}
+        # Accumulated (features, outcome) pairs for ML training
+        self._ml_training_data: list[dict] = []
+
     # ── Public API ──────────────────────────────────────────
 
     def run(
@@ -473,6 +481,7 @@ class BacktestEngine:
             snapshots=self._snapshots,
             positions=[],  # All positions have been closed
             config=self.cfg,
+            ml_training_data=self._ml_training_data,
         )
         total = len(self._trades) + len(self._options_trades)
         log.info("backtest_complete", total_trades=total,
@@ -495,6 +504,8 @@ class BacktestEngine:
         self._vol_cache: dict[str, float] = {}    # Per-symbol-per-day volatility cache
         self._pending_stock_orders = []            # Queued signals for next-bar fill
         self._open_symbols: set[str] = set()  # Fast O(1) lookup for "do we hold this symbol?"
+        self._ml_feature_store = {}
+        self._ml_training_data = []
 
     def _equity(self, date_str: str, bars_dict: dict[str, pd.DataFrame]) -> float:
         """Current total portfolio equity = cash + stock market value + options MTM.
@@ -936,6 +947,17 @@ class BacktestEngine:
                     strategy_name=sig.strategy_name,
                 )
             )
+
+            # ── ML feature capture at entry ──
+            # Use the same extract_features() as live trading so the
+            # model trains on identical feature representations.
+            try:
+                entry_dt = datetime.strptime(date_str, "%Y-%m-%d")
+                feats = extract_features(sig, self._market_context, now=entry_dt)
+                self._ml_feature_store[f"{sig.symbol}:{date_str}"] = feats
+            except Exception:
+                pass  # Non-critical — don't break backtest for ML capture
+
             log.debug(
                 "backtest_entry",
                 symbol=sig.symbol,
@@ -1135,6 +1157,22 @@ class BacktestEngine:
             exit_reason=reason,
         )
         self._trades.append(trade)
+
+        # ── ML: pair entry features with trade outcome ──
+        feat_key = f"{pos.symbol}:{pos.entry_date}"
+        features = self._ml_feature_store.pop(feat_key, None)
+        if features is not None:
+            self._ml_training_data.append({
+                "features": features,
+                "pnl": trade.pnl,
+                "pnl_pct": trade.pnl_pct,
+                "symbol": pos.symbol,
+                "strategy": pos.strategy_name,
+                "hold_type": pos.hold_type.value,
+                "entry_date": pos.entry_date,
+                "exit_date": date_str,
+                "exit_reason": reason,
+            })
 
         log.debug(
             "backtest_exit",
@@ -1651,12 +1689,14 @@ class BacktestResults:
         snapshots: list[DailySnapshot],
         positions: list[BacktestPosition],
         config: BacktestConfig,
+        ml_training_data: list[dict] | None = None,
     ):
         self.trades = trades
         self.options_trades = options_trades
         self.snapshots = snapshots
         self.positions = positions
         self.config = config
+        self.ml_training_data = ml_training_data or []
 
     @property
     def all_pnls(self) -> list[float]:

@@ -93,6 +93,35 @@ DEFAULT_UNIVERSE = [
 ]
 
 
+def _load_full_universe(cfg) -> list[str]:
+    """Pull all tradeable US equities from Alpaca and filter for liquidity.
+
+    Returns symbols that are active, tradable, and on major exchanges.
+    This gives hundreds of symbols for broad ML training data generation.
+    """
+    from alpaca.trading.client import TradingClient
+    from alpaca.trading.requests import GetAssetsRequest
+    from alpaca.trading.enums import AssetClass, AssetStatus
+
+    init_clients(cfg)
+    from ai_trade.clients import get_trading_client
+
+    valid_exchanges = {"NYSE", "NASDAQ", "ARCA", "AMEX", "BATS"}
+    request = GetAssetsRequest(
+        asset_class=AssetClass.US_EQUITY,
+        status=AssetStatus.ACTIVE,
+    )
+    assets = get_trading_client().get_all_assets(filter=request)
+    symbols = [
+        a.symbol for a in assets
+        if a.tradable and a.exchange in valid_exchanges
+        and not a.symbol.isdigit()       # skip weird numeric tickers
+        and "." not in a.symbol          # skip preferred shares (BRK.B etc)
+        and len(a.symbol) <= 5           # skip long tickers (warrants, units)
+    ]
+    return sorted(symbols)
+
+
 def _build_options_strategies(cfg):
     """Build options strategy instances from the application config.
 
@@ -167,6 +196,8 @@ def run_backtest(
     show_trades: bool = False,
     export_csv: str | None = None,
     include_options: bool = False,
+    train_ml: bool = False,
+    capital_override: float | None = None,
 ) -> None:
     """Fetch data, configure strategies, and run the backtest.
 
@@ -213,14 +244,16 @@ def run_backtest(
     start_dt = datetime.strptime(start, "%Y-%m-%d").replace(tzinfo=ET)
     end_dt = datetime.strptime(end, "%Y-%m-%d").replace(tzinfo=ET)
 
-    # fetch_bars_multi returns a dict of {symbol: DataFrame} with OHLCV data.
-    # A DataFrame is a pandas table -- think of it as a spreadsheet with typed
-    # columns (open, high, low, close, volume) indexed by date.
-    bars_dict = fetch_bars_multi(symbols, TimeFrame.Day, start_dt, end_dt)
+    # Fetch in batches of 200 to avoid overwhelming the API for large universes.
+    BATCH_SIZE = 200
+    bars_dict: dict[str, any] = {}
+    for i in range(0, len(symbols), BATCH_SIZE):
+        batch = symbols[i : i + BATCH_SIZE]
+        if len(symbols) > BATCH_SIZE:
+            print(f"  Fetching batch {i // BATCH_SIZE + 1}/{(len(symbols) + BATCH_SIZE - 1) // BATCH_SIZE} ({len(batch)} symbols)...")
+        batch_bars = fetch_bars_multi(batch, TimeFrame.Day, start_dt, end_dt)
+        bars_dict.update(batch_bars)
 
-    # Dict comprehension: filter out symbols where the API returned no data.
-    # Syntax: {key: value for key, value in iterable if condition}
-    # This is equivalent to a for-loop that builds a new dict, but more concise.
     loaded = {sym: df for sym, df in bars_dict.items() if not df.empty}
     print(f"  Loaded data for {len(loaded)}/{len(symbols)} symbols")
 
@@ -273,16 +306,27 @@ def run_backtest(
     # ---------- Build BacktestConfig from settings ----------
     # BacktestConfig is a dataclass that holds all risk management and position
     # sizing parameters.  These come from settings.yaml but could be overridden.
+    effective_capital = capital_override or cfg.account.starting_capital
+
+    # When capital is overridden (e.g. for ML training), scale up position
+    # limits so capital constraints don't artificially suppress signal generation.
+    if capital_override and capital_override >= 25000:
+        max_positions = max(cfg.account.max_open_positions, 10)
+        heat_pct = max(getattr(cfg.risk, "max_portfolio_heat_pct", 0.06), 0.12)
+    else:
+        max_positions = cfg.account.max_open_positions
+        heat_pct = getattr(cfg.risk, "max_portfolio_heat_pct", 0.06)
+
     bt_config = BacktestConfig(
-        starting_capital=cfg.account.starting_capital,
-        max_position_pct=cfg.account.max_position_pct,          # Max % of equity in one position
-        max_risk_per_trade_pct=cfg.account.max_risk_per_trade_pct,  # Max % equity risked per trade
-        max_open_positions=cfg.account.max_open_positions,
-        daily_loss_limit_pct=cfg.account.daily_loss_limit_pct,   # Circuit breaker: stop trading if daily loss exceeds this
-        max_portfolio_heat_pct=getattr(cfg.risk, "max_portfolio_heat_pct", 0.06),  # Total risk across all positions
+        starting_capital=effective_capital,
+        max_position_pct=cfg.account.max_position_pct,
+        max_risk_per_trade_pct=cfg.account.max_risk_per_trade_pct,
+        max_open_positions=max_positions,
+        daily_loss_limit_pct=cfg.account.daily_loss_limit_pct,
+        max_portfolio_heat_pct=heat_pct,
         trailing_stop_pct=getattr(cfg.risk, "trailing_stop_pct", 0.02),
-        max_day_trades=cfg.pdt.max_day_trades,                   # PDT rule: max day trades in 5-day window
-        day_trade_reserve=cfg.pdt.day_trade_reserve,             # Reserve N slots for high-conviction trades
+        max_day_trades=cfg.pdt.max_day_trades,
+        day_trade_reserve=cfg.pdt.day_trade_reserve,
         min_conviction_for_day_trade=cfg.pdt.min_conviction_for_day_trade,
     )
 
@@ -397,6 +441,114 @@ def run_backtest(
             print(f"  Equity curve exported to {equity_path}")
         print()
 
+    # ---------- ML training from backtest data ----------
+    if train_ml:
+        _train_ml_from_backtest(results)
+
+
+def _train_ml_from_backtest(results) -> None:
+    """Write backtest ML training data into a database and train the model.
+
+    The backtest engine captures the same feature vectors as live trading
+    (via extract_features) at each entry, then pairs them with the actual
+    trade PnL at close.  This function:
+      1. Creates (or reuses) a backtest-specific SQLite database
+      2. Inserts each (features, outcome) pair as a trade + ml_features row
+      3. Calls the standard trainer to fit a GradientBoostingClassifier
+    """
+    import json
+    from ai_trade.monitoring.database import Database
+    from ai_trade.ml.trainer import train_signal_quality_model
+
+    ml_data = results.ml_training_data
+    if not ml_data:
+        print("\n  ML Training: No feature data captured during backtest.")
+        print("  (Strategies may not have generated any signals.)")
+        return
+
+    print(f"\n  ML Training: {len(ml_data)} labelled trade(s) from backtest")
+
+    # Use a dedicated backtest database so we don't pollute the live DB.
+    # Located next to the live db in the data/ directory.
+    db_path = Path(__file__).resolve().parents[3] / "data" / "backtest_ml.db"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    db = Database(str(db_path))
+
+    # Wipe prior backtest training data so we train on the fresh run only.
+    # This prevents stale data from prior backtest runs from accumulating.
+    with db._conn() as conn:
+        conn.execute("DELETE FROM ml_features WHERE trade_id IN (SELECT id FROM trades WHERE bot_version = 'backtest')")
+        conn.execute("DELETE FROM trades WHERE bot_version = 'backtest'")
+
+    # Insert each trade + its feature snapshot
+    inserted = 0
+    for row in ml_data:
+        trade_id = db.insert_trade(
+            symbol=row["symbol"],
+            strategy=row["strategy"],
+            side="buy",
+            shares=1,
+            entry_price=row["features"].get("entry_price", 0),
+            entry_time=row["entry_date"],
+            exit_price=0,
+            exit_time=row["exit_date"],
+            stop_loss=0,
+            take_profit=0,
+            hold_type=row["hold_type"],
+            pnl=row["pnl"],
+            pnl_pct=row["pnl_pct"],
+            status="closed",
+            bot_version="backtest",
+        )
+        db.insert_ml_features(
+            trade_id=trade_id,
+            features=json.dumps(row["features"]),
+        )
+        inserted += 1
+
+    print(f"  Inserted {inserted} labelled trades into {db_path.name}")
+
+    # Train the model
+    result = train_signal_quality_model(db, min_trades=30)
+    status = result.get("status", "unknown")
+
+    if status == "ok":
+        print(f"\n  Model trained successfully!")
+        print(f"    Version:          {result['version']}")
+        print(f"    Trades used:      {result['trades_used']}")
+        print(f"    Train accuracy:   {result['train_accuracy']:.1%}")
+        print(f"    Val accuracy:     {result['val_accuracy']:.1%}")
+        print(f"    Saved to:         {result['model_path']}")
+
+        # Register in the live database so the bot picks it up on next restart
+        live_db_path = Path(__file__).resolve().parents[3] / "data" / "ai_trade.db"
+        if live_db_path.exists():
+            live_db = Database(str(live_db_path))
+            try:
+                from ai_trade.ml.trainer import _deactivate_prior_versions, MODEL_NAME
+                _deactivate_prior_versions(live_db, MODEL_NAME)
+                live_db.insert_ml_model(
+                    model_name=MODEL_NAME,
+                    version=result["version"],
+                    trained_at=result.get("trained_at", ""),
+                    training_trades=result["trades_used"],
+                    backtest_accuracy=result["val_accuracy"],
+                    is_active=1,
+                    model_path=result["model_path"],
+                )
+                print(f"    Registered in live DB (active on next bot restart)")
+            except Exception as e:
+                print(f"    Warning: could not register in live DB: {e}")
+    elif status == "insufficient_data":
+        print(f"\n  Insufficient data for training: {result['trades_available']} trades")
+        print(f"  (Need at least {result['trades_required']})")
+        print("  Try a longer backtest period or more symbols.")
+    elif status == "single_class":
+        print(f"\n  All {result['trades_used']} trades had the same outcome (class={result['class']}).")
+        print("  Need both winning and losing trades to train.")
+    else:
+        print(f"\n  Training failed: {result}")
+
 
 def main():
     """CLI entry point: parse arguments and invoke run_backtest.
@@ -440,6 +592,14 @@ def main():
         "--default-universe", action="store_true",
         help=f"Use the built-in universe of {len(DEFAULT_UNIVERSE)} liquid stocks"
     )
+    parser.add_argument(
+        "--full-universe", action="store_true",
+        help="Pull all tradeable US equities from Alpaca for broad ML training"
+    )
+    parser.add_argument(
+        "--capital", type=float, default=None,
+        help="Override starting capital (default: from settings.yaml)"
+    )
 
     parser.add_argument(
         "--days", type=int, default=90,
@@ -471,28 +631,35 @@ def main():
         "--export", type=str, default=None,
         help="Export results to CSV (provide base filename)"
     )
+    parser.add_argument(
+        "--train-ml", action="store_true",
+        help="Train the ML signal-quality model from backtest trade data"
+    )
 
     # parse_args() reads from sys.argv (the command-line arguments passed to the script),
     # validates them against the definitions above, and returns a Namespace object.
     args = parser.parse_args()
 
-    # ---------- Resolve symbols (three mutually exclusive sources) ----------
+    # ---------- Resolve symbols ----------
     if args.symbols:
-        # List comprehension: [expression for item in iterable]
-        # .upper() normalizes to uppercase (e.g., "aapl" -> "AAPL")
         symbols = [s.upper() for s in args.symbols]
     elif args.symbols_file:
         path = Path(args.symbols_file)
         if not path.exists():
             print(f"  Error: file not found: {path}")
-            sys.exit(1)  # Exit with non-zero status code = error
-        # Read file, split into lines, strip whitespace, uppercase, skip blanks.
-        # This is a list comprehension with a filter condition (if line.strip()).
+            sys.exit(1)
         symbols = [line.strip().upper() for line in path.read_text().splitlines() if line.strip()]
+    elif args.full_universe:
+        setup_logging()
+        cfg = load_config(args.config)
+        init_clients(cfg)
+        print("  Loading full tradeable universe from Alpaca...")
+        symbols = _load_full_universe(cfg)
+        print(f"  Found {len(symbols)} tradeable symbols")
     elif args.default_universe:
         symbols = DEFAULT_UNIVERSE
     else:
-        print("  No symbols specified. Use --symbols, --symbols-file, or --default-universe.")
+        print("  No symbols specified. Use --symbols, --symbols-file, --default-universe, or --full-universe.")
         print("  Example: ai-trade-backtest --symbols AAPL MSFT TSLA --days 90")
         sys.exit(1)
 
@@ -519,6 +686,8 @@ def main():
         show_trades=args.show_trades,
         export_csv=args.export,
         include_options=args.options,
+        train_ml=args.train_ml,
+        capital_override=args.capital,
     )
 
 
