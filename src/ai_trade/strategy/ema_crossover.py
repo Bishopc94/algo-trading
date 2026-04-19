@@ -8,15 +8,15 @@ Theory:
 
 Entry conditions (ALL must be true):
   1. EMA-9 > EMA-20 (bullish crossover)
-  2. Previous bar: EMA-9 <= EMA-20 (crossover is fresh, single-bar)
+  2. Crossover happened within last 2 bars (fresh, not stale — relaxed)
   3. EMA-20 > EMA-50 (established uptrend structure)
   4. Close > EMA-50 (confirmed above medium-term trend)
-  5. 50 < RSI < 70 (positive momentum, not overbought)
+  5. 45 < RSI < 75 (positive momentum — widened range)
   6. MACD histogram > 0 (momentum aligned)
-  7. Relative volume >= 1.2x (participation confirms move)
-  8. Bullish candle close (close > open, buyers in control)
+  7. Bullish candle close (close > open, buyers in control)
 
 Conviction: additive across trend, RSI, MACD, volume, candle factors.
+Volume confirmation is a conviction factor, not a hard gate.
 
 Exit: EMA-9 < EMA-20 (crossover reversed) OR RSI > 75 (overbought).
 Hold type: SWING.
@@ -83,29 +83,49 @@ class EMACrossoverStrategy(BaseStrategy):
 
         # ── Hard filters ──
         if fast_ema <= slow_ema:
+            self._reject(symbol, "fast_above_slow_ema", fast_ema, slow_ema, "above")
             return None
-        if prev_fast > prev_slow:
-            return None  # Not a fresh crossover
+
+        # Allow crossover within last 2 bars (not just fresh single-bar)
+        if len(df) >= 4:
+            prev2 = df.iloc[-3]
+            prev2_fast: float = prev2[fast_col]
+            prev2_slow: float = prev2[slow_col]
+            crossover_recent = (prev_fast <= prev_slow) or (prev2_fast <= prev2_slow)
+        else:
+            crossover_recent = prev_fast <= prev_slow
+
+        if not crossover_recent:
+            self._reject(symbol, "crossover_recent", 0.0, 1.0, "above")
+            return None
+
         if slow_ema <= trend_ema:
-            return None  # No established uptrend structure
-        if close <= trend_ema:
+            self._reject(symbol, "slow_above_trend_ema", slow_ema, trend_ema, "above")
             return None
-        if rsi_val <= rsi_min or rsi_val >= rsi_max:
+        if close <= trend_ema:
+            self._reject(symbol, "close_above_trend_ema", close, trend_ema, "above")
+            return None
+        if rsi_val <= rsi_min:
+            self._reject(symbol, "rsi_min", rsi_val, rsi_min, "above")
+            return None
+        if rsi_val >= rsi_max:
+            self._reject(symbol, "rsi_max", rsi_val, rsi_max, "below")
             return None
         if macd_hist <= 0:
-            return None  # Momentum not aligned
-        if rel_vol < 1.2:
+            self._reject(symbol, "macd_hist_positive", macd_hist, 0.0, "above")
             return None
         if close <= open_price:
-            return None  # Bearish candle, buyers not in control
-
-        # Meaningful EMA gap (not a noise crossover)
-        ema_gap_pct = (fast_ema - slow_ema) / close
-        if ema_gap_pct < 0.002:
+            self._reject(symbol, "bullish_candle", close, open_price, "above")
             return None
 
-        # ── Conviction scoring (additive, 0.55–0.90) ──
-        conviction = 0.55
+        # Meaningful EMA gap (not a noise crossover — relaxed from 0.2% to 0.1%)
+        ema_gap_pct = (fast_ema - slow_ema) / close
+        if ema_gap_pct < 0.001:
+            self._reject(symbol, "ema_gap_pct", ema_gap_pct, 0.001, "above")
+            return None
+
+        # ── Conviction scoring (additive, 0.50–0.90) ──
+        conviction = 0.50
 
         # +0.10: Trend strength (EMA-20/EMA-50 gap)
         trend_gap = (slow_ema - trend_ema) / trend_ema
@@ -119,8 +139,10 @@ class EMACrossoverStrategy(BaseStrategy):
         # +0.08: RSI in sweet spot
         if 55 <= rsi_val <= 65:
             conviction += 0.08
-        elif 50 < rsi_val < 55 or 65 < rsi_val < 68:
-            conviction += 0.04
+        elif 50 <= rsi_val < 55 or 65 < rsi_val < 70:
+            conviction += 0.05
+        elif 45 < rsi_val < 50:
+            conviction += 0.02
 
         # +0.07: MACD accelerating
         prev_macd_hist = float(prev["macd_hist"])
@@ -129,24 +151,38 @@ class EMACrossoverStrategy(BaseStrategy):
         elif macd_hist > 0:
             conviction += 0.03
 
-        # +0.07: Volume strength
+        # +0.08: Volume strength (conviction factor, not hard gate)
         if rel_vol >= 2.0:
-            conviction += 0.07
+            conviction += 0.08
         elif rel_vol >= 1.5:
-            conviction += 0.04
+            conviction += 0.05
+        elif rel_vol >= 1.2:
+            conviction += 0.03
+        elif rel_vol >= 1.0:
+            conviction += 0.01
 
         # +0.05: EMA gap strength (wider = stronger signal)
         conviction += min(0.05, ema_gap_pct * 5.0)
 
-        conviction = max(0.55, min(0.90, conviction))
+        # +0.03: Crossover freshness bonus
+        if prev_fast <= prev_slow:
+            conviction += 0.03  # Bar 1 of crossover (freshest)
+
+        conviction = max(0.50, min(0.90, conviction))
 
         entry_price = close
-        stop_loss = entry_price - atr_stop_mult * atr
-        take_profit = entry_price + atr_tp_mult * atr
+        levels = self._plan_long_exit(
+            bars=df, entry_price=entry_price, atr=atr,
+            base_stop_mult=atr_stop_mult, base_tp_mult=atr_tp_mult,
+        )
+        stop_loss = levels.stop_loss
+        take_profit = levels.take_profit
 
         risk = entry_price - stop_loss
         reward = take_profit - entry_price
-        if risk <= 0 or reward / risk < 2.0:
+        rr = reward / risk if risk > 0 else 0.0
+        if risk <= 0 or rr < 2.0:
+            self._reject(symbol, "risk_reward", rr, 2.0, "above")
             return None
 
         logger.info(

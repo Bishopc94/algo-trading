@@ -69,6 +69,8 @@ class PositionSizer:
         signal: Signal,
         account_equity: float,
         available_cash: float,
+        risk_scale: float = 1.0,
+        max_position_pct_override: float | None = None,
     ) -> int:
         """Return the number of whole shares to buy (>= 0).
 
@@ -98,14 +100,30 @@ class PositionSizer:
         max_risk_pct: float = getattr(
             self.config, "max_risk_per_trade_pct", 0.02  # Default: risk 2% per trade
         )
-        max_position_pct: float = getattr(
+        base_max_position_pct: float = getattr(
             self.config, "max_position_pct", 0.30  # Default: max 30% in one stock
         )
+        # V2 Phase 7: DynamicRiskController can widen the concentration
+        # cap for high-conviction signals (up to 50%).  When no override
+        # is supplied, stick with the config default.
+        max_position_pct: float = (
+            max_position_pct_override
+            if max_position_pct_override is not None
+            else base_max_position_pct
+        )
+
+        # V2 Phase 7: the dynamic risk controller can scale the per-trade
+        # risk budget up (high conviction, winning streak, strong bull) or
+        # down (losing streak, bear regime, drawdown tier 1).  Clamp to
+        # [0, 3x] so a bug in the upstream blender can't blow up risk.
+        effective_risk_scale = max(0.0, min(3.0, float(risk_scale)))
 
         # ── Step 1: Dollar risk budget ──────────────────────────
         # This is the maximum dollar amount we're willing to lose on this
         # single trade.  For a $10,000 account at 2%, that's $200.
-        risk_amount = account_equity * max_risk_pct
+        risk_amount = account_equity * max_risk_pct * effective_risk_scale
+        if risk_amount <= 0:
+            return 0
 
         # ── Step 2: Per-share risk ──────────────────────────────
         # The distance between entry price and stop-loss price.  If we buy
@@ -166,6 +184,8 @@ class PositionSizer:
             risk_amount=risk_amount,
             risk_per_share=risk_per_share,
             dollar_value=shares * signal.entry_price,
+            risk_scale=effective_risk_scale,
+            max_position_pct=max_position_pct,
         )
 
         return shares

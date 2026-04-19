@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import pandas as pd
 
-from ai_trade.data.indicators import add_vwap
+from ai_trade.data.indicators import add_atr, add_vwap
 from ai_trade.monitoring.logger import get_logger
 from ai_trade.strategy.base import BaseStrategy, HoldType, Signal
 
@@ -46,6 +46,14 @@ class VWAPStrategy(BaseStrategy):
         if len(df) < lookback + 1:
             return None
 
+        # ATR needs at least 14 bars — use daily ATR as fallback
+        if len(df) >= 14:
+            add_atr(df, period=14)
+        elif not daily_bars.empty and "atr_14" in daily_bars.columns:
+            df["atr_14"] = daily_bars["atr_14"].iloc[-1]
+        else:
+            return None
+
         latest = df.iloc[-1]
         close: float = latest["close"]
         open_price: float = latest["open"]
@@ -59,39 +67,62 @@ class VWAPStrategy(BaseStrategy):
         recent = df.iloc[-lookback:]
         dip_bars = recent[recent["close"] < recent["vwap_calc"]]
         if dip_bars.empty:
+            self._reject(symbol, "dip_below_vwap", 0.0, 1.0, "above")
             return None
 
         # Meaningfully above VWAP (not noise)
-        if close <= vwap * 1.001:
+        vwap_floor = vwap * 1.001
+        if close <= vwap_floor:
+            self._reject(symbol, "close_above_vwap", close, vwap_floor, "above")
             return None
 
-        # Volume confirmation
-        if avg_bar_vol > 0 and bar_volume <= 1.5 * avg_bar_vol:
+        # Volume confirmation (relaxed: 1.2x instead of 1.5x hard gate)
+        vol_ratio = bar_volume / avg_bar_vol if avg_bar_vol > 0 else 1.0
+        if vol_ratio < 1.0:
+            self._reject(symbol, "vol_ratio_min", vol_ratio, 1.0, "above")
             return None
 
         # Bullish candle
         if close <= open_price:
+            self._reject(symbol, "bullish_candle", close, open_price, "above")
             return None
 
-        # Dip depth filter
+        # Dip depth filter (relaxed from 0.5% to 0.2%)
         dip_low_price = dip_bars["close"].min()
         dip_vwap = dip_bars.loc[dip_bars["close"].idxmin(), "vwap_calc"]
         dip_pct = abs((dip_low_price - dip_vwap) / dip_vwap) if dip_vwap else 0
-        if dip_pct < 0.005:
-            return None  # Shallow noise dip
+        if dip_pct < 0.002:
+            self._reject(symbol, "dip_depth_pct", dip_pct, 0.002, "above")
+            return None
 
-        # Conviction scoring
-        base_conviction = 0.55
-        dip_adj = min(0.20, dip_pct * 15)
-        vol_ratio = bar_volume / avg_bar_vol if avg_bar_vol > 0 else 1.0
-        vol_adj = min(0.15, (vol_ratio - 1.5) * 0.10)
+        # Conviction scoring (wider range)
+        base_conviction = 0.50
+        dip_adj = min(0.20, dip_pct * 20)  # More credit for deeper dips
 
-        conviction = base_conviction + dip_adj + vol_adj
-        conviction = max(0.55, min(0.90, conviction))
+        # Volume: conviction factor with wider scoring
+        if vol_ratio >= 2.0:
+            vol_adj = 0.15
+        elif vol_ratio >= 1.5:
+            vol_adj = 0.10
+        elif vol_ratio >= 1.2:
+            vol_adj = 0.05
+        else:
+            vol_adj = 0.01
+
+        # Reclaim strength: how far above VWAP
+        reclaim_pct = (close - vwap) / vwap
+        reclaim_adj = min(0.08, reclaim_pct * 10)
+
+        conviction = base_conviction + dip_adj + vol_adj + reclaim_adj
+        conviction = max(0.50, min(0.92, conviction))
 
         entry_price = close
         dip_low = dip_bars["low"].min()
         stop_loss = max(dip_low, vwap * 0.99)
+
+        atr_val = float(df["atr_14"].iloc[-1]) if "atr_14" in df.columns else 0.0
+        if not (atr_val > 0):
+            atr_val = max(entry_price * 0.01, 0.01)
 
         exit_dev: float = getattr(self.config, "exit_deviation_pct", 0.3) / 100
         tp_from_vwap = vwap * (1 + exit_dev)
@@ -100,7 +131,9 @@ class VWAPStrategy(BaseStrategy):
 
         risk = entry_price - stop_loss
         reward = take_profit - entry_price
-        if risk <= 0 or reward / risk < 1.5:
+        rr = reward / risk if risk > 0 else 0.0
+        if risk <= 0 or rr < 1.5:
+            self._reject(symbol, "risk_reward", rr, 1.5, "above")
             return None
 
         logger.info(
@@ -128,6 +161,9 @@ class VWAPStrategy(BaseStrategy):
                 "dip_pct": dip_pct,
                 "bar_volume": bar_volume,
                 "avg_bar_volume": avg_bar_vol,
+                "atr": atr_val,
+                "stop_method": "vwap_reclaim",
+                "target_method": "prior_high_or_vwap_target",
             },
         )
 

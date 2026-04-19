@@ -3,18 +3,18 @@
 Theory:
   Stocks that break out to new highs on heavy volume tend to continue.
   We require multi-indicator confluence: price breakout + volume spike +
-  trend alignment + momentum confirmation (MACD + RSI) + tight consolidation.
+  trend alignment + momentum confirmation (MACD + RSI).
+  Consolidation tightness is a conviction factor, not a hard gate.
 
 Entry conditions (ALL must be true):
   1. Close > 20-day high (fresh breakout)
-  2. Relative volume > 2.0x (institutional participation)
-  3. ADR% > 2.0 (enough range to be worth trading)
-  4. Close > EMA-20 > EMA-50 (stacked uptrend)
-  5. RSI 50-80 (positive momentum, not exhausted)
-  6. MACD histogram > 0 (momentum aligned)
-  7. Prior 5-bar range was tight (consolidation before breakout)
+  2. Relative volume > 1.5x (participation confirmation)
+  3. Close > EMA-20 > EMA-50 (stacked uptrend)
+  4. RSI 45-80 (positive momentum, not exhausted)
+  5. MACD histogram > 0 (momentum aligned)
 
-Conviction: additive across 5 factors (volume, trend, RSI, MACD, consolidation).
+Conviction: additive across 6 factors (volume, trend, RSI, MACD,
+  consolidation, ADR).
 
 Exit: bracket orders handle all exits.
 """
@@ -44,8 +44,7 @@ class MomentumStrategy(BaseStrategy):
         df = daily_bars.copy()
 
         breakout_lookback: int = getattr(self.config, "breakout_lookback", 20)
-        vol_spike: float = getattr(self.config, "volume_spike_multiplier", 2.0)
-        min_adr: float = getattr(self.config, "min_adr_pct", 2.0)
+        vol_spike: float = getattr(self.config, "volume_spike_multiplier", 1.5)
         atr_stop_mult: float = getattr(self.config, "atr_stop_multiplier", 1.5)
         atr_tp_mult: float = getattr(self.config, "atr_tp_multiplier", 3.5)
 
@@ -71,42 +70,51 @@ class MomentumStrategy(BaseStrategy):
         rsi_val: float = latest["rsi_14"]
         macd_hist: float = latest["macd_hist"]
 
-        # ── Hard filters ──
+        # ── Hard filters (relaxed — conviction handles degree of strength) ──
         if close <= high_20:
+            self._reject(symbol, "breakout", close, high_20, "above")
             return None
-        if rel_vol <= vol_spike:
-            return None
-        if adr_pct <= min_adr:
+        if rel_vol < vol_spike:
+            self._reject(symbol, "rel_volume", rel_vol, vol_spike, "above")
             return None
 
         # Stacked uptrend: close > EMA-20 > EMA-50
-        if close <= ema_20 or ema_20 <= ema_50:
+        if close <= ema_20:
+            self._reject(symbol, "close_above_ema20", close, ema_20, "above")
+            return None
+        if ema_20 <= ema_50:
+            self._reject(symbol, "ema20_above_ema50", ema_20, ema_50, "above")
             return None
 
-        # RSI in momentum range (not oversold, not exhausted)
-        if rsi_val <= 50 or rsi_val >= 80:
+        # RSI in momentum range (widened: allow earlier entries at 45+)
+        if rsi_val < 45:
+            self._reject(symbol, "rsi_min", rsi_val, 45.0, "above")
+            return None
+        if rsi_val >= 80:
+            self._reject(symbol, "rsi_max", rsi_val, 80.0, "below")
             return None
 
         # MACD histogram positive (momentum aligned)
         if macd_hist <= 0:
+            self._reject(symbol, "macd_hist_positive", macd_hist, 0.0, "above")
             return None
 
-        # Pre-breakout consolidation: 5-bar range was tight (< 1.5x ATR)
+        # Pre-breakout consolidation: conviction factor, not hard gate
         recent_5 = df.iloc[-6:-1]
         consolidation_range = recent_5["high"].max() - recent_5["low"].min()
-        if consolidation_range > 2.0 * atr:
-            return None  # Too choppy, not a clean breakout
 
         # ── Conviction scoring (additive, 0.55–1.0) ──
         conviction = 0.55
 
-        # +0.10: Volume strength
+        # +0.12: Volume strength (wider tiers)
         if rel_vol >= 5.0:
-            conviction += 0.10
+            conviction += 0.12
         elif rel_vol >= 3.0:
-            conviction += 0.07
+            conviction += 0.08
+        elif rel_vol >= 2.0:
+            conviction += 0.05
         else:
-            conviction += 0.03
+            conviction += 0.02
 
         # +0.10: Trend strength (EMA gap)
         trend_gap = (ema_20 - ema_50) / ema_50
@@ -120,8 +128,10 @@ class MomentumStrategy(BaseStrategy):
         # +0.08: RSI sweet spot (55-70 = strong but not exhausted)
         if 55 <= rsi_val <= 70:
             conviction += 0.08
-        elif 50 < rsi_val < 55 or 70 < rsi_val < 75:
+        elif 50 <= rsi_val < 55 or 70 < rsi_val < 75:
             conviction += 0.04
+        elif 45 <= rsi_val < 50:
+            conviction += 0.01
 
         # +0.07: MACD histogram strength (accelerating momentum)
         prev_macd_hist = float(df.iloc[-2]["macd_hist"])
@@ -130,22 +140,42 @@ class MomentumStrategy(BaseStrategy):
         elif macd_hist > 0:
             conviction += 0.03  # Positive but decelerating
 
-        # +0.05: Tight consolidation before breakout
+        # +0.07: Consolidation tightness (conviction factor, not hard reject)
         if consolidation_range < 1.0 * atr:
-            conviction += 0.05
+            conviction += 0.07
         elif consolidation_range < 1.5 * atr:
+            conviction += 0.04
+        elif consolidation_range < 2.0 * atr:
             conviction += 0.02
+        elif consolidation_range < 3.0 * atr:
+            conviction += 0.0  # Wide but allowed
+        else:
+            conviction -= 0.05  # Penalize very choppy setups
 
-        conviction = max(0.55, min(1.0, conviction))
+        # +0.05: ADR bonus (conviction factor, not hard gate)
+        if adr_pct >= 3.0:
+            conviction += 0.05
+        elif adr_pct >= 2.0:
+            conviction += 0.03
+        elif adr_pct >= 1.0:
+            conviction += 0.01
+
+        conviction = max(0.50, min(1.0, conviction))
 
         entry_price = close
-        stop_loss = entry_price - atr_stop_mult * atr
-        take_profit = entry_price + atr_tp_mult * atr
+        levels = self._plan_long_exit(
+            bars=df, entry_price=entry_price, atr=atr,
+            base_stop_mult=atr_stop_mult, base_tp_mult=atr_tp_mult,
+        )
+        stop_loss = levels.stop_loss
+        take_profit = levels.take_profit
 
         # Enforce minimum 2:1 R:R
         risk = entry_price - stop_loss
         reward = take_profit - entry_price
-        if risk <= 0 or reward / risk < 2.0:
+        rr = reward / risk if risk > 0 else 0.0
+        if risk <= 0 or rr < 2.0:
+            self._reject(symbol, "risk_reward", rr, 2.0, "above")
             return None
 
         hold_type = HoldType.DAY if conviction >= 0.9 else HoldType.SWING
@@ -155,13 +185,14 @@ class MomentumStrategy(BaseStrategy):
             symbol=symbol,
             rel_vol=rel_vol,
             adr_pct=adr_pct,
-            conviction=conviction,
+            conviction=round(conviction, 3),
             entry=entry_price,
             stop=stop_loss,
             target=take_profit,
             rsi=rsi_val,
             macd_hist=macd_hist,
             trend_gap=round(trend_gap, 4),
+            consolidation_atr_ratio=round(consolidation_range / atr, 2),
             atr=atr,
             hold_type=hold_type.value,
         )
@@ -183,6 +214,10 @@ class MomentumStrategy(BaseStrategy):
                 "macd_hist": macd_hist,
                 "trend_gap": round(trend_gap, 4),
                 "atr": atr,
+                "stop_method": levels.stop_method,
+                "target_method": levels.target_method,
+                "effective_stop_mult": round(levels.effective_stop_mult, 3),
+                "effective_tp_mult": round(levels.effective_tp_mult, 3),
             },
         )
 

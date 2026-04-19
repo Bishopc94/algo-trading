@@ -57,7 +57,7 @@ class RiskManager:
         market conditions.
     """
 
-    def __init__(self, config, database) -> None:
+    def __init__(self, config, database, dynamic_controller=None) -> None:
         self.config = config
         self._database = database
 
@@ -68,6 +68,12 @@ class RiskManager:
         # or `from __future__ import annotations`.
         self._starting_equity: float | None = None
 
+        # V2 Phase 7: optional DynamicRiskController.  When wired, the
+        # approve_trade path consults it for the tiered drawdown breaker
+        # and the per-regime max-positions override so Phase 7's runtime
+        # risk posture composes with the portfolio gates.
+        self._dynamic = dynamic_controller
+
     # ------------------------------------------------------------------
     # Setup
     # ------------------------------------------------------------------
@@ -77,10 +83,17 @@ class RiskManager:
 
         This must be called once at market open each day.  All subsequent
         calls to `check_daily_loss_limit` compare the current equity
-        against this reference value.
+        against this reference value.  If a DynamicRiskController is
+        wired, it shares the same reference so tiered drawdown
+        calculations stay in sync with the hard daily loss limit.
         """
         self._starting_equity = equity
         logger.info("starting_equity_set", equity=equity)
+        if self._dynamic is not None:
+            try:
+                self._dynamic.set_starting_equity(equity)
+            except Exception:
+                logger.exception("dynamic_risk_set_starting_equity_failed")
 
     # ------------------------------------------------------------------
     # Individual checks
@@ -131,7 +144,9 @@ class RiskManager:
         return True, "ok"
 
     def check_concentration(
-        self, current_positions_count: int
+        self,
+        current_positions_count: int,
+        max_positions_override: int | None = None,
     ) -> tuple[bool, str]:
         """Return ``(False, reason)`` if max open positions reached.
 
@@ -139,12 +154,41 @@ class RiskManager:
             Limiting the number of simultaneous open positions forces
             diversification and keeps the portfolio manageable.  A common
             limit for small accounts is 3-5 positions.
+
+        V2 Phase 7: ``max_positions_override`` comes from the
+        DynamicRiskController's regime bonus (fewer positions in bear,
+        more in strong bull).
         """
-        max_pos: int = getattr(self.config, "max_open_positions", 4)
+        max_pos: int = (
+            max_positions_override
+            if max_positions_override is not None
+            else getattr(self.config, "max_open_positions", 4)
+        )
         if current_positions_count >= max_pos:
             msg = f"max positions reached: {current_positions_count}/{max_pos}"
             logger.warning("max_positions", count=current_positions_count)
             return False, msg
+        return True, "ok"
+
+    def check_drawdown_breaker(self, current_equity: float) -> tuple[bool, str]:
+        """Tiered drawdown circuit breaker (Phase 7).
+
+        Consults the DynamicRiskController's most recent drawdown tier.
+        Tier 0-1 allow new entries (tier 1 still halves position size
+        via the risk scale); tier 2-3 halt new entries entirely.  This
+        is STRICTER than ``check_daily_loss_limit`` — it fires at 5%
+        drawdown rather than the config default, as specified in the
+        V2 brief.
+        """
+        if self._dynamic is None:
+            return True, "ok"
+        try:
+            tier = self._dynamic.refresh_drawdown(current_equity)
+        except Exception:
+            logger.exception("drawdown_refresh_failed")
+            return True, "ok"
+        if not tier.allow_new_entries:
+            return False, f"drawdown circuit breaker: {tier.reason}"
         return True, "ok"
 
     def check_portfolio_heat(
@@ -219,6 +263,7 @@ class RiskManager:
         available_cash: float,
         open_positions_count: int,
         open_trades: list[dict],
+        max_positions_override: int | None = None,
     ) -> tuple[bool, str]:
         """Run all risk checks and return ``(True, 'approved')`` or
         ``(False, reason)``.
@@ -245,8 +290,18 @@ class RiskManager:
         if not ok:
             return False, reason
 
-        # Check 2: Position concentration
-        ok, reason = self.check_concentration(open_positions_count)
+        # Check 1b: V2 Phase 7 tiered drawdown breaker (fires before the
+        # hard daily-loss cap so we halve size at -3% and halt at -5%).
+        ok, reason = self.check_drawdown_breaker(current_equity)
+        if not ok:
+            return False, reason
+
+        # Check 2: Position concentration (regime-adjusted when the
+        # dynamic controller provides an override).
+        ok, reason = self.check_concentration(
+            open_positions_count,
+            max_positions_override=max_positions_override,
+        )
         if not ok:
             return False, reason
 

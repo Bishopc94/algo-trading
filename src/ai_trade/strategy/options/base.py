@@ -36,18 +36,12 @@ Options Terminology Quick Reference
 # older Python versions (3.9) that would otherwise raise a TypeError.
 from __future__ import annotations
 
-# abc = Abstract Base Class module.  ABC is the base you inherit from, and
-# @abstractmethod marks methods that subclasses *must* override.
 from abc import ABC, abstractmethod
-
-# dataclass auto-generates __init__, __repr__, __eq__ from field declarations.
-# field() lets you set defaults for mutable types (lists, dicts) safely.
 from dataclasses import dataclass, field
-
 from datetime import datetime, timezone
-
-# Enum creates a fixed set of named constants (like a C/Java enum).
 from enum import Enum
+
+from ai_trade.strategy.base import Rejection
 
 
 class OptionsStrategyType(Enum):
@@ -68,6 +62,8 @@ class OptionsStrategyType(Enum):
     CASH_SECURED_PUT = "cash_secured_put"
     COVERED_CALL = "covered_call"
     COVERED_STRADDLE = "covered_straddle"
+    ZERO_DTE_CALL = "zero_dte_call"
+    ZERO_DTE_PUT = "zero_dte_put"
 
 
 # ---------------------------------------------------------------------------
@@ -415,9 +411,28 @@ class BaseOptionsStrategy(ABC):
 
     def __init__(self, config):
         self.config = config
-        # ``getattr(config, "enabled", True)`` -- see docstring above.
-        # Default to enabled if the config doesn't specify.
         self.enabled = getattr(config, "enabled", True)
+        self._rejections: list[Rejection] = []
+
+    def _reject(
+        self, symbol: str, filter_name: str,
+        actual: float, threshold: float, direction: str = "above",
+    ) -> None:
+        """Record a rejection with the filter that failed."""
+        self._rejections.append(Rejection(
+            symbol=symbol,
+            strategy=type(self).__name__,
+            filter_name=filter_name,
+            actual=actual,
+            threshold=threshold,
+            direction=direction,
+        ))
+
+    def drain_rejections(self) -> list[Rejection]:
+        """Return and clear all buffered rejections."""
+        rej = self._rejections
+        self._rejections = []
+        return rej
 
     @abstractmethod
     def evaluate(

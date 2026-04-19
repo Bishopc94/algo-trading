@@ -41,18 +41,21 @@ news service required.
 from __future__ import annotations
 
 import re
+import time as _time
 
-# PYTHON PATTERN — @dataclass with field():
-# `dataclass` auto-generates __init__ from type annotations.
-# `field(default_factory=list)` tells the dataclass to create a NEW empty
-# list for each instance.  Without this, all instances would share the
-# SAME list object (a common Python gotcha with mutable default arguments).
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from ai_trade.clients import get_news_client
 from ai_trade.monitoring.logger import get_logger
+from ai_trade.sentiment.event_classifier import (
+    ClassifiedEvent,
+    EventType,
+    classify_article,
+    compute_conviction_modifier as _ec_conviction_modifier,
+    aggregate_sector_impacts,
+)
 
 log = get_logger(__name__)
 
@@ -136,11 +139,12 @@ class NewsSentiment:
     conviction_modifier: float  # Multiplier for strategy conviction (e.g. 0.7 or 1.2)
     catalyst_detected: bool     # True if a strong news event was found
     top_headline: str = ""      # Most recent headline for display
-    # PYTHON PATTERN — field(default_factory=list):
-    # Mutable defaults (like lists or dicts) must use default_factory to
-    # avoid the "shared mutable default" bug.  Each NewsSentiment instance
-    # gets its own independent list.
     headlines: list[str] = field(default_factory=list)
+    # V2 Phase 11: structured event classification
+    classified_events: list[ClassifiedEvent] = field(default_factory=list)
+    event_categories: dict[str, int] = field(default_factory=dict)  # EventType → count
+    sector_impacts: dict[str, float] = field(default_factory=dict)  # sector → direction
+    earnings_status: str = "clear"  # "clear", "upcoming", "just_reported"
 
     def __str__(self) -> str:
         """Human-readable summary string."""
@@ -164,35 +168,35 @@ class NewsSentimentScanner:
         >>> print(result.conviction_modifier)  # e.g. 1.15
     """
 
-    def __init__(self, lookback_hours: int = 24, max_articles: int = 10):
-        # How far back to search for news articles.
+    def __init__(self, lookback_hours: int = 24, max_articles: int = 10,
+                 cache_ttl_seconds: int = 900):
         self._lookback_hours = lookback_hours
-        # Maximum number of articles to fetch per symbol (API limit control).
         self._max_articles = max_articles
+        self._cache_ttl = cache_ttl_seconds
+        self._cache: dict[str, tuple[float, NewsSentiment]] = {}  # symbol → (timestamp, result)
 
     def scan_symbol(self, symbol: str) -> NewsSentiment:
         """Analyze recent news sentiment for a single symbol.
 
         Scoring pipeline:
-        1. Fetch recent articles from Alpaca's news API.
-        2. For each article, score bullish and bearish keywords.
-        3. Apply recency weighting (newer articles score higher).
-        4. Normalize to net_score in [-1.0, +1.0].
-        5. Detect catalysts (unusually strong signal).
-        6. Calculate conviction modifier.
-
-        Args:
-            symbol: Stock ticker (e.g. "AAPL").
-
-        Returns:
-            NewsSentiment with scores and conviction modifier.
+        1. Check in-memory cache (TTL-based).
+        2. Fetch recent articles from Alpaca's news API.
+        3. Classify each article into structured event categories.
+        4. Score using both legacy keyword matching and event classifier.
+        5. Apply recency weighting (newer articles score higher).
+        6. Detect catalysts, aggregate sector impacts.
+        7. Calculate conviction modifier (blended keyword + classifier).
         """
+        cached = self._cache.get(symbol)
+        if cached:
+            ts, result = cached
+            if (_time.monotonic() - ts) < self._cache_ttl:
+                return result
+
         articles = self._fetch_news(symbol)
 
-        # If no articles found, return neutral sentiment (modifier = 1.0,
-        # meaning "no change to conviction").
         if not articles:
-            return NewsSentiment(
+            result = NewsSentiment(
                 symbol=symbol,
                 article_count=0,
                 bullish_score=0.0,
@@ -201,98 +205,85 @@ class NewsSentimentScanner:
                 conviction_modifier=1.0,
                 catalyst_detected=False,
             )
+            self._cache[symbol] = (_time.monotonic(), result)
+            return result
 
         total_bull = 0.0
         total_bear = 0.0
         headlines = []
+        all_classified: list[ClassifiedEvent] = []
+        category_counts: dict[str, int] = {}
 
         for article in articles:
-            # getattr with fallback handles Alpaca API objects that might
-            # have missing attributes depending on the SDK version.
             headline = getattr(article, "headline", "") or ""
             summary = getattr(article, "summary", "") or ""
-
-            # Combine headline + summary and lowercase for keyword matching.
             text = f"{headline} {summary}".lower()
             headlines.append(headline)
 
-            # ── Score this article's bullish keywords ────────
-            # PYTHON PATTERN — generator expression with sum():
-            # `sum(weight for keyword, weight in dict.items() if condition)`
-            # is a concise way to iterate through a dictionary and sum the
-            # values that match a condition.  The `for k, v in dict.items()`
-            # unpacks each key-value pair.
             bull_score = sum(
                 weight for keyword, weight in _BULLISH_KEYWORDS.items()
                 if keyword in text
             )
-            # ── Score this article's bearish keywords ────────
             bear_score = sum(
                 weight for keyword, weight in _BEARISH_KEYWORDS.items()
                 if keyword in text
             )
 
-            # ── Recency weighting ────────────────────────────
-            # More recent articles should influence the score more than
-            # older ones.  A linear decay from 1.0 (just published) to
-            # 0.3 (at 2× the lookback window) is applied.
+            events = classify_article(headline, summary)
+            all_classified.extend(events)
+            for ev in events:
+                category_counts[ev.event_type.value] = category_counts.get(ev.event_type.value, 0) + 1
+
             created = getattr(article, "created_at", None)
             if created:
                 try:
-                    # hasattr check: the created_at value might be a
-                    # datetime object (with .timestamp) or a plain string.
                     if hasattr(created, "timestamp"):
                         age_hours = (datetime.now(ET) - created).total_seconds() / 3600
                     else:
                         age_hours = self._lookback_hours
-                    # Linear decay: 1.0 at age_hours=0, 0.3 at 2×lookback.
                     recency_weight = max(0.3, 1.0 - (age_hours / (self._lookback_hours * 2)))
                 except Exception:
-                    recency_weight = 0.5  # Safe default on parsing errors
+                    recency_weight = 0.5
             else:
-                recency_weight = 0.5  # No timestamp → use middle weight
+                recency_weight = 0.5
 
-            # Apply recency weighting to this article's scores.
             total_bull += bull_score * recency_weight
             total_bear += bear_score * recency_weight
 
-        # ── Normalize scores to [-1.0, +1.0] ────────────────
-        # Divide each side by the total magnitude so the net score is
-        # bounded.  max(..., 1.0) prevents division by zero when there
-        # are no keyword matches.
         max_possible = max(total_bull + total_bear, 1.0)
         norm_bull = total_bull / max_possible
         norm_bear = total_bear / max_possible
-        # Clamp to [-1.0, +1.0] as a safety measure.
         net_score = max(-1.0, min(1.0, norm_bull - norm_bear))
 
-        # ── Detect strong catalyst ──────────────────────────
-        # If the raw (pre-normalization) score exceeds 4.0 on either side,
-        # that indicates a significant news event (e.g. an earnings beat
-        # with analyst upgrade = ~4.5 points).
         catalyst_detected = (total_bull > 4.0 or total_bear > 4.0)
 
-        # ── Calculate conviction modifier ────────────────────
-        # The modifier adjusts the strategy's base conviction score:
-        # - Positive news (net > +0.3): boost conviction up to +30%.
-        # - Negative news (net < -0.3): reduce conviction up to -50%.
-        # - Neutral (between -0.3 and +0.3): no change (modifier = 1.0).
-        #
-        # The dead zone [-0.3, +0.3] prevents weak/noisy signals from
-        # affecting trade decisions.
+        # Legacy keyword-based modifier
         if net_score > 0.3:
-            conviction_modifier = 1.0 + min(net_score * 0.5, 0.3)  # Cap at +30%
+            kw_modifier = 1.0 + min(net_score * 0.5, 0.3)
         elif net_score < -0.3:
-            conviction_modifier = 1.0 + max(net_score * 0.5, -0.5)  # Floor at -50%
+            kw_modifier = 1.0 + max(net_score * 0.5, -0.5)
         else:
-            conviction_modifier = 1.0  # Neutral — no change
+            kw_modifier = 1.0
 
-        # Strong catalysts get an extra multiplier on top.
         if catalyst_detected:
             if net_score > 0:
-                conviction_modifier = min(conviction_modifier * 1.2, 1.5)  # Cap total at +50%
+                kw_modifier = min(kw_modifier * 1.2, 1.5)
             else:
-                conviction_modifier = max(conviction_modifier * 0.8, 0.3)  # Floor total at 0.3
+                kw_modifier = max(kw_modifier * 0.8, 0.3)
+
+        # Event-classifier modifier (structured)
+        ec_modifier = _ec_conviction_modifier(all_classified)
+
+        # Blend: 40% classifier, 60% keyword (classifier earns more weight
+        # as it proves reliable; keyword scoring is the battle-tested fallback)
+        conviction_modifier = round(0.6 * kw_modifier + 0.4 * ec_modifier, 3)
+
+        # Sector impacts from macro/geopolitical events
+        sector_impacts = aggregate_sector_impacts(all_classified)
+
+        # Earnings proximity heuristic
+        from ai_trade.sentiment.earnings_guard import check_earnings_from_text
+        earnings_status = check_earnings_from_text(headlines)
 
         result = NewsSentiment(
             symbol=symbol,
@@ -300,11 +291,17 @@ class NewsSentimentScanner:
             bullish_score=round(total_bull, 2),
             bearish_score=round(total_bear, 2),
             net_score=round(net_score, 3),
-            conviction_modifier=round(conviction_modifier, 3),
+            conviction_modifier=conviction_modifier,
             catalyst_detected=catalyst_detected,
             top_headline=headlines[0] if headlines else "",
-            headlines=headlines[:5],  # Keep only top 5 headlines
+            headlines=headlines[:5],
+            classified_events=all_classified,
+            event_categories=category_counts,
+            sector_impacts=sector_impacts,
+            earnings_status=earnings_status,
         )
+
+        self._cache[symbol] = (_time.monotonic(), result)
 
         log.debug(
             "news_sentiment",
@@ -313,9 +310,15 @@ class NewsSentimentScanner:
             net_score=result.net_score,
             modifier=result.conviction_modifier,
             catalyst=result.catalyst_detected,
+            event_categories=category_counts,
+            earnings_status=earnings_status,
         )
 
         return result
+
+    def clear_cache(self) -> None:
+        """Clear the in-memory news cache."""
+        self._cache.clear()
 
     def scan_symbols(self, symbols: list[str]) -> dict[str, NewsSentiment]:
         """Analyze news sentiment for multiple symbols.

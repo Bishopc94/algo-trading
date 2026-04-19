@@ -98,6 +98,13 @@ CREATE TABLE IF NOT EXISTS trades (
     buy_order_id    TEXT,
     sell_order_id   TEXT,
     bot_version     TEXT,
+    atr             REAL,
+    conviction      REAL,
+    high_since_entry REAL,
+    low_since_entry  REAL,
+    stop_method     TEXT,
+    target_method   TEXT,
+    stop_quality    TEXT,
     created_at      TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -166,6 +173,134 @@ CREATE TABLE IF NOT EXISTS scanner_results (
     selected        INTEGER NOT NULL DEFAULT 0
 );
 
+-- V2: Decision audit trail — captures EVERY decision point for ML training
+CREATE TABLE IF NOT EXISTS decisions (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp       TEXT NOT NULL DEFAULT (datetime('now')),
+    decision_type   TEXT NOT NULL,
+    symbol          TEXT NOT NULL,
+    strategy        TEXT,
+    action          TEXT NOT NULL,
+    conviction      REAL,
+    reasoning       TEXT,
+    factors         TEXT,
+    outcome_pnl     REAL,
+    outcome_duration TEXT,
+    outcome_exit    TEXT,
+    created_at      TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- V2: Post-trade analysis
+CREATE TABLE IF NOT EXISTS trade_analysis (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    trade_id            INTEGER NOT NULL,
+    entry_quality       REAL,
+    stop_quality        TEXT,
+    exit_quality        TEXT,
+    market_regime       TEXT,
+    regime_at_exit      TEXT,
+    price_after_exit    REAL,
+    lessons             TEXT,
+    created_at          TEXT NOT NULL DEFAULT (datetime('now')),
+    FOREIGN KEY (trade_id) REFERENCES trades(id)
+);
+
+-- V2: Strategy parameter change history
+CREATE TABLE IF NOT EXISTS parameter_history (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    strategy        TEXT NOT NULL,
+    param_name      TEXT NOT NULL,
+    old_value       REAL,
+    new_value       REAL,
+    reason          TEXT,
+    created_at      TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- V2: Rolling strategy performance by regime
+CREATE TABLE IF NOT EXISTS strategy_performance (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    strategy        TEXT NOT NULL,
+    regime          TEXT NOT NULL,
+    period_start    TEXT,
+    period_end      TEXT,
+    trade_count     INTEGER NOT NULL DEFAULT 0,
+    win_rate        REAL,
+    avg_pnl         REAL,
+    profit_factor   REAL,
+    sharpe          REAL,
+    created_at      TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- V2: ML model registry
+CREATE TABLE IF NOT EXISTS ml_models (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    model_name          TEXT NOT NULL,
+    version             INTEGER NOT NULL,
+    trained_at          TEXT,
+    training_trades     INTEGER,
+    backtest_sharpe     REAL,
+    backtest_accuracy   REAL,
+    is_active           INTEGER NOT NULL DEFAULT 0,
+    model_path          TEXT,
+    created_at          TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- V2: ML predictions log
+CREATE TABLE IF NOT EXISTS ml_predictions (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp           TEXT NOT NULL DEFAULT (datetime('now')),
+    signal_id           INTEGER,
+    decision_id         INTEGER,
+    predicted_outcome   TEXT,
+    predicted_confidence REAL,
+    actual_outcome      TEXT,
+    model_version       INTEGER,
+    created_at          TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- V2: ML feature snapshots at trade entry
+CREATE TABLE IF NOT EXISTS ml_features (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    trade_id        INTEGER,
+    decision_id     INTEGER,
+    features        TEXT NOT NULL,
+    created_at      TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- V2 Phase 4: Persistent strategy weights (restart-safe)
+CREATE TABLE IF NOT EXISTS strategy_weights (
+    strategy_name   TEXT PRIMARY KEY,
+    weight          REAL NOT NULL,
+    composite_score REAL,
+    win_rate        REAL,
+    profit_factor   REAL,
+    avg_pnl         REAL,
+    recency_score   REAL,
+    trades_used     INTEGER,
+    last_updated    TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- V2 Phase 4: Generic key/value state for restart-safe miscellanea
+CREATE TABLE IF NOT EXISTS bot_state (
+    key             TEXT PRIMARY KEY,
+    value           TEXT NOT NULL,
+    updated_at      TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- V2 Phase 4/9: Active parameter overrides learned by the optimizer
+-- Phase 9 adds `regime` to the PK so overrides can vary by market regime.
+-- regime='' means "global / all regimes".
+CREATE TABLE IF NOT EXISTS parameter_overrides (
+    strategy_name   TEXT NOT NULL,
+    param_name      TEXT NOT NULL,
+    regime          TEXT NOT NULL DEFAULT '',
+    value           TEXT NOT NULL,
+    set_at          TEXT NOT NULL DEFAULT (datetime('now')),
+    set_by          TEXT,
+    reason          TEXT,
+    PRIMARY KEY (strategy_name, param_name, regime)
+);
+
 -- Performance indexes for frequent queries
 CREATE INDEX IF NOT EXISTS idx_trades_status ON trades(status);
 CREATE INDEX IF NOT EXISTS idx_trades_symbol ON trades(symbol);
@@ -176,6 +311,16 @@ CREATE INDEX IF NOT EXISTS idx_daily_snapshots_date ON daily_snapshots(date);
 CREATE INDEX IF NOT EXISTS idx_signals_timestamp ON signals(timestamp);
 CREATE INDEX IF NOT EXISTS idx_signals_symbol ON signals(symbol);
 CREATE INDEX IF NOT EXISTS idx_day_trades_date ON day_trades(trade_date);
+
+-- V2 indexes
+CREATE INDEX IF NOT EXISTS idx_decisions_timestamp ON decisions(timestamp);
+CREATE INDEX IF NOT EXISTS idx_decisions_symbol ON decisions(symbol);
+CREATE INDEX IF NOT EXISTS idx_decisions_strategy ON decisions(strategy);
+CREATE INDEX IF NOT EXISTS idx_decisions_action ON decisions(action);
+CREATE INDEX IF NOT EXISTS idx_decisions_type ON decisions(decision_type);
+CREATE INDEX IF NOT EXISTS idx_trade_analysis_trade_id ON trade_analysis(trade_id);
+CREATE INDEX IF NOT EXISTS idx_strategy_perf_strategy ON strategy_performance(strategy);
+CREATE INDEX IF NOT EXISTS idx_ml_predictions_decision ON ml_predictions(decision_id);
 """
 
 
@@ -254,6 +399,13 @@ class Database:
         migrations = [
             ("trades", "bot_version", "ALTER TABLE trades ADD COLUMN bot_version TEXT"),
             ("options_trades", "bot_version", "ALTER TABLE options_trades ADD COLUMN bot_version TEXT"),
+            ("trades", "atr", "ALTER TABLE trades ADD COLUMN atr REAL"),
+            ("trades", "high_since_entry", "ALTER TABLE trades ADD COLUMN high_since_entry REAL"),
+            ("trades", "low_since_entry", "ALTER TABLE trades ADD COLUMN low_since_entry REAL"),
+            ("trades", "stop_method", "ALTER TABLE trades ADD COLUMN stop_method TEXT"),
+            ("trades", "target_method", "ALTER TABLE trades ADD COLUMN target_method TEXT"),
+            ("trades", "stop_quality", "ALTER TABLE trades ADD COLUMN stop_quality TEXT"),
+            ("trades", "conviction", "ALTER TABLE trades ADD COLUMN conviction REAL"),
         ]
         try:
             with self._conn() as conn:
@@ -263,6 +415,37 @@ class Database:
                     if column not in columns:
                         conn.execute(sql)
                         _db_log.info("schema_migrated", table=table, column=column)
+
+                # Phase 9: parameter_overrides needs regime in composite PK.
+                # SQLite can't ALTER a PK, so we rebuild the table.
+                po_cols = [
+                    row[1]
+                    for row in conn.execute("PRAGMA table_info(parameter_overrides)").fetchall()
+                ]
+                if "regime" not in po_cols:
+                    conn.executescript("""
+                        CREATE TABLE parameter_overrides_new (
+                            strategy_name TEXT NOT NULL,
+                            param_name    TEXT NOT NULL,
+                            regime        TEXT NOT NULL DEFAULT '',
+                            value         TEXT NOT NULL,
+                            set_at        TEXT NOT NULL DEFAULT (datetime('now')),
+                            set_by        TEXT,
+                            reason        TEXT,
+                            PRIMARY KEY (strategy_name, param_name, regime)
+                        );
+                        INSERT INTO parameter_overrides_new
+                            (strategy_name, param_name, regime, value, set_at, set_by, reason)
+                        SELECT strategy_name, param_name, '', value, set_at, set_by, reason
+                            FROM parameter_overrides;
+                        DROP TABLE parameter_overrides;
+                        ALTER TABLE parameter_overrides_new RENAME TO parameter_overrides;
+                    """)
+                    _db_log.info(
+                        "schema_migrated",
+                        table="parameter_overrides",
+                        detail="rebuilt with regime in composite PK",
+                    )
         except Exception as e:
             _db_log.warning("migration_failed", error=str(e))
 
@@ -279,6 +462,9 @@ class Database:
         index (e.g., row[0]).
         """
         conn = sqlite3.connect(str(self._path), timeout=10)
+        # WAL mode: allows concurrent readers + one writer without blocking.
+        # This is a persistent PRAGMA — once set, it stays until changed.
+        conn.execute("PRAGMA journal_mode=WAL")
         # Row factory makes rows behave like dictionaries — much more
         # readable than positional indexing.
         conn.row_factory = sqlite3.Row
@@ -533,6 +719,225 @@ class Database:
             ).fetchall()
             return [dict(r) for r in rows]
 
+    # ── Decisions (V2) ─────────────────────────────────────────
+
+    def log_decision(self, **kwargs) -> int:
+        """Record a decision in the audit trail. Returns the new row ID.
+
+        Decision types: scan, evaluate, signal, rank, size, approve,
+        reject, execute, exit, review.
+
+        Actions: consider, reject, signal, approve, execute, skip, exit.
+        """
+        return self._insert("decisions", **kwargs)
+
+    def log_decisions_batch(self, decisions: list[dict]) -> None:
+        """Batch insert multiple decisions in a single transaction."""
+        if not decisions:
+            return
+        def _do_batch():
+            cols = list(decisions[0].keys())
+            _validate_columns(cols)
+            col_str = ", ".join(cols)
+            placeholders = ", ".join(["?"] * len(cols))
+            with self._conn() as conn:
+                conn.executemany(
+                    f"INSERT INTO decisions ({col_str}) VALUES ({placeholders})",
+                    [list(d.values()) for d in decisions],
+                )
+        self._retry_on_lock(_do_batch)
+
+    def update_decision_outcome(self, decision_id: int, **kwargs) -> None:
+        """Update outcome fields on a decision after trade closes."""
+        self._update("decisions", decision_id, **kwargs)
+
+    def get_decisions(
+        self, symbol: str | None = None, strategy: str | None = None,
+        decision_type: str | None = None, limit: int = 100,
+    ) -> list[dict]:
+        """Query decisions with optional filters."""
+        where_parts = []
+        params = []
+        if symbol:
+            where_parts.append("symbol = ?")
+            params.append(symbol)
+        if strategy:
+            where_parts.append("strategy = ?")
+            params.append(strategy)
+        if decision_type:
+            where_parts.append("decision_type = ?")
+            params.append(decision_type)
+        where_clause = " AND ".join(where_parts) if where_parts else "1=1"
+        params.append(limit)
+        with self._conn() as conn:
+            rows = conn.execute(
+                f"SELECT * FROM decisions WHERE {where_clause} "
+                f"ORDER BY timestamp DESC LIMIT ?",
+                params,
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    # ── Trade Analysis (V2) ─────────────────────────────────
+
+    def insert_trade_analysis(self, **kwargs) -> int:
+        """Insert a post-trade analysis record."""
+        return self._insert("trade_analysis", **kwargs)
+
+    def log_parameter_change(self, **kwargs) -> int:
+        """Record a strategy parameter change."""
+        return self._insert("parameter_history", **kwargs)
+
+    def insert_strategy_performance(self, **kwargs) -> int:
+        """Record rolling strategy performance by regime."""
+        return self._insert("strategy_performance", **kwargs)
+
+    # ── ML (V2) ─────────────────────────────────────────────
+
+    def insert_ml_model(self, **kwargs) -> int:
+        """Register a new ML model version."""
+        return self._insert("ml_models", **kwargs)
+
+    def insert_ml_prediction(self, **kwargs) -> int:
+        """Log an ML model prediction."""
+        return self._insert("ml_predictions", **kwargs)
+
+    def insert_ml_features(self, **kwargs) -> int:
+        """Save ML feature snapshot for a trade/decision."""
+        return self._insert("ml_features", **kwargs)
+
+    # ── Persistent state (V2 Phase 4) ───────────────────────
+
+    def get_strategy_weights(self) -> list[dict]:
+        """Return all persisted strategy weight rows."""
+        with self._conn() as conn:
+            rows = conn.execute("SELECT * FROM strategy_weights").fetchall()
+            return [dict(r) for r in rows]
+
+    def upsert_strategy_weight(self, strategy_name: str, **kwargs) -> None:
+        """Insert or update a strategy weight row.
+
+        kwargs may include: weight, composite_score, win_rate, profit_factor,
+        avg_pnl, recency_score, trades_used.  last_updated is auto-set.
+        """
+        def _do():
+            cols = ["strategy_name", *kwargs.keys(), "last_updated"]
+            _validate_columns(cols)
+            col_str = ", ".join(cols)
+            placeholders = ", ".join(["?"] * len(cols))
+            values = [strategy_name, *kwargs.values(), time.strftime("%Y-%m-%d %H:%M:%S")]
+            with self._conn() as conn:
+                conn.execute(
+                    f"INSERT OR REPLACE INTO strategy_weights ({col_str}) VALUES ({placeholders})",
+                    values,
+                )
+        self._retry_on_lock(_do)
+
+    def get_state(self, key: str, default: str | None = None) -> str | None:
+        """Read a value from bot_state by key.  Returns default if missing."""
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT value FROM bot_state WHERE key = ?", (key,)
+            ).fetchone()
+            return row[0] if row else default
+
+    def set_state(self, key: str, value: str) -> None:
+        """Write a key/value pair to bot_state."""
+        def _do():
+            with self._conn() as conn:
+                conn.execute(
+                    "INSERT OR REPLACE INTO bot_state (key, value, updated_at) VALUES (?, ?, ?)",
+                    (key, value, time.strftime("%Y-%m-%d %H:%M:%S")),
+                )
+        self._retry_on_lock(_do)
+
+    def get_all_state(self) -> dict[str, str]:
+        """Return the full bot_state as a dict."""
+        with self._conn() as conn:
+            rows = conn.execute("SELECT key, value FROM bot_state").fetchall()
+            return {r[0]: r[1] for r in rows}
+
+    def get_parameter_overrides(self, regime: str | None = None) -> list[dict]:
+        """Return parameter overrides, optionally filtered by regime.
+
+        Args:
+            regime: If None, return ALL rows across all regimes.
+                    If a string (including ''), return only rows for that
+                    exact regime value.
+        """
+        with self._conn() as conn:
+            if regime is None:
+                rows = conn.execute("SELECT * FROM parameter_overrides").fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM parameter_overrides WHERE regime = ?", (regime,),
+                ).fetchall()
+            return [dict(r) for r in rows]
+
+    def get_effective_overrides(self, regime: str = "") -> list[dict]:
+        """Return overrides for a regime with global fallback.
+
+        For each (strategy, param), prefers the regime-specific override;
+        falls back to the global (regime='') override when no
+        regime-specific row exists.
+        """
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT * FROM parameter_overrides WHERE regime IN (?, '') "
+                "ORDER BY strategy_name, param_name, "
+                "CASE WHEN regime = ? THEN 0 ELSE 1 END",
+                (regime, regime),
+            ).fetchall()
+        seen: set[tuple[str, str]] = set()
+        result: list[dict] = []
+        for r in rows:
+            key = (r["strategy_name"], r["param_name"])
+            if key not in seen:
+                seen.add(key)
+                result.append(dict(r))
+        return result
+
+    def set_parameter_override(
+        self,
+        strategy_name: str,
+        param_name: str,
+        value: str,
+        regime: str = "",
+        set_by: str | None = None,
+        reason: str | None = None,
+    ) -> None:
+        """Insert/update a parameter override for a (strategy, param, regime) tuple."""
+        def _do():
+            with self._conn() as conn:
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO parameter_overrides
+                        (strategy_name, param_name, regime, value, set_at, set_by, reason)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        strategy_name,
+                        param_name,
+                        regime,
+                        value,
+                        time.strftime("%Y-%m-%d %H:%M:%S"),
+                        set_by,
+                        reason,
+                    ),
+                )
+        self._retry_on_lock(_do)
+
+    def delete_parameter_override(
+        self, strategy_name: str, param_name: str, regime: str = "",
+    ) -> None:
+        def _do():
+            with self._conn() as conn:
+                conn.execute(
+                    "DELETE FROM parameter_overrides "
+                    "WHERE strategy_name = ? AND param_name = ? AND regime = ?",
+                    (strategy_name, param_name, regime),
+                )
+        self._retry_on_lock(_do)
+
     # ── Scanner ─────────────────────────────────────────────
 
     def log_scanner_results(self, results: list[dict]) -> None:
@@ -546,3 +951,38 @@ class Database:
         """
         for r in results:
             self._insert("scanner_results", **r)
+
+    # ── Cleanup (V2 Phase 13) ─────────────────────────────────
+
+    def cleanup_old_data(self, retention_days: int = 90) -> dict[str, int]:
+        """Delete rows older than *retention_days* from high-volume tables.
+
+        Keeps the database lean without losing recent data needed for ML
+        training and the self-learning feedback loop.
+
+        Returns a dict mapping table name to rows deleted.
+        """
+        cutoff = f"datetime('now', '-{retention_days} days')"
+        targets = [
+            ("decisions", "timestamp"),
+            ("scanner_results", "date"),
+            ("ml_features", "created_at"),
+            ("ml_predictions", "created_at"),
+        ]
+        deleted: dict[str, int] = {}
+        def _do():
+            with self._conn() as conn:
+                for table, ts_col in targets:
+                    try:
+                        cur = conn.execute(
+                            f"DELETE FROM {table} WHERE {ts_col} < {cutoff}"
+                        )
+                        deleted[table] = cur.rowcount
+                    except Exception as e:
+                        _db_log.debug("cleanup_table_skipped", table=table, error=str(e))
+                        deleted[table] = 0
+        self._retry_on_lock(_do)
+        total = sum(deleted.values())
+        if total > 0:
+            _db_log.info("cleanup_complete", retention_days=retention_days, deleted=deleted)
+        return deleted

@@ -81,28 +81,34 @@ class DebitCallSpreadStrategy(BaseOptionsStrategy):
         macd_hist: float = latest.get("macd_hist", 0.0)
         prev_macd_hist: float = prev.get("macd_hist", 0.0)
 
-        # RSI in strong momentum zone (not overbought)
-        if not (50 < rsi < 70):
+        # RSI in momentum zone (widened: 45-75)
+        if rsi <= 45:
+            self._reject(underlying, "rsi_min", rsi, 45.0, "above")
+            return None
+        if rsi >= 75:
+            self._reject(underlying, "rsi_max", rsi, 75.0, "below")
             return None
 
-        # Price above both EMAs (confirmed uptrend)
-        if price <= ema_20 or price <= ema_50:
+        # Price above EMA-50 (confirmed uptrend — relaxed from both EMAs)
+        if price <= ema_50:
+            self._reject(underlying, "price_above_ema50", price, ema_50, "above")
             return None
 
-        # Uptrend EMA structure
-        if ema_20 <= ema_50:
+        # EMA structure not deeply broken
+        ema_struct_floor = ema_50 * 0.98
+        if ema_20 < ema_struct_floor:
+            self._reject(underlying, "ema_structure", ema_20, ema_struct_floor, "above")
             return None
 
-        # MACD histogram positive (momentum aligned)
-        if macd_hist <= 0:
-            return None
-
-        # Volume confirmation
-        if rel_vol <= 1.3:
+        # MACD not deeply negative (relaxed from strictly positive)
+        macd_floor = -0.005 * price
+        if macd_hist < macd_floor:
+            self._reject(underlying, "macd_not_deep_neg", macd_hist, macd_floor, "above")
             return None
 
         # Bullish candle
         if price <= open_price:
+            self._reject(underlying, "bullish_candle", price, open_price, "above")
             return None
 
         # ------------------------------------------------------------------

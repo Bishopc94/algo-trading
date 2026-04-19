@@ -79,28 +79,32 @@ class CreditPutSpreadStrategy(BaseOptionsStrategy):
         macd_hist: float = latest.get("macd_hist", 0.0)
         prev_macd_hist: float = prev.get("macd_hist", 0.0)
 
-        # RSI not bearish (selling puts into downtrends is dangerous)
-        if rsi <= 45:
+        # RSI not deeply bearish (relaxed from 45 to 35)
+        if rsi <= 35:
+            self._reject(underlying, "rsi_min", rsi, 35.0, "above")
             return None
 
-        # Price above EMA-20 (short-term uptrend)
-        if price <= ema_20:
+        # Price near EMA-50 support (relaxed: allow 3% below)
+        ema50_floor = ema_50 * 0.97
+        if price <= ema50_floor:
+            self._reject(underlying, "price_near_ema50", price, ema50_floor, "above")
             return None
 
-        # Price above EMA-50 (medium-term uptrend)
-        if price <= ema_50:
+        # EMA structure: at least not deeply broken
+        ema_struct_floor = ema_50 * 0.97
+        if ema_20 < ema_struct_floor:
+            self._reject(underlying, "ema_structure", ema_20, ema_struct_floor, "above")
             return None
 
-        # Uptrend EMA structure
-        if ema_20 <= ema_50:
-            return None
-
-        # MACD not deeply negative (momentum not deteriorating)
-        if macd_hist < -0.01 * price:
+        # MACD not deeply negative (relaxed 2x)
+        macd_floor = -0.02 * price
+        if macd_hist < macd_floor:
+            self._reject(underlying, "macd_not_deep_neg", macd_hist, macd_floor, "above")
             return None
 
         # High volume on a down candle is a warning sign
-        if rel_vol > 2.0 and price < latest["open"]:
+        if rel_vol > 2.5 and price < latest["open"]:
+            self._reject(underlying, "bearish_vol_spike", rel_vol, 2.5, "below")
             return None
 
         # ------------------------------------------------------------------

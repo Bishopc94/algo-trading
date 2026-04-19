@@ -77,32 +77,45 @@ class CoveredCallStrategy(BaseOptionsStrategy):
         macd_hist: float = latest.get("macd_hist", 0.0)
         rel_vol: float = latest.get("relative_volume", 1.0)
 
-        # RSI 40-65 (neutral to mildly bullish)
-        if not (40 <= rsi <= 65):
+        # RSI 35-70 (widened: neutral to bullish)
+        if rsi < 35:
+            self._reject(underlying, "rsi_min", rsi, 35.0, "above")
+            return None
+        if rsi > 70:
+            self._reject(underlying, "rsi_max", rsi, 70.0, "below")
             return None
 
-        # Price within 5% of EMA-20 (not running away)
-        if price > ema_20 * 1.05:
+        # Price within 8% of EMA-20 (not running away — relaxed from 5%)
+        ema20_ceil = ema_20 * 1.08
+        if price > ema20_ceil:
+            self._reject(underlying, "price_near_ema20", price, ema20_ceil, "below")
             return None
 
-        # Stock affordable for 100-share position
+        # Stock affordable for 100-share position ($5 = $500 collateral)
         if price > max_stock_price:
+            self._reject(underlying, "max_stock_price", price, max_stock_price, "below")
             return None
 
-        # EMA structure intact (not in confirmed downtrend)
-        if ema_20 < ema_50 * 0.97:
+        # EMA structure: not in deep downtrend (relaxed from 3% to 5%)
+        ema_struct_floor = ema_50 * 0.95
+        if ema_20 < ema_struct_floor:
+            self._reject(underlying, "ema_structure", ema_20, ema_struct_floor, "above")
             return None
 
         # Don't sell calls during strong upward momentum
-        if macd_hist > 0.02 * price:
+        macd_ceil = 0.02 * price
+        if macd_hist > macd_ceil:
+            self._reject(underlying, "macd_not_strong_up", macd_hist, macd_ceil, "below")
             return None
 
-        # Bollinger Band width < 15% (range-bound, not volatile)
-        if bb_width > 0.15:
+        # Bollinger Band width < 20% (relaxed from 15%)
+        if bb_width > 0.20:
+            self._reject(underlying, "bb_width_max", bb_width, 0.20, "below")
             return None
 
         # Don't sell calls on high-volume breakout days
-        if rel_vol > 2.0 and price > ema_20:
+        if rel_vol > 2.5 and price > ema_20:
+            self._reject(underlying, "breakout_vol_spike", rel_vol, 2.5, "below")
             return None
 
         # ------------------------------------------------------------------

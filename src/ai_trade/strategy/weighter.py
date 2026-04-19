@@ -51,6 +51,37 @@ class StrategyWeighter:
 
         self._weights: dict[str, float] = {}
         self._trade_count_at_last_recalc: int = 0
+        self._load_persisted_state()
+
+    _STATE_CURSOR_KEY = "weighter.trade_count_at_last_recalc"
+
+    def _load_persisted_state(self) -> None:
+        """Restore weights and recalc cursor from the database on startup.
+
+        Without this, every restart resets weights to 1.0 and forces a
+        full recalculation from the trades table on the next cycle — which
+        both burns I/O and briefly ignores weeks of learned weighting
+        during the warm-up window.
+        """
+        try:
+            rows = self._db.get_strategy_weights()
+            if rows:
+                self._weights = {r["strategy_name"]: float(r["weight"]) for r in rows}
+                logger.info(
+                    "weighter_weights_restored",
+                    strategy_count=len(self._weights),
+                    weights=self._weights,
+                )
+
+            cursor_raw = self._db.get_state(self._STATE_CURSOR_KEY)
+            if cursor_raw is not None:
+                self._trade_count_at_last_recalc = int(cursor_raw)
+                logger.info(
+                    "weighter_cursor_restored",
+                    trade_count_at_last_recalc=self._trade_count_at_last_recalc,
+                )
+        except Exception:
+            logger.exception("weighter_state_restore_failed")
 
     def get_weight(self, strategy_name: str) -> float:
         """Return the current weight for a strategy.  Default 1.0 (no adjustment)."""
@@ -72,6 +103,10 @@ class StrategyWeighter:
 
             self._recalculate(closed)
             self._trade_count_at_last_recalc = total_closed
+            try:
+                self._db.set_state(self._STATE_CURSOR_KEY, str(total_closed))
+            except Exception:
+                logger.exception("weighter_cursor_persist_failed")
         except Exception:
             logger.exception("weighter_recalc_failed")
 
@@ -114,6 +149,7 @@ class StrategyWeighter:
         pnl_range = max_avg_pnl - min_avg_pnl if max_avg_pnl != min_avg_pnl else 1.0
 
         new_weights: dict[str, float] = {}
+        persisted_rows: list[dict] = []
 
         for name, components in scores.items():
             # Normalize avg P&L to [0, 1]
@@ -135,7 +171,33 @@ class StrategyWeighter:
             weight = max(self._min_weight, min(self._max_weight, weight))
             new_weights[name] = round(weight, 3)
 
+            persisted_rows.append({
+                "strategy_name": name,
+                "weight": new_weights[name],
+                "composite_score": round(composite, 4),
+                "win_rate": round(components["win_rate"], 4),
+                "profit_factor": round(components["profit_factor"], 4),
+                "avg_pnl": round(avg_pnls[name], 4),
+                "recency_score": round(components["recency"], 4),
+                "trades_used": len(by_strategy[name]),
+            })
+
         self._weights = new_weights
+
+        for row in persisted_rows:
+            try:
+                self._db.upsert_strategy_weight(
+                    row["strategy_name"],
+                    weight=row["weight"],
+                    composite_score=row["composite_score"],
+                    win_rate=row["win_rate"],
+                    profit_factor=row["profit_factor"],
+                    avg_pnl=row["avg_pnl"],
+                    recency_score=row["recency_score"],
+                    trades_used=row["trades_used"],
+                )
+            except Exception:
+                logger.exception("weight_persist_failed", strategy=row["strategy_name"])
 
         logger.info(
             "strategy_weights_updated",

@@ -82,32 +82,35 @@ class LongCallStrategy(BaseOptionsStrategy):
         prev_macd_hist: float = prev.get("macd_hist", 0.0)
         atr: float = latest.get("atr_14", 0.0)
 
-        # RSI in strong momentum range (not overbought)
-        if not (55 <= rsi <= 75):
+        # RSI in momentum range (widened: 48-78)
+        if rsi < 48:
+            self._reject(underlying, "rsi_min", rsi, 48.0, "above")
+            return None
+        if rsi > 78:
+            self._reject(underlying, "rsi_max", rsi, 78.0, "below")
             return None
 
-        # Price breakout above 20-day high
-        if price <= high_20:
+        # Price above EMA-50 (medium-term uptrend)
+        if price <= ema_50:
+            self._reject(underlying, "price_above_ema50", price, ema_50, "above")
             return None
 
-        # Stacked EMA uptrend: close > EMA-20 > EMA-50
-        if not (price > ema_20 > ema_50):
+        # EMA structure not deeply broken
+        ema_struct_floor = ema_50 * 0.98
+        if ema_20 < ema_struct_floor:
+            self._reject(underlying, "ema_structure", ema_20, ema_struct_floor, "above")
             return None
 
-        # Volume confirmation (institutional participation)
-        if rel_vol <= 2.0:
+        # Volume confirmation (relaxed from 2.0 to 1.3)
+        if rel_vol < 1.3:
+            self._reject(underlying, "rel_volume", rel_vol, 1.3, "above")
             return None
 
-        # MACD histogram positive (momentum aligned)
-        if macd_hist <= 0:
+        # MACD not deeply negative (relaxed from strictly positive)
+        macd_floor = -0.005 * price
+        if macd_hist < macd_floor:
+            self._reject(underlying, "macd_not_deep_neg", macd_hist, macd_floor, "above")
             return None
-
-        # Pre-breakout consolidation: 5-bar range < 2x ATR
-        if atr > 0 and len(df) >= 6:
-            recent_5 = df.iloc[-6:-1]
-            consolidation_range = recent_5["high"].max() - recent_5["low"].min()
-            if consolidation_range > 2.0 * atr:
-                return None  # Too volatile before breakout -- likely noise
 
         # ------------------------------------------------------------------
         # 2. Select contract -- ATM to slightly ITM call

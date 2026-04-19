@@ -76,29 +76,40 @@ class CashSecuredPutStrategy(BaseOptionsStrategy):
         rel_vol: float = latest.get("relative_volume", 1.0)
         macd_hist: float = latest.get("macd_hist", 0.0)
 
-        # RSI in neutral zone (not in freefall)
-        if not (35 <= rsi <= 55):
+        # RSI not in freefall (widened: 30-60)
+        if rsi < 30:
+            self._reject(underlying, "rsi_min", rsi, 30.0, "above")
+            return None
+        if rsi > 60:
+            self._reject(underlying, "rsi_max", rsi, 60.0, "below")
             return None
 
-        # Price near or below EMA-50 (value zone, within 5% above)
-        if price > ema_50 * 1.05:
+        # Price not way above EMA-50 (within 8% above)
+        ema50_ceil = ema_50 * 1.08
+        if price > ema50_ceil:
+            self._reject(underlying, "price_near_ema50", price, ema50_ceil, "below")
             return None
 
         # Stock must be affordable for cash-secured requirement
         if price > max_stock_price:
+            self._reject(underlying, "max_stock_price", price, max_stock_price, "below")
             return None
 
         # MACD not deeply negative (selling not accelerating)
-        if macd_hist < -0.02 * price:
+        macd_floor = -0.02 * price
+        if macd_hist < macd_floor:
+            self._reject(underlying, "macd_not_deep_neg", macd_hist, macd_floor, "above")
             return None
 
         # Reject if high volume on a bearish candle (distribution)
         if rel_vol > 2.0 and price < open_price:
+            self._reject(underlying, "bearish_vol_spike", rel_vol, 2.0, "below")
             return None
 
-        # EMA structure: prefer EMA-20 >= EMA-50 or nearly crossing
-        # Allow EMA-20 slightly below EMA-50 (within 2%) for value plays
-        if ema_20 < ema_50 * 0.98:
+        # EMA structure: allow EMA-20 slightly below EMA-50 (within 2%)
+        ema_struct_floor = ema_50 * 0.98
+        if ema_20 < ema_struct_floor:
+            self._reject(underlying, "ema_structure", ema_20, ema_struct_floor, "above")
             return None
 
         # ------------------------------------------------------------------

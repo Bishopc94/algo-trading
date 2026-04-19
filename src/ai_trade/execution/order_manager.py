@@ -50,6 +50,7 @@ from alpaca.trading.requests import (
     GetOrdersRequest,
     LimitOrderRequest,
     MarketOrderRequest,
+    ReplaceOrderRequest,
     StopLossRequest,
     TakeProfitRequest,
 )
@@ -268,6 +269,11 @@ class OrderManager:
             # We use datetime.now(timezone.utc) to get the current time
             # in UTC (Coordinated Universal Time) — the standard for
             # storing timestamps in databases.
+            meta = getattr(signal, "metadata", {}) or {}
+            atr_val = meta.get("atr")
+            stop_method = meta.get("stop_method")
+            target_method = meta.get("target_method")
+
             self._db.insert_trade(
                 symbol=signal.symbol,
                 strategy=signal.strategy_name,
@@ -280,6 +286,12 @@ class OrderManager:
                 hold_type=signal.hold_type.value,
                 status="open",
                 buy_order_id=str(order.id),
+                atr=atr_val,
+                conviction=float(getattr(signal, "conviction", 0.0) or 0.0),
+                stop_method=stop_method,
+                target_method=target_method,
+                high_since_entry=entry_price,
+                low_since_entry=entry_price,
             )
 
             return str(order.id)
@@ -326,7 +338,8 @@ class OrderManager:
         submitting a market sell order and cancelling any open bracket legs.
 
         If shares are held by pending orders (e.g. bracket stop/target legs),
-        we cancel those orders first, then retry the close.
+        we cancel those orders first, wait for Alpaca to release the shares,
+        then retry the close.
         """
         try:
             self._client.close_position(symbol_or_asset_id=symbol)
@@ -338,27 +351,79 @@ class OrderManager:
                 log.info("position_already_closed", symbol=symbol)
                 return True
 
-            # Shares held by open orders — cancel them and retry once
+            # Shares held by open orders — cancel them and retry
             if "insufficient qty" in error_msg or "held_for_orders" in error_msg:
                 log.warning("close_position_held_by_orders", symbol=symbol)
                 print(con.warning(f"Shares held by open orders for {symbol} — cancelling and retrying..."))
-                try:
-                    self._cancel_orders_for_symbol(symbol)
-                    time.sleep(1)  # Brief pause for Alpaca to process cancellations
-                    self._client.close_position(symbol_or_asset_id=symbol)
-                    log.info("position_closed_after_cancel", symbol=symbol)
-                    return True
-                except Exception as retry_err:
-                    retry_msg = str(retry_err).lower()
-                    if "no position" in retry_msg or "not found" in retry_msg:
-                        log.info("position_already_closed_after_cancel", symbol=symbol)
-                        return True
-                    log.exception("close_position_retry_failed", symbol=symbol)
-                    print(con.warning(f"Retry close {symbol} failed — {str(retry_err)[:100]}"))
-                    return False
+                return self._cancel_and_retry_close(symbol)
 
             log.exception("close_position_failed", symbol=symbol)
             print(con.warning(f"Failed to close {symbol} — {str(e)[:100]}"))
+            return False
+
+    def _cancel_and_retry_close(self, symbol: str, max_attempts: int = 4) -> bool:
+        """Cancel open orders for *symbol*, wait for shares to be released, retry close.
+
+        Alpaca's paper API can take 2-5 seconds to fully process bracket leg
+        cancellations and release the held shares.  This method:
+        1. Cancels per-symbol orders (bracket legs, stop-losses, etc.)
+        2. If no orders found, falls back to cancelling ALL open orders
+        3. Polls the position up to *max_attempts* times (2s apart) waiting
+           for ``qty_available > 0``
+        4. Retries the close once shares are available
+        """
+        # Step 1: Cancel orders holding the shares
+        cancelled = self._cancel_orders_for_symbol(symbol)
+        if cancelled == 0:
+            # Bracket child legs may not show up in per-symbol query —
+            # fall back to cancelling all open orders as a last resort.
+            log.warning("no_orders_found_for_symbol_trying_cancel_all", symbol=symbol)
+            try:
+                self._client.cancel_orders()
+            except Exception:
+                pass
+
+        # Step 2: Poll until shares are released or we give up
+        for attempt in range(1, max_attempts + 1):
+            time.sleep(2)
+            try:
+                pos = self._client.get_open_position(symbol)
+                qty_available = int(pos.qty_available or 0)
+                qty = int(pos.qty or 0)
+                log.info(
+                    "close_position_poll",
+                    symbol=symbol, attempt=attempt,
+                    qty=qty, qty_available=qty_available,
+                )
+                if qty_available > 0:
+                    break
+            except Exception as pe:
+                pe_msg = str(pe).lower()
+                if "not found" in pe_msg or "no position" in pe_msg:
+                    log.info("position_gone_during_poll", symbol=symbol)
+                    return True
+                log.debug("position_poll_error", symbol=symbol, error=str(pe))
+        else:
+            # Exhausted all attempts — shares never freed
+            log.error(
+                "close_position_shares_never_released",
+                symbol=symbol, attempts=max_attempts,
+            )
+            print(con.error(f"Could not release held shares for {symbol} after {max_attempts} attempts."))
+            return False
+
+        # Step 3: Retry the close
+        try:
+            self._client.close_position(symbol_or_asset_id=symbol)
+            log.info("position_closed_after_cancel", symbol=symbol)
+            return True
+        except Exception as retry_err:
+            retry_msg = str(retry_err).lower()
+            if "no position" in retry_msg or "not found" in retry_msg:
+                log.info("position_already_closed_after_cancel", symbol=symbol)
+                return True
+            log.error("close_position_retry_failed", symbol=symbol, error=str(retry_err))
+            print(con.warning(f"Retry close {symbol} failed — {str(retry_err)[:100]}"))
             return False
 
     def close_all_day_trades(self, open_trades: list[dict]) -> None:
@@ -452,22 +517,37 @@ class OrderManager:
 
     def _cancel_orders_for_symbol(self, symbol: str) -> int:
         """Cancel all open orders for a specific symbol. Returns count cancelled."""
+        cancelled = 0
         try:
             request = GetOrdersRequest(
                 status="open",
                 symbols=[symbol],
             )
             orders = self._client.get_orders(filter=request)
+            if not orders:
+                log.info("no_open_orders_for_symbol", symbol=symbol)
+                return 0
             for order in orders:
                 try:
                     self._client.cancel_order_by_id(order.id)
-                except Exception:
-                    pass  # Order may have already filled/cancelled
-            log.info("orders_cancelled_for_symbol", symbol=symbol, count=len(orders))
-            return len(orders)
+                    cancelled += 1
+                    log.info(
+                        "order_cancelled",
+                        symbol=symbol,
+                        order_id=str(order.id),
+                        order_type=str(getattr(order, "order_class", "unknown")),
+                        side=str(getattr(order, "side", "unknown")),
+                    )
+                except Exception as ce:
+                    # Order may have already filled/cancelled — not fatal
+                    log.debug("cancel_single_order_skipped", symbol=symbol,
+                              order_id=str(order.id), error=str(ce))
+            log.info("orders_cancelled_for_symbol", symbol=symbol,
+                     found=len(orders), cancelled=cancelled)
+            return cancelled
         except Exception:
             log.exception("cancel_orders_for_symbol_failed", symbol=symbol)
-            return 0
+            return cancelled
 
     def cancel_all_open_orders(self) -> None:
         """Cancel every open order on Alpaca.
@@ -505,11 +585,12 @@ class OrderManager:
         Returns a summary dict with counts of each reconciliation action,
         useful for monitoring and alerting.
         """
-        summary: dict[str, int] = {
+        summary: dict = {
             "alpaca_positions": 0,
             "db_open_trades": 0,
             "untracked_positions": 0,
             "stale_trades_closed": 0,
+            "closed_trades": [],
         }
 
         try:
@@ -570,11 +651,68 @@ class OrderManager:
                         pnl_pct=pnl_pct,
                     )
                     summary["stale_trades_closed"] += 1
+                    summary["closed_trades"].append({
+                        "trade_id": trade["id"],
+                        "symbol": sym,
+                        "strategy": trade.get("strategy", ""),
+                        "entry_price": entry_price,
+                        "exit_price": exit_price,
+                        "shares": shares,
+                        "pnl": pnl,
+                        "pnl_pct": pnl_pct,
+                        "hold_type": trade.get("hold_type", ""),
+                        "stop_loss": trade.get("stop_loss"),
+                        "take_profit": trade.get("take_profit"),
+                        "high_since_entry": trade.get("high_since_entry"),
+                        "low_since_entry": trade.get("low_since_entry"),
+                    })
 
         except Exception:
             log.exception("sync_positions_failed")
 
         return summary
+
+    def find_stop_leg_id(self, buy_order_id: str) -> str | None:
+        """Locate the stop-loss child order id for a bracket parent order.
+
+        Used by the trailing-stop job to know which leg to replace. Returns
+        None if the parent or the stop leg can't be found.
+        """
+        try:
+            order = self._client.get_order_by_id(buy_order_id)
+            for leg in order.legs or []:
+                if leg.order_type is None:
+                    continue
+                if "stop" in str(leg.order_type).lower() and leg.status not in (
+                    OrderStatus.FILLED, OrderStatus.CANCELED, OrderStatus.EXPIRED,
+                ):
+                    return str(leg.id)
+        except Exception:
+            log.debug("stop_leg_lookup_failed", order_id=buy_order_id)
+        return None
+
+    def replace_stop_price(self, stop_order_id: str, new_stop_price: float) -> bool:
+        """Replace a live stop-loss order with a new stop price.
+
+        Used by the trailing-stop job to tighten stops as trades move in
+        our favor. Returns True on success.
+        """
+        try:
+            req = ReplaceOrderRequest(stop_price=round(new_stop_price, 2))
+            self._client.replace_order_by_id(order_id=stop_order_id, order_data=req)
+            log.info(
+                "stop_price_replaced",
+                order_id=stop_order_id,
+                new_stop=round(new_stop_price, 2),
+            )
+            return True
+        except Exception as e:
+            log.warning(
+                "stop_replace_failed",
+                order_id=stop_order_id,
+                error=str(e),
+            )
+            return False
 
     def _get_fill_price(self, buy_order_id: str | None, symbol: str) -> float | None:
         """Try to determine exit price from Alpaca order history.

@@ -221,6 +221,58 @@ def daily_summary(today: str, equity: float, cash: float,
     return "\n".join(lines)
 
 
+def cycle_summary(
+    regime: str, vix: float, pdt_used: int, pdt_max: int,
+    candidates: int, momentum: int, mean_rev: int, vwap: int,
+    signals: list[dict], near_misses: list[dict],
+    equity: float, cash: float, open_positions: int, heat_pct: float,
+) -> str:
+    """V2: Rich per-cycle summary matching the V2 agent brief spec.
+
+    Args:
+        signals: list of {symbol, strategy, conviction, entry, stop, target, hold_type, action}
+        near_misses: list of {symbol, strategy, reason, miss_pct}
+    """
+    ts = _ts()
+    w = _SECTION_WIDTH + 4
+    sep = _HORIZ * w
+
+    lines = [f"\n{sep}", f"  Scan {ts}  |  Regime: {regime.upper()}  |  VIX {vix:.1f}  |  PDT: {pdt_used}/{pdt_max}"]
+    lines.append(f"  Scanned: {candidates} candidates (momentum={momentum}, mean_rev={mean_rev}, vwap={vwap})")
+
+    if signals:
+        lines.append("")
+        lines.append("  Signals:")
+        for i, s in enumerate(signals, 1):
+            risk = s["entry"] - s["stop"]
+            reward = s["target"] - s["entry"]
+            rr = reward / risk if risk > 0 else 0
+            action_str = s.get("action", "QUEUED").upper()
+            shares_str = f"({s['shares']} shares, ${s['shares'] * s['entry']:,.0f})" if s.get("shares") else ""
+            lines.append(
+                f"    {i}. {s['symbol']:<6} {s['strategy']:<16} "
+                f"conv={s['conviction']:.2f}  entry=${s['entry']:.2f}  "
+                f"stop=${s['stop']:.2f}  target=${s['target']:.2f}  "
+                f"R:R=1:{rr:.1f}  -> {action_str} {shares_str}"
+            )
+    else:
+        lines.append("")
+        lines.append("  No signals this cycle.")
+
+    if near_misses:
+        lines.append("")
+        lines.append("  Near-misses:")
+        for nm in near_misses[:5]:
+            miss_str = f" -- missed by {nm['miss_pct']:.1f}%" if nm.get("miss_pct") else ""
+            lines.append(f"    - {nm['symbol']:<6} {nm['strategy']}: {nm['reason']}{miss_str}")
+
+    lines.append("")
+    lines.append(f"  Portfolio: ${equity:,.2f} equity | ${cash:,.2f} cash | {open_positions} open | heat {heat_pct:.1f}%")
+    lines.append(sep)
+
+    return "\n".join(lines)
+
+
 def catchup(msg: str) -> str:
     """Catchup status message."""
     return f"  [Catchup] {msg}"

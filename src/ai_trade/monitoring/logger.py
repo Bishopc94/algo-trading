@@ -55,11 +55,27 @@ from __future__ import annotations
 
 import logging
 import sys
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import structlog
 
 from ai_trade._version import __version__
+
+_ET = ZoneInfo("America/New_York")
+
+
+def _add_et_timestamp(logger, method_name, event_dict):
+    """Stamp each log entry with an Eastern Time ISO-8601 timestamp.
+
+    We deliberately use America/New_York (not UTC and not machine local
+    time) so logs read naturally against the market clock regardless of
+    where the bot is running. The offset suffix (-05:00 / -04:00) keeps
+    each line unambiguous across the DST boundary.
+    """
+    event_dict["timestamp"] = datetime.now(_ET).isoformat(timespec="milliseconds")
+    return event_dict
 
 # Resolve the log directory: 3 levels up from this file, then into logs/.
 _LOG_DIR = Path(__file__).resolve().parents[3] / "logs"
@@ -144,9 +160,8 @@ def setup_logging(level: str = "INFO") -> None:
             # to each log entry.
             structlog.processors.add_log_level,
 
-            # TimeStamper: adds an ISO-8601 timestamp to each log entry
-            # (e.g., "2025-06-01T14:30:00.000000Z").
-            structlog.processors.TimeStamper(fmt="iso"),
+            # Eastern-time ISO-8601 timestamp (market clock).
+            _add_et_timestamp,
 
             # Add application version to every log entry for traceability.
             _add_version,
