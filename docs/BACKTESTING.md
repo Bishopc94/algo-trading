@@ -32,10 +32,11 @@ The runner is the entry point. It handles everything *before* the simulation sta
 
 1. **Parses CLI arguments** using Python's `argparse` module (a standard library for building command-line interfaces). You specify symbols, date ranges, and which strategies to include.
 
-2. **Resolves symbols** from one of three sources:
+2. **Resolves symbols** from one of four sources:
    - `--symbols AAPL MSFT TSLA` -- explicit list
    - `--symbols-file watchlist.txt` -- one symbol per line in a text file
-   - `--default-universe` -- a built-in list of 24 liquid stocks (AAPL, MSFT, AMZN, GOOGL, META, TSLA, NVDA, AMD, NFLX, and others)
+   - `--default-universe` -- a built-in list of ~24 liquid stocks (AAPL, MSFT, AMZN, GOOGL, META, TSLA, NVDA, AMD, NFLX, and others)
+   - `--full-universe` -- loads `data/ml_training_universe.txt` (283 liquid stocks, price $5-$2000, volume >500k/day); recommended for ML training runs
 
 3. **Fetches historical daily bars** from Alpaca's market data API via `fetch_bars_multi()`. Each symbol gets a DataFrame (a tabular data structure from the `pandas` library, similar to a spreadsheet or SQL table) containing columns: open, high, low, close, volume.
 
@@ -44,6 +45,8 @@ The runner is the entry point. It handles everything *before* the simulation sta
 5. **Optionally fetches SPY/QQQ data** for market regime analysis -- the engine uses broad market conditions to gate entries (e.g., avoiding new long positions in a strong bear market).
 
 6. **Passes everything to the engine** and prints the results.
+
+7. **Optionally trains the ML model** (when `--train-ml` is set): after the simulation, `_train_ml_from_backtest()` writes all captured feature+outcome rows to `data/backtest_ml.db`, trains a `GradientBoostingClassifier`, and auto-registers the new model version in the live `data/ai_trade.db`. The bot picks up the updated model on its next restart.
 
 ### The Engine (`backtest/engine.py`)
 
@@ -276,12 +279,15 @@ ai-trade-backtest --default-universe --start 2025-01-01 --end 2025-12-31 --optio
 |------|------|---------|-------------|
 | `--symbols` | list of strings | none | Stock tickers to backtest |
 | `--symbols-file` | file path | none | Text file with one symbol per line |
-| `--default-universe` | flag | off | Use built-in list of 24 liquid stocks |
+| `--default-universe` | flag | off | Use built-in list of ~24 liquid stocks |
+| `--full-universe` | flag | off | Use `data/ml_training_universe.txt` (283 liquid stocks) — recommended for ML training |
 | `--days` | integer | 90 | Calendar days to look back (ignored if `--start` is set) |
 | `--start` | YYYY-MM-DD | computed from `--days` | Start date for the backtest period |
 | `--end` | YYYY-MM-DD | today | End date for the backtest period |
 | `--config` | file path | default location | Path to `settings.yaml` configuration file |
+| `--capital` | integer | settings.yaml value | Override starting capital (use `100000` to bypass small-account position-sizing constraints during ML training) |
 | `--options` | flag | off | Include options strategies (uses Black-Scholes synthetic pricing) |
+| `--train-ml` | flag | off | After the simulation, train a GradientBoostingClassifier from the captured features and auto-register it in the live `ai_trade.db` |
 | `--show-trades` | flag | off | Print every individual trade to the console |
 | `--export` | file path | none | Export results to CSV (provide base filename; generates `.trades.csv`, `.options_trades.csv`, `.equity.csv`) |
 
@@ -323,6 +329,52 @@ When using `--export results/my_backtest`, three CSV files are generated:
 - `my_backtest.trades.csv` -- every stock trade with entry/exit dates, prices, P&L, strategy, exit reason
 - `my_backtest.options_trades.csv` -- every options trade with strikes, contracts, entry cost, P&L, exit reason
 - `my_backtest.equity.csv` -- daily equity curve (date, equity, cash, open positions, open options)
+
+---
+
+## Training the ML Model from Backtest History
+
+The bot uses a `GradientBoostingClassifier` to blend a learned P(win) estimate into each signal's conviction score. Rather than waiting weeks for live trades to accumulate, you can bootstrap the model using a year of simulated trades.
+
+### Why High Fidelity Matters
+
+The backtest engine calls the **exact same** `extract_features()` function at fill time that the live bot uses at order submission. Features are computed against the same market context (regime, VIX, intraday bars), so the training distribution matches inference — there is no feature drift between the historical training data and live signals.
+
+### Recommended Training Command
+
+```bash
+python -m ai_trade.backtest.runner \
+    --full-universe \
+    --days 365 \
+    --capital 100000 \
+    --train-ml
+```
+
+**Why `--capital 100000`?** On a $500 live account, the position sizer cannot afford most S&P 500 stocks (25% cap = $125 max, 0 shares for any stock above $125). Running training at $100k removes this constraint so the backtest generates signals across the full universe. The ML model learns from what signals look like at execution — not the subset that survive a tight capital filter.
+
+**Why `--full-universe`?** 283 symbols × 365 days generates ~400+ completed trades — enough for a reliable GradientBoosting fit. The `--default-universe` (24 stocks) only produces ~50-100 trades, which is marginal for training.
+
+### What Happens After `--train-ml`
+
+1. All captured feature+outcome rows are written to `data/backtest_ml.db` (separate from your live DB; wiped fresh each run)
+2. A `GradientBoostingClassifier(n_estimators=100, max_depth=3, learning_rate=0.05)` is fit with a time-ordered 80/20 walk-forward split
+3. The model is saved to `models/signal_quality_v<N>.joblib`
+4. The new version is registered as active in `data/ai_trade.db` — the bot loads it on next startup
+5. On startup you will see: `predictor_model_loaded version=N training_trades=N val_accuracy=0.NNN`
+
+### How the Model Affects Live Trading
+
+The predictor is not a hard gate — it blends with the rule-based conviction score:
+
+```
+blended = (1 - blend_weight) * rule_conviction + blend_weight * ml_probability
+```
+
+The blend weight ramps linearly from 0 to 0.5 as training trades accumulate to 200. With 400+ training trades, the weight is capped at 0.5 (equal influence). Low-conviction ML predictions (P(win) < 0.5) pull the blended conviction down, which filters out marginal signals before they reach the risk gate.
+
+### Retraining Schedule
+
+The bot retrains nightly at 17:00 ET via `job_train_ml_models`. Each live trade that closes adds a labeled row to `ml_features`, gradually shifting the model toward live market conditions. To do a full re-bootstrap from backtest history (e.g., after a long break or strategy change), run the training command above again — it overwrites the previous model version.
 
 ---
 

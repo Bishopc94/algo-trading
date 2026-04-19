@@ -70,7 +70,8 @@ Pre-Market Scan          Find stocks moving on volume/gaps
 | **News Sentiment** | Keyword-weighted news scoring via Alpaca News API |
 | **Risk Controls** | Portfolio heat, daily loss limits, bracket orders (server-side stops), position size adaptation |
 | **Email Alerts** | Real-time notifications for high-conviction signals and all trade submissions |
-| **Backtesting** | Walk-forward event-driven simulator with slippage, Black-Scholes options pricing |
+| **ML Signal Scoring** | GradientBoostingClassifier blends rule-based conviction with learned P(win) estimate — trained from backtest history |
+| **Backtesting** | Walk-forward event-driven simulator with ML feature capture, slippage, Black-Scholes options pricing |
 | **Logging** | Structured JSON logs (full diagnostic + decision journal) via structlog |
 | **Persistence** | SQLite database for trades, signals, snapshots, PDT tracking (with performance indexes) |
 
@@ -159,6 +160,10 @@ ai-trade-backtest --default-universe --start 2024-03-01 --end 2026-03-01 --optio
 
 # Export results to CSV files for analysis in Excel/Sheets
 ai-trade-backtest --default-universe --days 90 --export results
+
+# Bootstrap the ML model from backtest history (283-symbol liquid universe, 1 year)
+# Trains a GradientBoostingClassifier and registers it in the live DB automatically
+ai-trade-backtest --full-universe --days 365 --capital 100000 --train-ml
 ```
 
 ### How the Backtester Works (Brief)
@@ -374,12 +379,18 @@ ai_trade/
 │   │   ├── notifier.py               #   Email alerts (SMTP, background threads)
 │   │   └── logger.py                  #   Structured logging (JSON + console)
 │   ├── scheduler/
-│   │   └── jobs.py                    #   APScheduler cron jobs (13 scheduled tasks)
+│   │   └── jobs.py                    #   APScheduler cron jobs (18 scheduled tasks)
+│   ├── ml/                             # Machine learning
+│   │   ├── features.py                #   Canonical 15-column feature vector
+│   │   ├── trainer.py                 #   GradientBoosting training (time-ordered 80/20 split)
+│   │   └── predictor.py               #   Live inference + blend weight ramp (0→0.5 over 200 trades)
 │   └── backtest/                       # Backtesting
-│       ├── engine.py                  #   Walk-forward simulator
+│       ├── engine.py                  #   Walk-forward simulator (ML feature capture at fill)
 │       ├── options_pricing.py         #   Black-Scholes pricing
-│       └── runner.py                  #   CLI interface
+│       └── runner.py                  #   CLI: --train-ml / --capital / --full-universe
 ├── data/                               # SQLite DB (auto-created)
+│   └── ml_training_universe.txt       #   283 liquid stocks for ML training backtests
+├── models/                             # Trained ML models (joblib, gitignored for prod)
 ├── logs/                               # Log files (auto-created)
 ├── docs/                               # In-depth documentation
 └── tests/                              # Test suite
@@ -400,9 +411,10 @@ ai-trade [--config CONFIG] [--dry-run]
 ### `ai-trade-backtest` — Backtester
 
 ```
-ai-trade-backtest [--symbols AAPL MSFT] [--default-universe] [--days 90]
-                  [--start 2024-01-01] [--end 2025-01-01] [--options]
+ai-trade-backtest [--symbols AAPL MSFT] [--default-universe] [--full-universe]
+                  [--days 90] [--start 2024-01-01] [--end 2025-01-01] [--options]
                   [--show-trades] [--export results]
+                  [--train-ml] [--capital 100000]
 ```
 
 ---
@@ -435,6 +447,22 @@ ai-trade-backtest [--symbols AAPL MSFT] [--default-universe] [--days 90]
 ---
 
 ## Changelog
+
+### v2.1.0 — Backtest ML Training Pipeline
+
+**ML Bootstrap from Historical Simulation**
+- Backtest engine now captures ML features at the exact moment each order fills, using the same `extract_features()` call as live trading — guaranteed feature parity between training and inference
+- Features are paired with realized P&L at close to build labelled training rows (no synthetic labels)
+- `--train-ml` flag runs `_train_ml_from_backtest()` after the simulation: writes a fresh `backtest_ml.db`, trains a `GradientBoostingClassifier` (100 estimators, max_depth=3, lr=0.05, time-ordered 80/20 split), and auto-registers the new model in the live `ai_trade.db` — the bot picks it up on next restart with no manual steps
+- `--full-universe` flag loads `data/ml_training_universe.txt` (283 liquid stocks: price $5-$2000, vol >500k/day) for production-grade training coverage
+- `--capital N` overrides starting capital for the simulation — use `--capital 100000` so position-sizing constraints on small accounts don't suppress signal generation during training
+- Batched symbol fetching (BATCH_SIZE=200) prevents Alpaca rate-limit errors on large universes
+- **Model v3** trained on 433 backtest trades: val accuracy 60.9%, 88.8% precision when P(win)>0.5 (top features: RSI, conviction, ATR, relative volume, R:R ratio)
+- Blend weight ramps from 0→0.5 as training trades accumulate (200 trade ramp); nightly retraining (`job_train_ml_models` at 17:00 ET) continuously improves the model as live data grows
+
+### v2.0.0 — Complete 13-Phase Overhaul
+
+See [docs/V2_PROGRESS.md](docs/V2_PROGRESS.md) for the full 13-phase breakdown. Key additions: decision audit trail, adaptive exit planner with S/R-anchored stops, conviction-aware trailing stops, state persistence across restarts, ML core infrastructure, self-learning trade analysis, dynamic risk controller, smart PDT management, strategy optimizer, 0DTE options strategy, news/event intelligence, market prediction module, and performance optimization (parallel fetching, WAL mode, cycle timing).
 
 ### v1.2.0 — Multi-Indicator Confluence & Options Strategy Optimization
 
