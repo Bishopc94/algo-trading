@@ -79,6 +79,7 @@ except ImportError:  # pragma: no cover
 from ai_trade.clients import get_trading_client
 from ai_trade.monitoring.database import Database
 from ai_trade.monitoring.logger import get_logger
+from ai_trade.utils import retry_api_call
 
 log = get_logger(__name__)
 
@@ -344,7 +345,7 @@ class OptionsOrderManager:
             often faster than a for-loop with an if-statement and append.
         """
         try:
-            positions = self._client.get_all_positions()
+            positions = retry_api_call(self._client.get_all_positions)
             return [
                 pos for pos in positions
                 if _OPTION_SYMBOL_RE.match(pos.symbol) or len(pos.symbol) > 10

@@ -61,6 +61,7 @@ from alpaca.trading.requests import (
 from ai_trade.clients import get_trading_client
 from ai_trade.monitoring.database import Database
 from ai_trade.monitoring.logger import get_logger
+from ai_trade.utils import retry_api_call
 from ai_trade.monitoring import console as con
 
 log = get_logger(__name__)
@@ -503,7 +504,7 @@ class OrderManager:
         ground truth of what we actually hold.
         """
         try:
-            return self._client.get_all_positions()
+            return retry_api_call(self._client.get_all_positions)
         except (ConnectTimeout, ReadTimeout, RequestsConnectionError) as exc:
             log.warning("get_open_positions_network_error", error=str(exc))
             return []
@@ -514,7 +515,7 @@ class OrderManager:
     def get_open_orders(self) -> list:
         """Return all open (unfilled/partially-filled) orders from Alpaca."""
         try:
-            return self._client.get_orders()
+            return retry_api_call(self._client.get_orders)
         except (ConnectTimeout, ReadTimeout, RequestsConnectionError) as exc:
             log.warning("get_open_orders_network_error", error=str(exc))
             return []

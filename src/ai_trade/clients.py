@@ -151,5 +151,12 @@ def get_stream_client(cfg: SimpleNamespace | None = None) -> StockDataStream:
 
 
 def get_account():
-    """Fetch current account information (equity, cash, buying power, etc.)."""
-    return get_trading_client().get_account()
+    """Fetch current account information (equity, cash, buying power, etc.).
+
+    Wrapped in ``retry_api_call`` so a transient ``ConnectTimeout`` gets up
+    to two exponential-backoff retries before bubbling up.  This is called
+    by the main scan loop and the PDT manager — a single network hiccup
+    should not skip a trading cycle.
+    """
+    from ai_trade.utils import retry_api_call
+    return retry_api_call(get_trading_client().get_account)
