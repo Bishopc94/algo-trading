@@ -33,8 +33,27 @@ from alpaca.data import NewsClient
 from alpaca.data.historical.stock import StockHistoricalDataClient
 from alpaca.data.live.stock import StockDataStream
 from alpaca.trading.client import TradingClient
+from requests.adapters import HTTPAdapter
 
 from ai_trade.monitoring.logger import get_logger
+
+
+class _TimeoutAdapter(HTTPAdapter):
+    """Injects a default (connect, read) timeout on every request.
+
+    The Alpaca SDK does not expose a timeout parameter, so without this the
+    socket will block until the OS TCP timeout fires (~2 minutes on Windows).
+    Mounting this adapter ensures transient API outages fail fast instead of
+    stalling the trading cycle.
+    """
+
+    def __init__(self, *args, timeout: tuple[int, int] = (10, 30), **kwargs) -> None:
+        self._default_timeout = timeout
+        super().__init__(*args, **kwargs)
+
+    def send(self, *args, **kwargs):  # type: ignore[override]
+        kwargs.setdefault("timeout", self._default_timeout)
+        return super().send(*args, **kwargs)
 
 log = get_logger(__name__)
 
@@ -80,6 +99,16 @@ def init_clients(cfg: SimpleNamespace) -> None:
     _news_client = NewsClient(
         cfg.alpaca.api_key, cfg.alpaca.secret_key,
     )
+
+    # Mount timeout adapters on all three clients.  The Alpaca SDK leaves
+    # connect_timeout=None by default, which means the OS TCP timeout (~2 min
+    # on Windows) is the only circuit breaker.  10s connect / 30s read gives
+    # the API a reasonable window while failing fast on outages.
+    _adapter = _TimeoutAdapter(timeout=(10, 30))
+    for _client in (_trading_client, _data_client, _news_client):
+        _client._session.mount("https://", _adapter)
+        _client._session.mount("http://", _adapter)
+
     log.info("clients_initialized", paper=cfg.alpaca.paper)
 
 

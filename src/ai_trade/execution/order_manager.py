@@ -43,6 +43,9 @@ from __future__ import annotations
 import time
 from datetime import datetime, timezone
 
+from requests.exceptions import ConnectionError as RequestsConnectionError
+from requests.exceptions import ConnectTimeout, ReadTimeout
+
 # Alpaca SDK imports for interacting with the brokerage.
 from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import OrderClass, OrderSide, OrderStatus, TimeInForce
@@ -501,6 +504,9 @@ class OrderManager:
         """
         try:
             return self._client.get_all_positions()
+        except (ConnectTimeout, ReadTimeout, RequestsConnectionError) as exc:
+            log.warning("get_open_positions_network_error", error=str(exc))
+            return []
         except Exception:
             log.exception("get_open_positions_failed")
             return []
@@ -509,6 +515,9 @@ class OrderManager:
         """Return all open (unfilled/partially-filled) orders from Alpaca."""
         try:
             return self._client.get_orders()
+        except (ConnectTimeout, ReadTimeout, RequestsConnectionError) as exc:
+            log.warning("get_open_orders_network_error", error=str(exc))
+            return []
         except Exception:
             log.exception("get_open_orders_failed")
             return []
@@ -545,6 +554,9 @@ class OrderManager:
             log.info("orders_cancelled_for_symbol", symbol=symbol,
                      found=len(orders), cancelled=cancelled)
             return cancelled
+        except (ConnectTimeout, ReadTimeout, RequestsConnectionError) as exc:
+            log.warning("cancel_orders_for_symbol_network_error", symbol=symbol, error=str(exc))
+            return cancelled
         except Exception:
             log.exception("cancel_orders_for_symbol_failed", symbol=symbol)
             return cancelled
@@ -559,6 +571,8 @@ class OrderManager:
         try:
             canceled = self._client.cancel_orders()
             log.info("all_orders_canceled", count=len(canceled))
+        except (ConnectTimeout, ReadTimeout, RequestsConnectionError) as exc:
+            log.warning("cancel_all_orders_network_error", error=str(exc))
         except Exception:
             log.exception("cancel_all_orders_failed")
 
@@ -667,6 +681,8 @@ class OrderManager:
                         "low_since_entry": trade.get("low_since_entry"),
                     })
 
+        except (ConnectTimeout, ReadTimeout, RequestsConnectionError) as exc:
+            log.warning("sync_positions_network_error", error=str(exc))
         except Exception:
             log.exception("sync_positions_failed")
 

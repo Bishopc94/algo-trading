@@ -58,6 +58,9 @@ from __future__ import annotations
 import re
 from datetime import datetime, timezone
 
+from requests.exceptions import ConnectionError as RequestsConnectionError
+from requests.exceptions import ConnectTimeout, ReadTimeout
+
 # Alpaca SDK imports for options order submission.
 from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import OrderSide, PositionIntent, TimeInForce
@@ -346,6 +349,9 @@ class OptionsOrderManager:
                 pos for pos in positions
                 if _OPTION_SYMBOL_RE.match(pos.symbol) or len(pos.symbol) > 10
             ]
+        except (ConnectTimeout, ReadTimeout, RequestsConnectionError) as exc:
+            log.warning("get_options_positions_network_error", error=str(exc))
+            return []
         except Exception:
             log.exception("get_options_positions_failed")
             return []
