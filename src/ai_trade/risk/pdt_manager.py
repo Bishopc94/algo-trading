@@ -74,6 +74,10 @@ class PDTManager:
         # This is the authoritative count; our local DB is a backup.
         self._alpaca_daytrade_count: int | None = None
 
+        # Track the last mismatch pair so we only warn when it changes —
+        # otherwise a stale local row spams a warning every sync cycle.
+        self._last_mismatch_pair: tuple[int, int] | None = None
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -92,13 +96,23 @@ class PDTManager:
             self._alpaca_daytrade_count = int(account.daytrade_count)
             local_count = self._get_local_day_trades_used()
             if self._alpaca_daytrade_count != local_count:
-                logger.warning(
-                    "pdt_count_mismatch",
-                    alpaca_count=self._alpaca_daytrade_count,
-                    local_count=local_count,
-                    using="alpaca (authoritative)",
-                )
+                pair = (self._alpaca_daytrade_count, local_count)
+                if pair != self._last_mismatch_pair:
+                    logger.warning(
+                        "pdt_count_mismatch",
+                        alpaca_count=self._alpaca_daytrade_count,
+                        local_count=local_count,
+                        using="alpaca (authoritative)",
+                    )
+                    self._last_mismatch_pair = pair
+                else:
+                    logger.debug(
+                        "pdt_count_mismatch_repeat",
+                        alpaca_count=self._alpaca_daytrade_count,
+                        local_count=local_count,
+                    )
             else:
+                self._last_mismatch_pair = None
                 logger.debug(
                     "pdt_synced",
                     count=self._alpaca_daytrade_count,

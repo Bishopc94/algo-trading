@@ -1561,7 +1561,12 @@ class TradingBot:
                     try:
                         news_sentiment = fut_news.result(timeout=30)
                     except Exception as e:
-                        log.warning("news_scan_failed", error=str(e))
+                        log.warning(
+                            "news_scan_failed",
+                            error_type=type(e).__name__,
+                            error=str(e) or repr(e),
+                            symbols_count=len(symbols),
+                        )
 
             # Log data availability for debugging
             bars_empty = [s for s, df in daily_bars.items() if df.empty]
