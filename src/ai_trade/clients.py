@@ -160,3 +160,15 @@ def get_account():
     """
     from ai_trade.utils import retry_api_call
     return retry_api_call(get_trading_client().get_account)
+
+
+def get_clock():
+    """Fetch the market clock (is_open, next_open, next_close).
+
+    Alpaca's clock is holiday-aware — `is_open` is False on weekends AND
+    market holidays (Memorial Day, July 4th, etc.).  The scheduler's
+    `day_of_week="mon-fri"` cron only filters weekends, so this is the
+    authoritative "should we be trading right now?" check.
+    """
+    from ai_trade.utils import retry_api_call
+    return retry_api_call(get_trading_client().get_clock)

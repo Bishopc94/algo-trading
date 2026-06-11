@@ -30,6 +30,10 @@ logger = get_logger(__name__)
 class VWAPStrategy(BaseStrategy):
     """Enter when price reclaims VWAP from below on elevated volume."""
 
+    # Tells the backtest engine to evaluate this strategy on per-15-min-bar
+    # boundaries (not just at EOD).  Without intraday bars it returns None.
+    is_intraday_only = True
+
     def evaluate(
         self,
         symbol: str,
@@ -70,8 +74,10 @@ class VWAPStrategy(BaseStrategy):
             self._reject(symbol, "dip_below_vwap", 0.0, 1.0, "above")
             return None
 
-        # Meaningfully above VWAP (not noise)
-        vwap_floor = vwap * 1.001
+        # Meaningfully above VWAP (not noise).  On cheap stocks, 0.1% of VWAP
+        # can be sub-tick ($2 * 0.001 = $0.002 < $0.01 min tick), so enforce
+        # a hard minimum of 1 tick so the filter isn't fooled by float noise.
+        vwap_floor = max(vwap * 1.001, vwap + 0.01)
         if close <= vwap_floor:
             self._reject(symbol, "close_above_vwap", close, vwap_floor, "above")
             return None
@@ -136,11 +142,23 @@ class VWAPStrategy(BaseStrategy):
             self._reject(symbol, "risk_reward", rr, 1.5, "above")
             return None
 
+        # Pullback-entry limit: wait for a retest of VWAP itself.  We
+        # just reclaimed VWAP from below, so the highest-probability
+        # pullback is right back to that line.  Place limit a hair above
+        # VWAP (within 1 tick of vwap_floor) so a clean retest fills.
+        limit_price = max(vwap + 0.01, vwap * 1.001)
+        if limit_price >= close:
+            # Already at/above the limit zone — just market entry.
+            limit_price = None
+        elif limit_price <= stop_loss:
+            limit_price = None
+
         logger.info(
             "vwap_signal",
             symbol=symbol,
             conviction=conviction,
             entry=entry_price,
+            limit=limit_price,
             stop=stop_loss,
             target=take_profit,
             vwap=vwap,
@@ -154,6 +172,7 @@ class VWAPStrategy(BaseStrategy):
             strategy_name="vwap",
             hold_type=HoldType.DAY,
             entry_price=entry_price,
+            limit_price=limit_price,
             stop_loss_price=stop_loss,
             take_profit_price=take_profit,
             metadata={

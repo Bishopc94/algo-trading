@@ -188,25 +188,41 @@ def create_scheduler(bot: TradingBot) -> BackgroundScheduler:
         name="Market open setup",
     )
 
-    # ── Job 3: Continuous scan & evaluate (every 15 min during market hours) ──
-    # Replaces the old fixed-time entry windows (9:35, 11:00, 12:00, 3:00).
-    # Scans for fresh candidates and evaluates all strategies every 15 minutes
-    # from 9:45 AM through 3:45 PM.  The algo decides when setups are
-    # worth entering — not the schedule.
+    # ── Job 3a: Full universe scan (every 15 min during market hours) ──
+    # Repopulates the candidate list.  Heavy: queries the whole tradeable
+    # universe for the screener filters (price, volume, relative-volume,
+    # gap %).  Doesn't run strategies — that's job 3b.
     #
     # Starts at 9:45 (15 min after open) to let opening volatility settle.
     # Stops at 3:45 to leave time for EOD close at 3:50.
     scan_interval = getattr(cfg, "scan_interval_minutes", 15)
     scheduler.add_job(
-        bot.job_scan_and_evaluate,
+        bot.job_full_scan,
         CronTrigger(
             hour="9-15",
             minute=f"*/{scan_interval}",
             day_of_week="mon-fri",
             timezone=ET,
         ),
-        id="scan_and_evaluate",
-        name=f"Scan & evaluate (every {scan_interval}min)",
+        id="full_scan",
+        name=f"Full universe scan (every {scan_interval}min)",
+    )
+
+    # ── Job 3b: Strategy evaluation (every 5 min during market hours) ──
+    # Lightweight: runs every strategy against the existing candidate
+    # list (no universe re-scan).  Catches setups within 5 min of when
+    # they actually print, instead of waiting for the next full scan.
+    eval_interval = getattr(cfg, "evaluate_interval_minutes", 5)
+    scheduler.add_job(
+        bot.job_evaluate,
+        CronTrigger(
+            hour="9-15",
+            minute=f"*/{eval_interval}",
+            day_of_week="mon-fri",
+            timezone=ET,
+        ),
+        id="evaluate",
+        name=f"Evaluate candidates (every {eval_interval}min)",
     )
 
     # ── Job 9: Options expiry management ──────────────────────
@@ -272,6 +288,19 @@ def create_scheduler(bot: TradingBot) -> BackgroundScheduler:
         ),
         id="trailing_stops",
         name="Advance trailing stops on open winners",
+    )
+
+    # ── Job 14b: Pending-entry management (every 5 min) ──────────
+    # Reviews unfilled LIMIT-entry bracket orders.  Decides per-order
+    # whether to keep waiting, chase at market, or cancel based on
+    # price drift and order age.  See main.py::job_manage_pending_entries.
+    scheduler.add_job(
+        bot.job_manage_pending_entries,
+        CronTrigger(
+            hour="9-15", minute="*/5", day_of_week="mon-fri", timezone=ET,
+        ),
+        id="pending_entries",
+        name="Review unfilled limit-entry orders",
     )
 
     # ── Job 13: Options position sync (every 5 min during market hours) ──

@@ -47,6 +47,7 @@ class MomentumStrategy(BaseStrategy):
         vol_spike: float = getattr(self.config, "volume_spike_multiplier", 1.5)
         atr_stop_mult: float = getattr(self.config, "atr_stop_multiplier", 1.5)
         atr_tp_mult: float = getattr(self.config, "atr_tp_multiplier", 3.5)
+        max_gap_pct: float = getattr(self.config, "max_gap_pct", 0.15)
 
         add_volume_profile(df)
         add_atr(df)
@@ -60,6 +61,7 @@ class MomentumStrategy(BaseStrategy):
         df["high_20"] = df["high"].rolling(breakout_lookback).max().shift(1)
 
         latest = df.iloc[-1]
+        prev = df.iloc[-2]
         close: float = latest["close"]
         high_20: float = latest["high_20"]
         rel_vol: float = latest["relative_volume"]
@@ -70,10 +72,30 @@ class MomentumStrategy(BaseStrategy):
         rsi_val: float = latest["rsi_14"]
         macd_hist: float = latest["macd_hist"]
 
-        # ── Hard filters (relaxed — conviction handles degree of strength) ──
+        # ── Hard filters ──
+
+        # Minimum ADR: stocks with < 0.5% average daily range have sub-cent
+        # ATR, which produces junk stops/targets that will be immediately
+        # stopped out by the bid-ask spread.  (EM had ADR=0.15%, ATR=$0.008.)
+        min_adr: float = getattr(self.config, "min_adr_pct", 1.0)
+        hard_adr_floor = 0.5
+        if adr_pct < hard_adr_floor:
+            self._reject(symbol, "min_adr_floor", adr_pct, hard_adr_floor, "above")
+            return None
+
         if close <= high_20:
             self._reject(symbol, "breakout", close, high_20, "above")
             return None
+
+        # Gap filter: reject if the entire "breakout" happened overnight (e.g.
+        # binary biotech news, earnings surprise in AH).  The move is already
+        # done — chasing a 15%+ gap rarely has intraday follow-through.
+        prev_close: float = float(prev["close"])
+        if prev_close > 0:
+            gap_pct = (close - prev_close) / prev_close
+            if gap_pct > max_gap_pct:
+                self._reject(symbol, "overnight_gap", round(gap_pct, 4), max_gap_pct, "below")
+                return None
         if rel_vol < vol_spike:
             self._reject(symbol, "rel_volume", rel_vol, vol_spike, "above")
             return None
@@ -180,6 +202,22 @@ class MomentumStrategy(BaseStrategy):
 
         hold_type = HoldType.DAY if conviction >= 0.9 else HoldType.SWING
 
+        # Pullback-entry limit price.  Breakout strategies fire AT the high
+        # of the move, so a market entry pays the highest available price.
+        # Place a LIMIT at the nearest meaningful support — EMA-20 if it's
+        # within 2% below close, otherwise close × 0.99.  The 2% cap stops
+        # us reaching for a far-away EMA-20 that won't get retested today.
+        # The entry-management job will chase at market if price walks
+        # away from this limit, so we don't strand setups.
+        max_pullback_pct = 0.02
+        ema_limit = ema_20 if 0 < (close - ema_20) / close <= max_pullback_pct else None
+        limit_price = ema_limit if ema_limit is not None else close * (1 - 0.01)
+        # Never set the limit above current close (would auto-fill on submit).
+        limit_price = min(limit_price, close * 0.999)
+        # Never set it below the stop (the trade would be pre-stopped).
+        if limit_price <= stop_loss:
+            limit_price = None  # support level is too deep — just market entry
+
         logger.info(
             "momentum_signal",
             symbol=symbol,
@@ -187,6 +225,7 @@ class MomentumStrategy(BaseStrategy):
             adr_pct=adr_pct,
             conviction=round(conviction, 3),
             entry=entry_price,
+            limit=limit_price,
             stop=stop_loss,
             target=take_profit,
             rsi=rsi_val,
@@ -204,6 +243,7 @@ class MomentumStrategy(BaseStrategy):
             strategy_name="momentum",
             hold_type=hold_type,
             entry_price=entry_price,
+            limit_price=limit_price,
             stop_loss_price=stop_loss,
             take_profit_price=take_profit,
             metadata={

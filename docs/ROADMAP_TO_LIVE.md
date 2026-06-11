@@ -57,7 +57,13 @@ If a change in this roadmap *lowers* the paper Sharpe but *raises* real-money ex
 
 ## Cross-cutting requirement: configurable day-trading (PDT)
 
-**This is a hard requirement that threads through every phase.** The US SEC/FINRA is in the process of changing the PDT rule — the proposed change lowers the minimum equity threshold from $25,000 to $2,000 and may eliminate the 5-business-day day-trade cap for accounts above that threshold. The effective date and Alpaca's implementation timeline are unknown as of writing.
+**This is a hard requirement that threads through every phase.**
+
+> **UPDATE 2026-05-26:** This is no longer "proposed" — it's confirmed and dated. **FINRA retired the PDT rule effective 2026-06-04**, replaced by an intraday-margin framework: the $25k minimum for 4x intraday buying power dropped to **$2,000**, the 3-trades/5-days designation is gone, and Alpaca enforces overextension via pre-trade margin checks + Intraday Margin Deficit (IMD) calls. Deprecated API fields (`pattern_day_trader`, `daytrade_count`, `last_daytrade_count`, `daytrading_buying_power`, `last_daytrading_buying_power`) return placeholders until full removal **2026-07-06**.
+>
+> **Implemented in v2.3.1:** `pdt.framework` config flag (`legacy` | `intraday_margin`); all `daytrade_count` reads guarded with `getattr`. Flip to `intraday_margin` on 2026-06-04. The original forward-compat design below is preserved for reference; the framework flag is the realized version of it.
+
+Original (pre-confirmation) note: The US SEC/FINRA is in the process of changing the PDT rule — the proposed change lowers the minimum equity threshold from $25,000 to $2,000 and may eliminate the 5-business-day day-trade cap for accounts above that threshold. The effective date and Alpaca's implementation timeline are unknown as of writing.
 
 ### What this means for the codebase
 
@@ -482,7 +488,7 @@ Phases 4, 5, 6 are post-live enhancements if time-constrained.
 ### Do not delete or significantly modify
 - [data/ai_trade.db](../data/ai_trade.db) — live trade history
 - [data/ml_training_universe.txt](../data/ml_training_universe.txt) — curated 283-symbol universe, regeneration is expensive
-- [src/ai_trade/models/signal_quality_v3.joblib](../src/ai_trade/models/signal_quality_v3.joblib) — v3 model; keep as fallback even when v4+ trains
+- [models/signal_quality_v3.joblib](../models/signal_quality_v3.joblib) — v3 model; keep as fallback even when v4+ trains
 - Anything under [logs/](../logs/) without confirming — evidence for debugging live issues
 
 ---

@@ -77,6 +77,36 @@ A **bracket order** is a set of three linked orders submitted simultaneously:
 
 When either the stop-loss or take-profit fills, the other is automatically canceled. This is also called an OCO (one-cancels-other) mechanism.
 
+### Entry routing: LIMIT vs MARKET (v2.3.0+)
+
+The entry leg of a bracket can be a **MARKET** order (fills immediately at the current ask) or a **LIMIT** order (only fills if price comes down to a specific level). Each strategy decides which to ask for:
+
+| Strategy | Entry routing | Limit price | Why |
+|---|---|---|---|
+| momentum | LIMIT (with fallback) | EMA-20 if within 2% below close, else close × 0.99 | Former resistance becomes new support — wait for the retest |
+| orb | LIMIT (with fallback) | OR high | Classic ORB retest of the broken level |
+| vwap | LIMIT (with fallback) | VWAP + 1 tick | Wait for the reclaim-then-retest pattern |
+| ema_crossover | LIMIT (with fallback) | Slow EMA if within 2%, else close × 0.99 | Slow EMA is the trend line price tends to test |
+| pullback | MARKET | — | Already buying the dip by design |
+| mean_reversion | MARKET | — | Already buying oversold by design |
+| macd_divergence | MARKET | — | Bar-by-bar setup — entry is a confirmation, not a level |
+| bb_squeeze | (disabled) | — | Disabled v2.3.0 pending entry-filter rework |
+
+**Pullback-entry safeguards:**
+- If the computed limit is at or below the stop, the strategy falls back to market entry (otherwise the trade would be pre-stopped).
+- Stop and target are re-anchored to the limit price, so the R:R ratio is preserved at the actual fill.
+
+**Adaptive management of unfilled limit orders** — every 5 minutes a job reviews pending entries and decides:
+
+| Situation | Action |
+|---|---|
+| Price drift ≥ +1.5% above limit (we're missing the move) | Cancel + re-submit as MARKET ("chase") |
+| Price drift ≤ −5% below limit (setup broke) | Cancel, mark `cancelled_breakdown` |
+| Order age ≥ 30 minutes, still unfilled | Cancel, mark `cancelled_stale` |
+| Otherwise (in zone, time left) | Wait, recheck next tick |
+
+This is the "let the algo decide cancel vs market" arm — it only chases when the setup is still intact and we're about to miss it.
+
 ---
 
 ## Stock Strategies

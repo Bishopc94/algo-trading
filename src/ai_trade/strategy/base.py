@@ -94,7 +94,18 @@ class Signal:
                           and position sizing.
         strategy_name:    Which strategy produced this signal (for logging).
         hold_type:        DAY, SWING, or ADAPTIVE.
-        entry_price:      Expected entry price (latest close).
+        entry_price:      Expected entry price (latest close).  Used as
+                          the reference price for the bracket's market
+                          entry; also used to compute "did price drift
+                          too far?" during entry management.
+        limit_price:      Optional limit price for the entry leg.  When
+                          set, the bracket order's entry becomes a LIMIT
+                          at this price instead of a market order — the
+                          strategy is asking the bot to wait for a dip
+                          to this level rather than entering at close.
+                          The entry-management job (every 5 min) decides
+                          whether to keep waiting, chase at market, or
+                          cancel the order based on price drift and age.
         stop_loss_price:  Server-side stop-loss price (bracket order).
         take_profit_price: Server-side take-profit price (bracket order).
         metadata:         Extra data for logging/debugging (RSI, ATR, etc.).
@@ -107,6 +118,7 @@ class Signal:
     entry_price: float
     stop_loss_price: float
     take_profit_price: float
+    limit_price: float | None = None  # None = market entry (legacy behavior)
     metadata: dict = field(default_factory=dict)
 
 

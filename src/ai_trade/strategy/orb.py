@@ -32,9 +32,20 @@ from ai_trade.strategy.base import BaseStrategy, HoldType, Signal
 
 logger = get_logger(__name__)
 
+# Wall-clock minutes per intraday bar — set in main.py's fetch.  ORB needs
+# to translate the human-readable opening_range_minutes config into a bar
+# count.  At 5-min bars, a 30-min opening range = 6 bars (much more
+# meaningful than the previous 2 bars at 15-min granularity).  The minimum
+# is still 2 bars so the "2 of last 3" trend filter has comparison room.
+_INTRADAY_BAR_MINUTES = 5
+
 
 class ORBStrategy(BaseStrategy):
     """Enter on opening range breakouts confirmed by volume and price action."""
+
+    # Tells the backtest engine to evaluate this strategy on per-15-min-bar
+    # boundaries (not just at EOD).  Without intraday bars it returns None.
+    is_intraday_only = True
 
     def evaluate(
         self,
@@ -49,9 +60,15 @@ class ORBStrategy(BaseStrategy):
         min_vol_ratio: float = getattr(self.config, "min_volume_ratio", 1.5)
         min_range_pct: float = getattr(self.config, "min_range_pct", 0.2) / 100.0
 
+        # Translate the human-readable opening_range_minutes config into a bar
+        # count given the current intraday timeframe.  At 15-min bars, a 30-min
+        # opening range becomes 2 bars; we floor at 2 so the trend-filter window
+        # stays meaningful.
+        opening_bars: int = max(2, opening_minutes // _INTRADAY_BAR_MINUTES)
+
         df = intraday_bars.copy()
 
-        if len(df) < opening_minutes + 1:
+        if len(df) < opening_bars + 1:
             return None
 
         # ATR needs at least 14 bars — use daily ATR as fallback
@@ -63,7 +80,7 @@ class ORBStrategy(BaseStrategy):
             return None
 
         # Define opening range
-        opening_range = df.iloc[:opening_minutes]
+        opening_range = df.iloc[:opening_bars]
         or_high: float = float(opening_range["high"].max())
         or_low: float = float(opening_range["low"].min())
         or_range = or_high - or_low
@@ -109,7 +126,7 @@ class ORBStrategy(BaseStrategy):
             return None
 
         # Trend forming: at least 2 of last 3 bars above OR high
-        post_or = df.iloc[opening_minutes:]
+        post_or = df.iloc[opening_bars:]
         if len(post_or) >= 3:
             recent_3 = post_or.iloc[-3:]
             bars_above = float((recent_3["close"] > or_high).sum())
@@ -165,6 +182,17 @@ class ORBStrategy(BaseStrategy):
             self._reject(symbol, "risk_reward", rr, 1.5, "above")
             return None
 
+        # Pullback-entry limit: classic ORB pullback to the breakout level.
+        # The OR high (just-broken resistance) becomes the natural new
+        # support; a retest is the highest-probability re-entry.  If we're
+        # already > 1% above OR high, the limit is just at OR high; if
+        # we're close, nudge it a hair above so a tiny touch fills.
+        limit_price = or_high
+        if close > or_high:
+            limit_price = min(or_high * 1.0005, close * 0.999)
+        if limit_price <= stop_loss:
+            limit_price = None
+
         logger.info(
             "orb_signal",
             symbol=symbol,
@@ -174,6 +202,7 @@ class ORBStrategy(BaseStrategy):
             vol_ratio=round(vol_ratio, 2),
             conviction=conviction,
             entry=entry_price,
+            limit=limit_price,
             stop=stop_loss,
             target=take_profit,
         )
@@ -185,6 +214,7 @@ class ORBStrategy(BaseStrategy):
             strategy_name="orb",
             hold_type=HoldType.DAY,
             entry_price=entry_price,
+            limit_price=limit_price,
             stop_loss_price=stop_loss,
             take_profit_price=take_profit,
             metadata={

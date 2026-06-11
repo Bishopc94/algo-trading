@@ -185,6 +185,20 @@ class EMACrossoverStrategy(BaseStrategy):
             self._reject(symbol, "risk_reward", rr, 2.0, "above")
             return None
 
+        # Pullback-entry limit: the slow EMA is the natural support that
+        # the new trend tends to retest after a fresh crossover.  Cap the
+        # pullback distance at 2% — if the slow EMA is further away, fall
+        # back to a 1% pullback from close so we don't reach for an EMA
+        # we won't see retested today.
+        max_pullback_pct = 0.02
+        if 0 < (entry_price - slow_ema) / entry_price <= max_pullback_pct:
+            limit_price = slow_ema
+        else:
+            limit_price = entry_price * (1 - 0.01)
+        limit_price = min(limit_price, entry_price * 0.999)
+        if limit_price <= stop_loss:
+            limit_price = None
+
         logger.info(
             "ema_crossover_signal",
             symbol=symbol,
@@ -195,6 +209,7 @@ class EMACrossoverStrategy(BaseStrategy):
             macd_hist=macd_hist,
             conviction=conviction,
             entry=entry_price,
+            limit=limit_price,
             stop=stop_loss,
             target=take_profit,
         )
@@ -206,6 +221,7 @@ class EMACrossoverStrategy(BaseStrategy):
             strategy_name="ema_crossover",
             hold_type=HoldType.SWING,
             entry_price=entry_price,
+            limit_price=limit_price,
             stop_loss_price=stop_loss,
             take_profit_price=take_profit,
             metadata={

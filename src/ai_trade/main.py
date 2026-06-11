@@ -46,11 +46,11 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import pandas as pd
-from alpaca.data.timeframe import TimeFrame
+from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 
 from ai_trade._version import __version__
 from ai_trade.config import load_config
-from ai_trade.clients import init_clients, get_trading_client, get_account
+from ai_trade.clients import init_clients, get_trading_client, get_account, get_clock
 from ai_trade.data.historical import fetch_bars_multi
 from ai_trade.data.indicators import add_all
 from ai_trade.monitoring.database import Database
@@ -285,6 +285,11 @@ class TradingBot:
         # ── State ──
         self._candidates: list[dict] = []          # Today's stock scanner candidates
         self._options_candidates: list[dict] = []  # Today's options-eligible candidates
+        # Set True while job_full_scan is rebuilding self._candidates so the
+        # 5-min job_evaluate skips that one tick rather than reading a torn list.
+        self._scan_in_progress: bool = False
+        # (timestamp, is_open) cache for the holiday-aware market clock check.
+        self._clock_cache: tuple | None = None
         self._running = False
         self._failed_symbols: dict[str, str] = {}  # symbol -> reason (untradable, halted, etc.)
         self._failed_symbol_counts: dict[str, int] = {}  # symbol -> consecutive fail count
@@ -328,7 +333,9 @@ class TradingBot:
             "connected",
             equity=float(account.equity),
             cash=float(account.cash),
-            day_trade_count=account.daytrade_count,
+            # getattr guard: daytrade_count is deprecated by Alpaca on
+            # 2026-06-04 (returns 0) and removed from the API on 2026-07-06.
+            day_trade_count=getattr(account, "daytrade_count", 0),
             paper=self.cfg.alpaca.paper,
         )
 
@@ -517,6 +524,9 @@ class TradingBot:
         evaluated by all strategies during the entry window.
         """
         now = datetime.now(ET)
+        if not self._is_trading_day():
+            log.info("job_skipped_market_closed", job="premarket_scan", date=now.date().isoformat())
+            return
         log.info("job_start", job="premarket_scan", time=now.strftime("%H:%M:%S"))
         print(con.section("Pre-market Scan"))
         # Reset daily blacklists — symbols halted yesterday may be tradable today
@@ -565,6 +575,10 @@ class TradingBot:
         whether it's safe to take new positions today.
         """
         now = datetime.now(ET)
+        if not self._is_trading_day():
+            log.info("job_skipped_market_closed", job="market_open", date=now.date().isoformat())
+            print(con.info("Market closed today (holiday/weekend) — standing down."))
+            return
         log.info("job_start", job="market_open")
         print(con.section("Market Open"))
         try:
@@ -664,6 +678,13 @@ class TradingBot:
         if now > market_end:
             return
 
+        # Holiday guard — the cron fires on market holidays (they're
+        # weekdays); Alpaca's clock knows better.
+        if not self._market_open():
+            log.info("job_skipped_market_closed", job="scan_and_evaluate", date=now.date().isoformat())
+            print(con.catchup("Market closed today (holiday/weekend) — skipping."))
+            return
+
         log.info("job_start", job="scan_and_evaluate", time=now.strftime("%H:%M"))
         print(con.section("Scan & Evaluate"))
 
@@ -681,6 +702,144 @@ class TradingBot:
             log.warning("scan_cycle_scan_failed", error=str(e))
             print(con.warning(f"Scan failed: {e} — evaluating existing candidates..."))
 
+        self._run_evaluation_cycle()
+
+    def _get_clock_cached(self):
+        """Return Alpaca's market clock, cached for 60s.
+
+        A burst of jobs firing on the same minute shouldn't make N identical
+        clock calls.  Returns None if the clock can't be fetched.
+        """
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc)
+        cached = getattr(self, "_clock_cache", None)
+        if cached is not None:
+            ts, clock = cached
+            if (now - ts).total_seconds() < 60:
+                return clock
+        try:
+            clock = get_clock()
+        except Exception as e:
+            log.warning("market_clock_fetch_failed", error=str(e))
+            clock = None
+        self._clock_cache = (now, clock)
+        return clock
+
+    def _market_open(self) -> bool:
+        """Is the market open *right now*? — for intraday jobs (9:45-15:45).
+
+        The scheduler's `day_of_week="mon-fri"` cron only filters weekends —
+        it fires on market holidays (Memorial Day, July 4th, etc.) because
+        those are weekdays.  Alpaca's clock knows the holiday calendar.
+
+        Fails closed: if the clock can't be fetched, returns False (skip
+        trading) rather than risk trading blind on an unknown day.
+        """
+        clock = self._get_clock_cached()
+        return bool(getattr(clock, "is_open", False)) if clock else False
+
+    def _is_trading_day(self) -> bool:
+        """Is today a trading day at all? — for pre-open jobs (9:00, 9:30).
+
+        `_market_open()` would return False before 9:30 even on a normal
+        trading day, so the pre-market and market-open jobs need this
+        instead: True if the market is open now, OR opens later today.
+        Holiday-aware via the clock's `next_open`.
+        """
+        clock = self._get_clock_cached()
+        if clock is None:
+            return False
+        if getattr(clock, "is_open", False):
+            return True
+        next_open = getattr(clock, "next_open", None)
+        if next_open is None:
+            return False
+        try:
+            return next_open.astimezone(ET).date() == datetime.now(ET).date()
+        except Exception:
+            return False
+
+    def job_full_scan(self) -> None:
+        """Every 15 min during market hours — refresh the candidate universe.
+
+        Decoupled from `job_evaluate` so the expensive full-universe scan
+        runs at a sustainable cadence while signal generation can poll
+        the existing candidates at a tighter cadence (every 5 min).  See
+        the v2.3.0 changelog for the rationale.
+
+        Bundles `sync_positions` as a safety net — the dedicated
+        position-sync job already runs every minute, but having a fresh
+        sync immediately before a new scan avoids any cross-job races
+        on candidate filtering.
+        """
+        now = datetime.now(ET)
+        market_start = now.replace(hour=9, minute=45, second=0, microsecond=0)
+        market_end = now.replace(hour=15, minute=45, second=0, microsecond=0)
+        if now < market_start or now > market_end:
+            return
+        if not self._market_open():
+            log.info("job_skipped_market_closed", job="full_scan", date=now.date().isoformat())
+            return
+
+        log.info("job_start", job="full_scan", time=now.strftime("%H:%M"))
+        print(con.section("Full Scan"))
+
+        try:
+            self.orders.sync_positions()
+        except Exception as e:
+            log.warning("scan_cycle_sync_failed", error=str(e))
+
+        self._scan_in_progress = True
+        try:
+            self.screener.invalidate_snapshot_cache()
+            counts = self._run_full_scan()
+            print(con.info(
+                f"Scan: {len(self._candidates)} candidates "
+                f"(momentum={counts['momentum']}, mr={counts['mean_reversion']}, "
+                f"vwap={counts['vwap']})"
+            ))
+        except Exception as e:
+            log.warning("scan_cycle_scan_failed", error=str(e))
+            print(con.warning(f"Scan failed: {e}"))
+        finally:
+            self._scan_in_progress = False
+
+    def job_evaluate(self) -> None:
+        """Every 5 min during market hours — evaluate existing candidates.
+
+        Lightweight signal-generation pass: re-runs every strategy on
+        the candidates produced by the most recent `job_full_scan`.  No
+        full-universe scan, no scanner work — just fetch the bars we
+        need, run strategies, rank, submit.
+
+        Skips if a scan is mid-flight (avoids torn read of
+        ``self._candidates``) or if the candidate list is empty (haven't
+        scanned yet today).
+        """
+        now = datetime.now(ET)
+        market_start = now.replace(hour=9, minute=45, second=0, microsecond=0)
+        market_end = now.replace(hour=15, minute=45, second=0, microsecond=0)
+        if now < market_start or now > market_end:
+            return
+        if not self._market_open():
+            log.info("job_skipped_market_closed", job="evaluate", date=now.date().isoformat())
+            return
+
+        if self._scan_in_progress:
+            log.debug("evaluate_skipped_scan_in_progress")
+            return
+
+        if not self._candidates:
+            log.debug("evaluate_skipped_no_candidates")
+            return
+
+        log.info(
+            "job_start",
+            job="evaluate",
+            time=now.strftime("%H:%M"),
+            candidates=len(self._candidates),
+        )
+        print(con.section("Evaluate"))
         self._run_evaluation_cycle()
 
     def job_options_expiry_check(self) -> None:
@@ -791,6 +950,8 @@ class TradingBot:
         """
         if not self.options_enabled:
             return
+        if not self._market_open():
+            return  # No 0DTE positions can exist when entries are holiday-gated.
         try:
             open_opts = self.db.get_open_options_trades()
             zero_dte_trades = [
@@ -941,7 +1102,12 @@ class TradingBot:
                 print(con.info(f"Closing {len(day_trades)} day trade(s): {', '.join(symbols)}"))
             else:
                 print(con.info("No open day trades to close."))
-            self.orders.close_all_day_trades(open_trades)
+            closed = self.orders.close_all_day_trades(open_trades)
+            for t in closed:
+                try:
+                    self.pdt.record_if_day_trade(t)
+                except Exception as e:
+                    log.debug("record_if_day_trade_failed", trade_id=t.get("id"), error=str(e))
         except Exception as e:
             log.error("eod_close_failed", error=str(e))
             print(con.error(f"EOD close FAILED: {e}"))
@@ -1044,6 +1210,53 @@ class TradingBot:
         except Exception:
             log.exception("eod_analysis_failed")
 
+        # Filter-effectiveness report (v2.3.5): summarize the close-call
+        # near-misses + execution funnel so the operator can spot a filter
+        # that's costing real trades.  Read-only / informational — no
+        # auto-tuning.  Runs once daily; weekly window default.
+        try:
+            days = getattr(self.cfg.analysis, "filter_report_days", 7)
+            report = self.db.filter_effectiveness_report(days=days)
+            funnel = report["funnel"]
+            log.info(
+                "filter_report_funnel",
+                days=days,
+                ml_predictions=funnel["ml_predictions"],
+                ranked=funnel["ranked"],
+                executed=funnel["executed"],
+                order_failed=funnel["order_failed"],
+            )
+            # Log the top 5 tightest near-miss clusters (most actionable).
+            sorted_strats = sorted(
+                report["per_strategy"],
+                key=lambda r: (r.get("avg_miss_pct") or 999),
+            )[:5]
+            for row in sorted_strats:
+                log.info(
+                    "filter_report_cluster",
+                    strategy=row["strategy"],
+                    filter=row["filter"],
+                    rejects=row["rejects"],
+                    near_misses=row["near_misses"],
+                    avg_miss_pct=row["avg_miss_pct"],
+                    tightest_pct=row["tightest_pct"],
+                    examples=row["tightest_examples"],
+                )
+        except Exception:
+            log.exception("filter_report_failed")
+
+        # Prune old high-volume decision rows so the DB doesn't balloon.
+        # reject/near_miss are ~99% of the table and nothing automated reads
+        # them — keep a window for ad-hoc debugging, drop the rest.  The
+        # meaningful audit rows (execute/rank/exit/review) are never pruned.
+        try:
+            retention = getattr(self.cfg.analysis, "decision_retention_days", 14)
+            deleted = self.db.prune_old_decisions(reject_retention_days=retention)
+            if deleted:
+                log.info("decisions_pruned", deleted=deleted, retention_days=retention)
+        except Exception:
+            log.exception("decision_prune_failed")
+
     def job_sync_positions(self) -> None:
         """Every 60 seconds — Reconcile Alpaca positions with local DB.
 
@@ -1056,10 +1269,189 @@ class TradingBot:
             closed = summary.get("closed_trades", []) if summary else []
             for t in closed:
                 self._log_stock_trade_exit(t)
+                # Record a day-trade row only if entry and exit fell on the
+                # same ET calendar day — the FINRA definition.  Recording
+                # at entry based on hold_type over-counted and froze the
+                # PDT budget for trades that carried overnight.
+                try:
+                    self.pdt.record_if_day_trade(t)
+                except Exception as e:
+                    log.debug("record_if_day_trade_failed", trade_id=t.get("trade_id"), error=str(e))
+                # Backfill the ML prediction's actual_outcome so the
+                # nightly trainer can score predicted vs realized.  Match
+                # by (symbol, strategy) on the most recent unresolved row.
+                try:
+                    pnl = t.get("pnl")
+                    if pnl is not None:
+                        self.db.backfill_ml_prediction_outcome(
+                            symbol=t.get("symbol", ""),
+                            strategy=t.get("strategy", ""),
+                            actual_outcome="win" if pnl > 0 else "loss",
+                        )
+                except Exception as e:
+                    log.debug(
+                        "ml_outcome_backfill_failed",
+                        trade_id=t.get("trade_id"), error=str(e),
+                    )
             if closed:
                 self.decisions.flush()
         except Exception as e:
             log.warning("sync_failed", error=str(e))
+
+    def job_manage_pending_entries(self) -> None:
+        """Every 5 minutes — review unfilled limit-entry orders.
+
+        Queries **Alpaca's open orders directly** (not the DB) so an order
+        that desynced from our trade rows still gets managed — that gap is
+        exactly how two limit entries once sat unfilled for days, reserving
+        all the buying power.  For each unfilled BUY-LIMIT bracket entry:
+
+          * Price ran more than 1.5% ABOVE our limit (we're missing it and
+            the setup is still valid) → cancel + resubmit market ("chase").
+          * Price fell more than 5% BELOW our limit (setup broke) → cancel.
+          * Order age > 30 minutes, unfilled → cancel ("stale").
+          * Otherwise → leave open, recheck next cycle.
+
+        Cancelling the parent bracket auto-cancels its stop/target legs, so
+        cancelled entries free their reserved buying power immediately.
+        """
+        if not self._market_open():
+            return  # No fills/chases possible on a holiday or weekend.
+        try:
+            from alpaca.trading.enums import (
+                OrderClass, OrderSide, TimeInForce, QueryOrderStatus,
+            )
+            from alpaca.trading.requests import (
+                MarketOrderRequest, StopLossRequest, TakeProfitRequest,
+                GetOrdersRequest,
+            )
+            from ai_trade.data.historical import fetch_snapshots
+            from datetime import datetime, timezone
+
+            now = datetime.now(timezone.utc)
+
+            # Pull ALL open orders from Alpaca.  The unfilled limit entries
+            # we care about are buy-side LIMIT parents (order_class bracket).
+            orders = self.orders._client.get_orders(
+                filter=GetOrdersRequest(status=QueryOrderStatus.OPEN, limit=200)
+            )
+            entries = [
+                o for o in orders
+                if o.side == OrderSide.BUY
+                and str(getattr(o, "order_type", "")).lower().endswith("limit")
+                and o.limit_price is not None
+            ]
+            if not entries:
+                return
+
+            symbols = sorted({o.symbol for o in entries if o.symbol})
+            snaps = fetch_snapshots(symbols)
+
+            for order in entries:
+                sym = order.symbol
+                limit_price = float(order.limit_price or 0)
+                if limit_price <= 0:
+                    continue
+
+                snap = snaps.get(sym)
+                cur = None
+                if snap and getattr(snap, "latest_trade", None):
+                    cur = float(snap.latest_trade.price)
+                elif snap and getattr(snap, "daily_bar", None):
+                    cur = float(snap.daily_bar.close)
+                if cur is None or cur <= 0:
+                    continue
+
+                submitted = getattr(order, "submitted_at", None) or getattr(order, "created_at", None)
+                age_min = 0.0
+                if submitted is not None:
+                    try:
+                        age_min = (now - submitted).total_seconds() / 60.0
+                    except Exception:
+                        age_min = 0.0
+
+                drift = (cur - limit_price) / limit_price  # positive = price ran up
+
+                action = None
+                if drift >= 0.015:
+                    action = "chase_market"
+                elif drift <= -0.05:
+                    action = "cancel_breakdown"
+                elif age_min >= 30:
+                    action = "cancel_stale"
+                if action is None:
+                    continue
+
+                # Find the matching DB row (if any) so we can keep it in sync.
+                db_row = None
+                for t in (self.db.get_open_trades() or []):
+                    if str(t.get("buy_order_id")) == str(order.id):
+                        db_row = t
+                        break
+
+                try:
+                    self.orders._client.cancel_order_by_id(order.id)
+                except Exception as e:
+                    log.debug("entry_cancel_failed", symbol=sym, error=str(e))
+                    continue
+
+                if action == "chase_market":
+                    # Re-arm a MARKET bracket anchored to current price,
+                    # preserving the original stop/target percentages.
+                    qty = int(float(order.qty or 0))
+                    stop_pct = target_pct = 0.0
+                    if db_row:
+                        sl = float(db_row.get("stop_loss") or 0)
+                        tp = float(db_row.get("take_profit") or 0)
+                        if sl > 0 and tp > 0:
+                            stop_pct = (limit_price - sl) / limit_price
+                            target_pct = (tp - limit_price) / limit_price
+                    # Fallback to default 3% stop / 6% target if no DB levels.
+                    if stop_pct <= 0 or target_pct <= 0:
+                        stop_pct, target_pct = 0.03, 0.06
+                    new_stop = round(cur * (1 - stop_pct), 2)
+                    new_target = round(cur * (1 + target_pct), 2)
+                    # Preserve dollar risk: re-size shares to the new stop distance.
+                    new_risk = cur - new_stop
+                    if db_row and new_risk > 0:
+                        orig_risk = limit_price - float(db_row.get("stop_loss") or 0)
+                        if orig_risk > 0 and qty > 0:
+                            qty = max(1, int((qty * orig_risk) / new_risk))
+                    if qty <= 0:
+                        continue
+                    try:
+                        market_req = MarketOrderRequest(
+                            symbol=sym, qty=qty, side=OrderSide.BUY,
+                            time_in_force=TimeInForce.DAY,
+                            order_class=OrderClass.BRACKET,
+                            stop_loss=StopLossRequest(stop_price=new_stop),
+                            take_profit=TakeProfitRequest(limit_price=new_target),
+                        )
+                        new_order = self.orders._client.submit_order(order_data=market_req)
+                        if db_row:
+                            self.db.update_trade(
+                                db_row["trade_id"], buy_order_id=str(new_order.id),
+                                entry_price=cur, stop_loss=new_stop,
+                                take_profit=new_target, shares=qty,
+                                stop_method=(db_row.get("stop_method") or "") + "_chased",
+                            )
+                        log.info("entry_chased_to_market", symbol=sym,
+                                 limit=limit_price, current=cur, qty=qty,
+                                 new_stop=new_stop, new_target=new_target)
+                    except Exception as e:
+                        log.warning("entry_chase_submit_failed", symbol=sym, error=str(e))
+                        if db_row:
+                            self.db.update_trade(db_row["trade_id"], status="cancelled_chase_failed")
+                else:
+                    reason = "breakdown" if action == "cancel_breakdown" else "stale"
+                    if db_row:
+                        self.db.update_trade(db_row["trade_id"], status=f"cancelled_{reason}")
+                    log.info("entry_cancelled", symbol=sym, reason=reason,
+                             limit=limit_price, current=cur,
+                             drift_pct=round(drift * 100, 2), age_min=round(age_min, 1),
+                             in_db=db_row is not None)
+        except Exception as e:
+            log.warning("manage_pending_entries_failed", error=str(e))
 
     def job_update_trailing_stops(self) -> None:
         """Every 5 minutes — advance stop-losses on open winners.
@@ -1070,6 +1462,8 @@ class TradingBot:
           3. Ask ExitPlanner.compute_trailing_stop_long for a tighter stop
           4. Replace the Alpaca stop-loss leg if the proposal improves it
         """
+        if not self._market_open():
+            return  # Prices don't move on a holiday — nothing to trail.
         try:
             from ai_trade.data.historical import fetch_snapshots
             from ai_trade.strategy.exit_planner import compute_trailing_stop_long
@@ -1483,10 +1877,43 @@ class TradingBot:
             try:
                 account = get_account()
                 equity = float(account.equity)
-                cash = float(account.cash)
+                # Size against buying_power, not cash.  `cash` is the settled
+                # balance and does NOT subtract holds for unfilled orders;
+                # `buying_power` does.  With limit-entry orders sitting open
+                # (v2.3.0), `cash` over-states what we can actually deploy —
+                # using it caused "insufficient funds" rejections when the
+                # bot tried to size a new trade against cash already reserved
+                # by a pending limit bracket.  min() guards against a margin
+                # account reporting buying_power > cash.
+                cash_balance = float(account.cash)
+                buying_power = float(getattr(account, "buying_power", cash_balance) or cash_balance)
+                cash = min(cash_balance, buying_power)
             except Exception as e:
                 log.error("account_fetch_failed_during_eval", error=str(e))
                 print(con.error(f"Could not fetch account info — {e}. Skipping evaluation."))
+                return
+
+            # Gate: deployable-funds floor.  On a cash account, proceeds
+            # from a same-day sale are unsettled (T+1) and excluded from
+            # buying_power.  Submitting against them gets rejected by Alpaca
+            # as "insufficient buying power" / "PDT protection" — which is
+            # exactly the spam (325 + 169 rejections) seen in the logs.
+            # If there isn't enough settled buying power to fund even a
+            # minimum position, skip new entries this cycle instead of
+            # firing orders we know will bounce.
+            min_deployable = getattr(self.cfg.account, "min_deployable_cash", 50.0)
+            if cash < min_deployable:
+                log.info(
+                    "evaluate_skipped_low_buying_power",
+                    buying_power=round(cash, 2),
+                    cash_balance=round(cash_balance, 2),
+                    min_required=min_deployable,
+                    note="likely unsettled funds on a cash account",
+                )
+                print(con.detail(
+                    f"Skipping entries — only ${cash:,.2f} settled buying power "
+                    f"(cash ${cash_balance:,.2f}, rest unsettled/reserved)."
+                ))
                 return
 
             try:
@@ -1517,7 +1944,16 @@ class TradingBot:
             if len(self._failed_symbols) > 0:
                 log.info("blacklisted_symbols_filtered", blacklisted=list(self._failed_symbols.keys()))
             end = datetime.now(ET)
-            start = end - timedelta(days=60)
+            # 60 calendar days only resolves to ~42 trading days, but every swing
+            # strategy (mean_reversion, momentum, ema_crossover, bb_squeeze,
+            # macd_divergence, pullback) has a `len(df) < 52: return None` first
+            # guard added in v1.2.0 (commit caf5e046, 2026-04-03).  At 60 days
+            # those strategies silently dropped every candidate without emitting
+            # a rejection — only ORB and VWAP (which read intraday bars) survived.
+            # 120 calendar days resolves to ~84 trading days, well above 52, and
+            # also seeds EMA-50 / longer indicators properly before the lookback
+            # window starts.
+            start = end - timedelta(days=120)
 
             # V2 Phase 13: Parallel data fetching — daily bars, intraday bars, and
             # news are independent data sources. Fetch them concurrently to cut the
@@ -1529,13 +1965,21 @@ class TradingBot:
             news_sentiment: dict = {}
 
             with self._cycle_timer.phase("fetch"):
-                intraday_start = end - timedelta(hours=2)
+                # Intraday timeframe is 5-min so ORB's opening range gets a
+                # proper 6-bar lookback (30-min OR / 5-min bars = 6 bars,
+                # vs 2 bars at 15-min — far less noisy level computation)
+                # and VWAP's dip-detection gets finer granularity for the
+                # reclaim setup.  Window: 8 hours = ~96 five-minute bars,
+                # comfortably above the 14 needed for ATR-14 and the
+                # 11 needed for VWAP lookback.
+                intraday_tf = TimeFrame(5, TimeFrameUnit.Minute)
+                intraday_start = end - timedelta(hours=8)
 
                 def _fetch_daily():
                     return fetch_bars_multi(symbols, TimeFrame.Day, start, end)
 
                 def _fetch_intraday():
-                    return fetch_bars_multi(symbols, TimeFrame.Minute, intraday_start, end)
+                    return fetch_bars_multi(symbols, intraday_tf, intraday_start, end)
 
                 def _fetch_news():
                     return self.news_scanner.scan_symbols(symbols)
@@ -1801,10 +2245,14 @@ class TradingBot:
         sig = item["signal"]
         shares = item["shares"]
 
-        # Apply market regime modifier to conviction
+        # Keep the strategy-level conviction intact in sig so submit_bracket_order
+        # stores it in the trades table.  All post-strategy modifiers (regime,
+        # news, econ, momentum) accumulate into a local `conviction` variable
+        # used only for gating and logging — not written back to the signal.
         original_conviction = sig.conviction
+        conviction = sig.conviction
         if ctx:
-            sig.conviction = min(1.0, sig.conviction * ctx.conviction_modifier)
+            conviction = min(1.0, conviction * ctx.conviction_modifier)
             shares = max(1, int(shares * ctx.position_size_modifier))
 
         # V2 Phase 11: Earnings proximity guard — block entries near earnings
@@ -1822,14 +2270,14 @@ class TradingBot:
                 self.db.update_signal_action(sig.symbol, sig.strategy_name, "blocked_earnings")
                 self.decisions.log_reject(
                     sig.symbol, sig.strategy_name, reason,
-                    conviction=sig.conviction,
+                    conviction=conviction,
                     factors={"earnings_status": ns.earnings_status},
                 )
                 return
 
         # Apply news sentiment modifier to conviction
         if ns:
-            sig.conviction = min(1.0, sig.conviction * ns.conviction_modifier)
+            conviction = min(1.0, conviction * ns.conviction_modifier)
             block_threshold = getattr(self.cfg.sentiment, "block_on_bearish_news", -0.5)
             if ns.net_score < block_threshold and not ns.catalyst_detected:
                 log.info(
@@ -1843,14 +2291,14 @@ class TradingBot:
                 self.decisions.log_reject(
                     sig.symbol, sig.strategy_name,
                     f"blocked by bearish news (score={ns.net_score:+.2f}): {ns.top_headline[:60]}",
-                    conviction=sig.conviction,
+                    conviction=conviction,
                     factors={"news_score": ns.net_score},
                 )
                 return
 
         # V2 Phase 11: Economic calendar conviction reduction
         if econ_modifier < 1.0:
-            sig.conviction = min(1.0, sig.conviction * econ_modifier)
+            conviction = min(1.0, conviction * econ_modifier)
 
         # V2 Phase 12: Momentum prediction modifier
         if momentum_scores:
@@ -1858,33 +2306,33 @@ class TradingBot:
             if ms:
                 mm = momentum_conviction_modifier(ms)
                 if mm != 1.0:
-                    sig.conviction = min(1.0, sig.conviction * mm)
+                    conviction = min(1.0, conviction * mm)
 
         # Final conviction gate after all modifiers
         min_post_mod = getattr(self.cfg.sentiment, "min_conviction_after_mods", 0.50)
-        if sig.conviction < min_post_mod:
+        if conviction < min_post_mod:
             log.info(
                 "trade_below_min_conviction",
                 symbol=sig.symbol,
-                conviction=sig.conviction,
+                conviction=conviction,
                 original=original_conviction,
             )
-            print(con.skip(f"{sig.symbol}: conviction too low after modifiers ({original_conviction:.2f} -> {sig.conviction:.2f})"))
+            print(con.skip(f"{sig.symbol}: conviction too low after modifiers ({original_conviction:.2f} -> {conviction:.2f})"))
             self.db.update_signal_action(sig.symbol, sig.strategy_name, "rejected_low_conviction")
             self.decisions.log_reject(
                 sig.symbol, sig.strategy_name,
-                f"conviction too low after modifiers: {original_conviction:.2f} -> {sig.conviction:.2f} (min={min_post_mod})",
-                conviction=sig.conviction,
+                f"conviction too low after modifiers: {original_conviction:.2f} -> {conviction:.2f} (min={min_post_mod})",
+                conviction=conviction,
                 factors={"original_conviction": original_conviction, "min_required": min_post_mod},
             )
             return
 
         # Email alert for high-conviction signals (>= 0.70)
-        if sig.conviction >= 0.70:
+        if conviction >= 0.70:
             notify_high_conviction_signal(
                 symbol=sig.symbol,
                 strategy=sig.strategy_name,
-                conviction=sig.conviction,
+                conviction=conviction,
                 hold_type=sig.hold_type.value,
                 entry_price=sig.entry_price,
                 stop_loss=sig.stop_loss_price,
@@ -1897,7 +2345,7 @@ class TradingBot:
                 "dry_run_stock_signal",
                 symbol=sig.symbol,
                 strategy=sig.strategy_name,
-                conviction=sig.conviction,
+                conviction=conviction,
                 original_conviction=original_conviction,
                 hold_type=sig.hold_type.value,
                 shares=shares,
@@ -1915,19 +2363,30 @@ class TradingBot:
             self.decisions.log_reject(
                 sig.symbol, sig.strategy_name,
                 f"symbol blacklisted: {self._failed_symbols[sig.symbol]}",
-                conviction=sig.conviction,
+                conviction=conviction,
             )
             return
 
         # Pre-check: verify PDT budget before submitting
         if self.pdt.would_be_day_trade(sig.hold_type) and not self.pdt.can_day_trade():
-            log.info("order_skipped_pdt_exhausted", symbol=sig.symbol)
+            used = self.pdt.get_day_trades_used()
+            in_flight = self.pdt.in_flight_day_trades()
+            max_dt = self.cfg.pdt.max_day_trades
+            log.info(
+                "order_skipped_pdt_exhausted",
+                symbol=sig.symbol, used=used, in_flight=in_flight, max=max_dt,
+            )
             print(con.skip(f"{sig.symbol}: PDT slots exhausted, skipping day trade."))
             self.decisions.log_reject(
                 sig.symbol, sig.strategy_name,
-                f"PDT slots exhausted ({self.pdt.get_day_trades_used()}/{self.cfg.pdt.max_day_trades} used)",
-                conviction=sig.conviction,
-                factors={"hold_type": sig.hold_type.value, "pdt_used": self.pdt.get_day_trades_used()},
+                f"PDT slots exhausted (used={used} in_flight={in_flight} max={max_dt})",
+                conviction=conviction,
+                factors={
+                    "hold_type": sig.hold_type.value,
+                    "pdt_used": used,
+                    "pdt_in_flight": in_flight,
+                    "pdt_max": max_dt,
+                },
             )
             return
 
@@ -1938,13 +2397,15 @@ class TradingBot:
             cost = shares * sig.entry_price
             risk_amount = shares * abs(sig.entry_price - sig.stop_loss_price)
             self.decisions.log_execute(
-                sig.symbol, sig.strategy_name, sig.conviction,
+                sig.symbol, sig.strategy_name, conviction,
                 reasoning=f"{shares} shares @ ${sig.entry_price:.2f} = ${cost:.2f}, risk=${risk_amount:.2f}, order={order_id}",
                 factors={
                     "shares": shares, "entry": sig.entry_price, "cost": cost,
                     "risk_amount": risk_amount, "order_id": str(order_id),
                     "hold_type": sig.hold_type.value,
                     "stop": sig.stop_loss_price, "target": sig.take_profit_price,
+                    "original_conviction": round(original_conviction, 4),
+                    "final_conviction": round(conviction, 4),
                 },
             )
             # V2 Phase 5: snapshot the feature vector for ML training.
@@ -1974,34 +2435,61 @@ class TradingBot:
                 stop_loss=sig.stop_loss_price,
                 take_profit=sig.take_profit_price,
                 hold_type=sig.hold_type.value,
-                conviction=sig.conviction,
+                conviction=conviction,
                 order_id=order_id,
                 cost=cost,
             )
-            if self.pdt.would_be_day_trade(sig.hold_type):
-                today = datetime.now(ET).strftime("%Y-%m-%d")
-                self.pdt.record_day_trade(sig.symbol, today, buy_order_id=str(order_id))
+            # NOTE: day-trade recording happens at EXIT time via
+            # pdt.record_if_day_trade() in the close paths (job_sync_positions
+            # and job_eod_close_day_trades).  Recording at entry based on the
+            # signal's intended hold_type over-counts whenever a day-typed
+            # trade gets held overnight, which silently froze the PDT budget.
         else:
+            err_type = self.orders.pop_order_error(sig.symbol)
             self.db.update_signal_action(sig.symbol, sig.strategy_name, "order_failed")
             log.warning(
                 "stock_order_failed",
                 symbol=sig.symbol,
                 strategy=sig.strategy_name,
                 shares=shares,
+                error_type=err_type,
+            )
+            self.decisions.log_reject(
+                sig.symbol, sig.strategy_name,
+                f"order_failed ({err_type or 'unknown'}): {shares} shares",
+                conviction=conviction,
+                factors={"error_type": err_type, "shares": shares},
             )
             print(con.order_failed(sig.symbol, sig.strategy_name, shares))
+            # Human-readable reason for the email so the inbox isn't a
+            # pile of cryptic "order rejected" notes during the run.
+            _reason_for_email = {
+                "account_pdt": "Pattern Day Trade protection (Alpaca blocked entry)",
+                "account_funds": "Insufficient buying power",
+                "account_forbidden": "Account restriction (403) — check Alpaca dashboard",
+                "account_rate_limit": "Rate limited by Alpaca",
+                "symbol_invalid": "Symbol not found or not tradeable",
+                "symbol_halted": "Trading halt / suspended",
+                "network": "Network error reaching Alpaca",
+                "unknown": "Unknown error (see log)",
+            }.get(err_type or "unknown", "Unknown error (see log)")
             notify_stock_order_failed(
                 symbol=sig.symbol,
                 strategy=sig.strategy_name,
                 shares=shares,
+                reason=_reason_for_email,
             )
-            # Track consecutive failures — blacklist after 2 failures to avoid
-            # retrying halted/untradable symbols every 15-minute cycle.
-            count = self._failed_symbol_counts.get(sig.symbol, 0) + 1
-            self._failed_symbol_counts[sig.symbol] = count
-            if count >= 2:
-                self._failed_symbols[sig.symbol] = "repeated_order_failure"
-                log.info("symbol_blacklisted", symbol=sig.symbol, failures=count)
+            # Blacklist only for symbol-specific errors (halted, invalid).
+            # Account-level errors (PDT, insufficient funds, rate limit,
+            # network) are not the symbol's fault — don't blacklist it.
+            _account_errors = {"account_pdt", "account_funds", "account_forbidden",
+                               "account_rate_limit", "network"}
+            if err_type not in _account_errors:
+                count = self._failed_symbol_counts.get(sig.symbol, 0) + 1
+                self._failed_symbol_counts[sig.symbol] = count
+                if count >= 2:
+                    self._failed_symbols[sig.symbol] = f"repeated_{err_type or 'order_failure'}"
+                    log.info("symbol_blacklisted", symbol=sig.symbol, failures=count, reason=err_type)
 
     # ══════════════════════════════════════════════════════════
     # Core Logic: Options evaluation pipeline
@@ -2091,10 +2579,16 @@ class TradingBot:
                 log.info("options_all_candidates_held")
                 return
 
-            # Fetch daily bars for all candidates
+            # Fetch daily bars for all candidates.  120 days resolves to
+            # ~84 trading days — well above the 52-bar minimum that 8 of 9
+            # options strategies guard with `len(df) < 52: return None`.
+            # The previous 60-day window resolved to ~42 trading days,
+            # which made every non-ZeroDTE strategy silently return None
+            # without ever reaching its filter logic (same silent-skip bug
+            # that was fixed on the stock-evaluate path in v2.1.x).
             symbols = [c["symbol"] for c in candidates]
             end = datetime.now(ET)
-            start = end - timedelta(days=60)
+            start = end - timedelta(days=120)
 
             daily_bars = fetch_bars_multi(symbols, TimeFrame.Day, start, end)
             for sym, df in list(daily_bars.items()):

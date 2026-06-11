@@ -31,10 +31,16 @@ KEY DESIGN DECISIONS:
 # annotation is never evaluated at runtime — it stays as a string.
 from __future__ import annotations
 
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
+from zoneinfo import ZoneInfo
 
 from ai_trade.monitoring.logger import get_logger
 from ai_trade.strategy.base import HoldType
+
+# PDT is an ET-based calendar rule. Entry/exit dates must be compared in
+# ET, not UTC — a trade entered 16:05 ET and exited 00:30 UTC the next day
+# is the same ET day (and therefore a round-trip day trade).
+ET = ZoneInfo("America/New_York")
 
 # Create a module-level logger.  In Python, __name__ evaluates to the
 # fully-qualified module path (e.g. "ai_trade.risk.pdt_manager"), which
@@ -70,13 +76,28 @@ class PDTManager:
         # across bot restarts.
         self._database = database
 
+        # Regulatory framework.  FINRA retired the PDT rule on 2026-06-04,
+        # replacing the 3-trades/5-days designation with an intraday margin
+        # model (Intraday Buying Power + pre-trade margin checks).  Under
+        # "intraday_margin" the day-trade COUNT limit no longer exists, so
+        # this manager stops gating on it and defers entirely to Alpaca's
+        # pre-trade checks + our buying_power-based sizing.  Default stays
+        # "legacy" until the operator flips it on/after the cutover date.
+        self._framework: str = getattr(config, "framework", "legacy")
+
         # Alpaca's server-side PDT count — synced at startup and before trades.
         # This is the authoritative count; our local DB is a backup.
+        # NOTE: deprecated by Alpaca 2026-06-04, fully removed 2026-07-06 —
+        # reads are guarded with getattr() so a missing field can't crash us.
         self._alpaca_daytrade_count: int | None = None
 
         # Track the last mismatch pair so we only warn when it changes —
         # otherwise a stale local row spams a warning every sync cycle.
         self._last_mismatch_pair: tuple[int, int] | None = None
+
+    def framework_is_legacy(self) -> bool:
+        """True while the old PDT count rule is in force (pre-2026-06-04)."""
+        return self._framework == "legacy"
 
     # ------------------------------------------------------------------
     # Public API
@@ -90,10 +111,17 @@ class PDTManager:
         stale.  Alpaca's count is authoritative — if it's higher than
         ours, we trust Alpaca.
         """
+        # Under the intraday-margin framework there is no day-trade count to
+        # sync — the field is a deprecated placeholder (always 0) and the
+        # count limit no longer exists.  Skip the sync entirely.
+        if not self.framework_is_legacy():
+            self._alpaca_daytrade_count = 0
+            return
         try:
             from ai_trade.clients import get_account
             account = get_account()
-            self._alpaca_daytrade_count = int(account.daytrade_count)
+            # getattr guard: field is removed from the API after 2026-07-06.
+            self._alpaca_daytrade_count = int(getattr(account, "daytrade_count", 0) or 0)
             local_count = self._get_local_day_trades_used()
             if self._alpaca_daytrade_count != local_count:
                 pair = (self._alpaca_daytrade_count, local_count)
@@ -135,35 +163,78 @@ class PDTManager:
 
     def _get_local_day_trades_used(self) -> int:
         """Count day trades recorded in our local DB in the last 5 business days."""
-        cutoff = self._five_business_days_ago()
+        cutoff = self._rolling_window_start()
         trades = self._database.get_day_trades_since(cutoff.isoformat())
         return len(trades)
+
+    def in_flight_day_trades(self) -> int:
+        """Count open positions that will round-trip into day trades today.
+
+        Day trades are recorded at EXIT time (see ``record_if_day_trade``),
+        so positions opened earlier in the same session don't yet appear
+        in the historical count.  The PDT gate has to add this number on
+        top of the historical count or the bot will oversubscribe within
+        a single trading day.
+
+        We count only positions where:
+          * status is open
+          * entry_time falls on today's ET date
+          * hold_type is DAY or ADAPTIVE (would_be_day_trade)
+        """
+        try:
+            open_trades = self._database.get_open_trades()
+        except Exception:
+            return 0
+        today_et = datetime.now(ET).date()
+        count = 0
+        for t in open_trades:
+            hold = (t.get("hold_type") or "").lower()
+            if hold not in ("day", "adaptive"):
+                continue
+            entry_time = t.get("entry_time")
+            if not entry_time:
+                continue
+            try:
+                entry_et = datetime.fromisoformat(entry_time).astimezone(ET)
+            except (TypeError, ValueError):
+                continue
+            if entry_et.date() == today_et:
+                count += 1
+        return count
 
     def can_day_trade(self) -> bool:
         """Return ``True`` if we still have budget (respecting reserve).
 
-        The check is:  used_trades < max_day_trades - reserve
+        The check is:  (used + in_flight) < max_day_trades - reserve
 
-        For example, with max=3 and reserve=1:
-            - 0 used → 0 < 2 → True  (can trade)
-            - 1 used → 1 < 2 → True  (can trade)
-            - 2 used → 2 < 2 → False (budget exhausted)
+        ``used`` counts completed round-trips in the rolling 5-day window;
+        ``in_flight`` counts open day-mode positions opened today that
+        will become day trades when the EOD close-out fires.  Without
+        ``in_flight`` we'd allow the gate to issue 4 same-day day-mode
+        entries before the first one closed and the count caught up.
 
-        PYTHON PATTERN — getattr with default:
-            `getattr(obj, "attr_name", default)` safely reads an attribute
-            from an object, returning `default` if the attribute doesn't
-            exist.  This avoids AttributeError if the config doesn't have
-            that field.
+        Example with max=3, reserve=0:
+            - 0 used, 0 in-flight → 0 < 3 → True  (can trade)
+            - 0 used, 2 in-flight → 2 < 3 → True  (can trade)
+            - 0 used, 3 in-flight → 3 < 3 → False (slots booked)
+
+        Under the intraday-margin framework (post-2026-06-04) there is no
+        day-trade count limit — Alpaca's pre-trade margin checks and our
+        buying_power sizing are the only constraints — so this always
+        returns True and lets those layers do the gating.
         """
+        if not self.framework_is_legacy():
+            return True
         max_trades: int = getattr(self.config, "max_day_trades", 3)
         reserve: int = getattr(self.config, "day_trade_reserve", 1)
         used = self.get_day_trades_used()
-        allowed = used < max_trades - reserve
+        in_flight = self.in_flight_day_trades()
+        allowed = (used + in_flight) < max_trades - reserve
 
-        # Structured logging: key=value pairs make logs easy to filter/parse.
         logger.debug(
             "pdt_check",
             used=used,
+            in_flight=in_flight,
             max=max_trades,
             reserve=reserve,
             allowed=allowed,
@@ -171,18 +242,17 @@ class PDTManager:
         return allowed
 
     def day_trades_remaining(self) -> int:
-        """How many day trades we could still make (ignoring reserve).
+        """How many day trades we could still make right now (ignores reserve).
 
-        This is the raw count without the safety reserve subtracted.
-        Useful for display/reporting purposes.
-
-        PYTHON PATTERN — max(0, ...):
-            Clamps the result to a minimum of 0 so we never return a
-            negative number, even if the database somehow has more trades
-            than the configured maximum.
+        Subtracts both completed round-trips in the rolling window and
+        open same-day day-mode positions that will become day trades on
+        close.  Useful for display and operator reporting.
         """
         max_trades: int = getattr(self.config, "max_day_trades", 3)
-        return max(0, max_trades - self.get_day_trades_used())
+        return max(
+            0,
+            max_trades - self.get_day_trades_used() - self.in_flight_day_trades(),
+        )
 
     def record_day_trade(
         self,
@@ -215,6 +285,69 @@ class PDTManager:
             remaining=self.day_trades_remaining(),
         )
 
+    def record_if_day_trade(self, trade: dict) -> bool:
+        """Record a day-trade row iff the trade round-tripped within a
+        single ET calendar day.
+
+        This is the EXIT-TIME hook: called after a trade transitions to
+        ``status='closed'``.  We compare ``entry_time`` and ``exit_time``
+        (both stored as UTC ISO strings) in Eastern Time and only record
+        when they fall on the same ET date.
+
+        Previously the bot recorded day trades at ENTRY time based on the
+        signal's intended ``hold_type``.  That over-counted whenever a
+        day-typed trade got held overnight (e.g. late-session fill that
+        couldn't close before 16:00 ET) and silently froze the PDT
+        budget on subsequent days.  Recording at exit is the only way
+        to match FINRA's same-day-round-trip definition.
+
+        Idempotent: skips if a matching ``(symbol, trade_date,
+        buy_order_id)`` row already exists.
+
+        Returns ``True`` if a new row was written.
+        """
+        entry_time = trade.get("entry_time")
+        exit_time = trade.get("exit_time")
+        if not entry_time or not exit_time:
+            return False
+        try:
+            entry_et = datetime.fromisoformat(entry_time).astimezone(ET)
+            exit_et = datetime.fromisoformat(exit_time).astimezone(ET)
+        except (TypeError, ValueError):
+            logger.debug(
+                "record_if_day_trade_parse_failed",
+                entry_time=entry_time,
+                exit_time=exit_time,
+            )
+            return False
+        if entry_et.date() != exit_et.date():
+            return False
+
+        trade_date = entry_et.date().isoformat()
+        symbol = trade.get("symbol") or ""
+        buy_order_id = str(trade.get("buy_order_id") or "")
+        sell_order_id = str(trade.get("sell_order_id") or "")
+
+        # Idempotency — scan the rolling window for a pre-existing row
+        # matching this trade.  Reconcile jobs may fire twice on the same
+        # close; without this guard we would double-count.
+        existing = self._database.get_day_trades_since(trade_date)
+        for row in existing:
+            if (
+                row.get("symbol") == symbol
+                and row.get("trade_date") == trade_date
+                and (not buy_order_id or row.get("buy_order_id") == buy_order_id)
+            ):
+                return False
+
+        self.record_day_trade(
+            symbol=symbol,
+            trade_date=trade_date,
+            buy_order_id=buy_order_id,
+            sell_order_id=sell_order_id,
+        )
+        return True
+
     @staticmethod
     def would_be_day_trade(hold_type: HoldType) -> bool:
         """Return ``True`` if the hold type implies a same-day round trip.
@@ -238,29 +371,28 @@ class PDTManager:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _five_business_days_ago() -> date:
-        """Return the date 5 business days before today, skipping weekends.
+    def _rolling_window_start() -> date:
+        """Return the earliest date in the rolling 5-business-day window.
 
-        We walk backwards from today one calendar day at a time.  Each
-        time we land on a weekday (Monday–Friday), we increment our
-        business-day counter.  Once we've counted 5 weekdays, we return
-        that date.
+        FINRA's window is "5 rolling business days" — that's TODAY plus
+        the 4 most-recent prior weekdays.  Example with today = Fri 5/1:
+        the window is {Mon 4/27, Tue 4/28, Wed 4/29, Thu 4/30, Fri 5/1}.
+        The cutoff (earliest in-window date) is Mon 4/27.
 
-        NOTE: This does NOT account for market holidays (e.g. Christmas,
-        MLK Day).  For a small-account PDT tracker, this is conservative
-        — we may count a slightly wider window than necessary, which is
-        the safer direction (over-counting day trades, not under-counting).
+        Previously this walked back 5 weekdays, returning Fri 4/24 — that
+        gave a 6-business-day window and silently held trades from one
+        week ago in the count.  Holiday-aware? No (e.g. MLK Day still
+        counts as a business day here); that's the conservative direction.
 
         PYTHON DETAIL — date.weekday():
             Returns 0 for Monday, 1 for Tuesday, ... 4 for Friday,
-            5 for Saturday, 6 for Sunday.  So `weekday() < 5` means
-            Monday through Friday.
+            5 for Saturday, 6 for Sunday.  `weekday() < 5` means Mon-Fri.
         """
         today = date.today()
         biz_days = 0
         cursor = today
-        while biz_days < 5:
-            cursor -= timedelta(days=1)  # Move one calendar day backward
-            if cursor.weekday() < 5:     # Mon=0 ... Fri=4 are business days
+        while biz_days < 4:
+            cursor -= timedelta(days=1)
+            if cursor.weekday() < 5:
                 biz_days += 1
         return cursor

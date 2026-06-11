@@ -125,6 +125,7 @@ from ai_trade.ml.features import extract_features
 from ai_trade.monitoring.logger import get_logger
 from ai_trade.sentiment.market_regime import MarketRegimeAnalyzer, MarketContext
 from ai_trade.strategy.base import BaseStrategy, HoldType, Signal
+from ai_trade.strategy.exit_planner import compute_trailing_stop_long
 from ai_trade.strategy.options.base import BaseOptionsStrategy, OptionsSignal
 
 # get_logger(__name__) creates a structured logger tagged with this module's path.
@@ -163,6 +164,8 @@ class BacktestPosition:
     hold_type: HoldType       # DAY or SWING (affects PDT counting and EOD close)
     strategy_name: str        # Which strategy generated this position
     highest_price: float = 0.0  # Highest price seen since entry (for trailing stop)
+    atr: float = 0.0          # ATR at entry — fed to the live trailing-stop planner
+    conviction: float = 0.70  # Signal conviction — scales breakeven/chandelier width
 
     def __post_init__(self):
         # Set the trailing stop baseline to entry price.  As the stock rises,
@@ -285,8 +288,64 @@ class BacktestConfig:
     options_loss_limit_pct: float = 2.0   # Close options when loss = 2x entry cost
     options_slippage_pct: float = 0.003  # 0.3% options slippage (wider than stock 0.1%)
 
+    # Strategy-weighter integration.  When set (with .enabled=True), the engine
+    # re-runs the same self-correcting weight calculation that live uses, so
+    # losing strategies get throttled instead of running at full conviction
+    # for the entire backtest window.  Pass cfg.strategy_weighting from the
+    # runner; leave None to disable (legacy backtest behavior).
+    strategy_weighting: object | None = None
+
+    # Min effective conviction post-weight.  In live, this is enforced via
+    # sentiment.min_conviction_after_mods.  We keep the same gate here so the
+    # weighter can drive losing strategies below the threshold and silence them.
+    min_conviction_after_weight: float = 0.40
+
 
 # ── Core engine ────────────────────────────────────────────
+
+
+class _BacktestDBAdapter:
+    """In-memory shim that exposes the parts of Database the weighter needs.
+
+    The live ``StrategyWeighter`` reads closed trades from the DB and
+    persists weights back via the same connection.  In a backtest, the
+    closed trades live in ``BacktestEngine._trades`` (list of dataclasses).
+    This adapter wraps that list and translates the calls into the shape
+    the weighter expects, so we can reuse the live class without touching
+    its DB-dependent code path.
+    """
+
+    def __init__(self, engine, engine_state: dict) -> None:
+        # Hold a reference to the engine, not the trades list directly —
+        # the engine's _reset() rebinds self._trades to a fresh list, which
+        # would orphan a held list reference.
+        self._engine = engine
+        self._state = engine_state
+
+    def get_all_trades(self) -> list[dict]:
+        # The weighter filters status=='closed' and pnl is not None — emulate
+        # that shape from the BacktestTrade dataclasses.
+        out = []
+        for t in self._engine._trades:
+            out.append({
+                "strategy": t.strategy,
+                "status": "closed",
+                "pnl": t.pnl,
+                "entry_date": t.entry_date,
+            })
+        return out
+
+    def get_strategy_weights(self) -> list[dict]:
+        return []  # never restore; weights are computed fresh each backtest
+
+    def upsert_strategy_weight(self, strategy_name: str, **kwargs) -> None:
+        pass  # no persistence in backtest
+
+    def get_state(self, key: str, default=None):
+        return self._state.get(key, default)
+
+    def set_state(self, key: str, value) -> None:
+        self._state[key] = value
 
 
 class BacktestEngine:
@@ -325,6 +384,23 @@ class BacktestEngine:
         self._cash: float = 0.0
         self._positions: list[BacktestPosition] = []          # Open stock positions
         self._trades: list[BacktestTrade] = []                # Closed stock trades
+
+        # ---- Adaptive strategy weighter ----
+        # Mirrors the live aggregator's behavior: as trades close, recompute
+        # per-strategy weights and apply them to fresh signals' convictions
+        # before ranking.  Without this the backtest runs every strategy at
+        # full weight forever, masking the self-correction that live applies.
+        self._weighter_state: dict = {}
+        self._weighter = None
+        wcfg = getattr(self.cfg, "strategy_weighting", None)
+        if wcfg is not None and getattr(wcfg, "enabled", True):
+            try:
+                from ai_trade.strategy.weighter import StrategyWeighter
+                adapter = _BacktestDBAdapter(self, self._weighter_state)
+                self._weighter = StrategyWeighter(adapter, wcfg)
+            except Exception:
+                log.exception("backtest_weighter_init_failed")
+                self._weighter = None
         self._options_positions: list[OptionsBacktestPosition] = []  # Open options positions
         self._options_trades: list[OptionsBacktestTrade] = []  # Closed options trades
         self._snapshots: list[DailySnapshot] = []             # End-of-day equity snapshots
@@ -348,6 +424,7 @@ class BacktestEngine:
         start_date: str | None = None,
         end_date: str | None = None,
         market_bars: dict[str, pd.DataFrame] | None = None,
+        intraday_bars: dict[str, pd.DataFrame] | None = None,
     ) -> BacktestResults:
         """Run the backtest simulation over a date range.
 
@@ -373,6 +450,12 @@ class BacktestEngine:
             BacktestResults with all trades, snapshots, and computed metrics.
         """
         self._reset()
+
+        # Stash intraday bars (15-min) so vwap/orb can see them in
+        # _evaluate_entries.  Indexed by symbol; values are DataFrames
+        # keyed by an intraday DatetimeIndex.  We slice per-day at
+        # evaluation time.  May be None or empty (legacy daily-only).
+        self._intraday_bars = intraday_bars or {}
 
         # ---- Step 1: Enrich bars with technical indicators ----
         # Strategies need indicators like RSI, Bollinger Bands, ATR, etc.
@@ -760,6 +843,12 @@ class BacktestEngine:
         if self._market_context and not self._market_context.allow_new_longs:
             pass  # Bear regime: don't open new long positions
         else:
+            # 3a. Per-bar intraday evaluation for vwap/orb.  Walks today's
+            # 15-min bars and fires signals as they form, with immediate
+            # same-day fills at the triggering bar's close.  No-op when no
+            # intraday data is available.
+            self._evaluate_intraday_strategies(date_str, bars_dict)
+
             self._evaluate_entries(date_str, bars_dict)
 
             # 3b. Evaluate options strategies for new entries
@@ -836,13 +925,30 @@ class BacktestEngine:
             else:
                 # ---- Trailing stop update ----
                 # If the stock made a new high, update the tracking variable.
-                # Then compute the trailing stop level and ratchet the stop_loss UP
-                # (it never moves down -- "trailing" means it only follows price upward).
                 if bar["high"] > pos.highest_price:
                     pos.highest_price = bar["high"]
-                trailing_stop = pos.highest_price * (1 - self.cfg.trailing_stop_pct)
-                if trailing_stop > pos.stop_loss:
-                    pos.stop_loss = trailing_stop  # Tighten the stop (ratchet up)
+
+                # Use the SAME planner as live (exit_planner.compute_trailing_stop_long):
+                # conviction-aware breakeven + ATR chandelier + the profit-tier
+                # ratchet.  This keeps the backtest faithful to live exit behavior
+                # so features like the ratchet are actually measurable here.
+                # Falls back to the simple % chandelier if ATR is unknown.
+                atr = pos.atr if pos.atr > 0 else pos.entry_price * 0.02
+                new_stop, _mode = compute_trailing_stop_long(
+                    entry_price=pos.entry_price,
+                    current_price=bar["close"],
+                    current_stop=pos.stop_loss,
+                    atr=atr,
+                    high_since_entry=pos.highest_price,
+                    conviction=pos.conviction,
+                )
+                if new_stop is not None and new_stop > pos.stop_loss:
+                    pos.stop_loss = new_stop
+                else:
+                    # Fallback simple % chandelier (only ratchets up).
+                    trailing_stop = pos.highest_price * (1 - self.cfg.trailing_stop_pct)
+                    if trailing_stop > pos.stop_loss:
+                        pos.stop_loss = trailing_stop
 
                 # ---- Strategy-generated exit signal ----
                 # Ask the originating strategy if its own indicators say "exit."
@@ -945,6 +1051,8 @@ class BacktestEngine:
                     take_profit=new_target,
                     hold_type=sig.hold_type,
                     strategy_name=sig.strategy_name,
+                    atr=float((sig.metadata or {}).get("atr", 0.0) or 0.0),
+                    conviction=float(getattr(sig, "conviction", 0.70) or 0.70),
                 )
             )
 
@@ -968,6 +1076,179 @@ class BacktestEngine:
             )
 
         self._pending_stock_orders = carried
+
+    def _evaluate_intraday_strategies(
+        self,
+        date_str: str,
+        bars_dict: dict[str, pd.DataFrame],
+    ) -> None:
+        """Per-bar evaluation of intraday-only strategies (vwap, orb).
+
+        Walks today's 15-min bars from earliest to latest.  At each bar
+        boundary (after the first 30 minutes — needed for ORB's opening
+        range), each intraday-only strategy is evaluated on the cumulative
+        slice of today's intraday bars + all prior daily bars.  When a
+        signal fires, the position opens immediately at that bar's close
+        + slippage; this is the simulated mid-day fill.
+
+        Limitations of this implementation (worth knowing for the audit):
+          * Stop/take-profit hits are still detected against the next
+            day's daily HIGH/LOW (existing _check_exits flow), which over-
+            counts hits that happened pre-entry.  For ORB/VWAP setups
+            entries usually come early-to-mid session and the day's
+            extreme tends to follow the entry, so the bias is small.
+          * Per-symbol "first signal wins" — only one intraday entry per
+            symbol per day (matches live: positions block subsequent
+            signals on the same name).
+        """
+        if not self._intraday_bars:
+            return
+
+        intraday_strategies = [
+            s for s in self.strategies
+            if getattr(s, "is_intraday_only", False) and s.enabled
+        ]
+        if not intraday_strategies:
+            return
+
+        today = pd.Timestamp(date_str).date()
+
+        # Build per-symbol day slices once up front.
+        per_symbol_today: dict[str, pd.DataFrame] = {}
+        for sym, sym_intraday in self._intraday_bars.items():
+            if sym_intraday is None or sym_intraday.empty:
+                continue
+            try:
+                day_slice = sym_intraday[sym_intraday.index.date == today]
+            except Exception:
+                continue
+            if not day_slice.empty:
+                per_symbol_today[sym] = day_slice
+        if not per_symbol_today:
+            return
+
+        # Decision boundaries: take the union of all bar timestamps across
+        # symbols today, sorted, and skip the first 2 (need ≥ 30 min for
+        # ORB's opening range).  Evaluating on every bar a symbol has
+        # ensures we don't miss sparse-volume tickers.
+        all_ts = sorted({ts for df in per_symbol_today.values() for ts in df.index})
+        if len(all_ts) < 3:
+            return
+        decision_points = all_ts[2:]  # skip first two 15-min bars
+
+        # Track which symbols have already entered intraday today, so we
+        # don't fire vwap then orb back-to-back on the same name.
+        entered_today: set[str] = set()
+
+        for boundary_ts in decision_points:
+            # Position-limit / heat checks at each boundary.
+            if len(self._positions) >= self.cfg.max_open_positions:
+                return
+            current_eq = self._equity(date_str, bars_dict)
+            if current_eq <= 0:
+                return
+            total_heat = sum(
+                abs(p.entry_price - p.stop_loss) * p.shares
+                for p in self._positions
+            )
+            if (total_heat / current_eq) > self.cfg.max_portfolio_heat_pct:
+                return
+
+            for symbol, day_slice in per_symbol_today.items():
+                if symbol in entered_today:
+                    continue
+                if any(p.symbol == symbol for p in self._positions):
+                    entered_today.add(symbol)
+                    continue
+
+                # Cumulative intraday slice up to and including this boundary.
+                cumulative = day_slice[day_slice.index <= boundary_ts]
+                if len(cumulative) < 2:
+                    continue
+
+                # Daily context for indicators that need history (ATR fallback).
+                daily_to_date = self._bars_up_to(symbol, date_str, bars_dict)
+                if daily_to_date is None or len(daily_to_date) < 20:
+                    continue
+
+                for strategy in intraday_strategies:
+                    try:
+                        sig = strategy.evaluate(symbol, daily_to_date, cumulative)
+                    except Exception:
+                        continue
+                    if sig is None:
+                        continue
+
+                    # Apply weighter, then floor.
+                    if self._weighter is not None:
+                        try:
+                            self._weighter.maybe_recalculate()
+                        except Exception:
+                            pass
+                        w = self._weighter.get_weight(sig.strategy_name)
+                        if w != 1.0:
+                            sig.conviction = max(0.0, min(1.0, sig.conviction * w))
+                        if sig.conviction < self.cfg.min_conviction_after_weight:
+                            continue
+
+                    # Apply market regime modifier (matches live + daily path).
+                    if self._market_context:
+                        sig.conviction = min(
+                            1.0,
+                            sig.conviction * self._market_context.conviction_modifier,
+                        )
+
+                    shares = self._size_position(sig, current_eq)
+                    if shares <= 0:
+                        continue
+
+                    # Immediate same-day fill at this bar's close.
+                    bar_close = float(cumulative.iloc[-1]["close"])
+                    slippage = bar_close * self.cfg.slippage_pct
+                    fill_price = bar_close + slippage
+
+                    cost = shares * fill_price
+                    if cost > self._cash:
+                        shares = math.floor(self._cash / fill_price)
+                        if shares <= 0:
+                            continue
+                        cost = shares * fill_price
+
+                    # Re-scale stop/target proportionally to the actual fill.
+                    original_risk = sig.entry_price - sig.stop_loss_price
+                    original_reward = sig.take_profit_price - sig.entry_price
+                    if sig.entry_price > 0 and original_risk > 0:
+                        risk_pct = original_risk / sig.entry_price
+                        reward_pct = original_reward / sig.entry_price
+                        new_stop = fill_price * (1 - risk_pct)
+                        new_target = fill_price * (1 + reward_pct)
+                    else:
+                        new_stop = sig.stop_loss_price
+                        new_target = sig.take_profit_price
+
+                    self._cash -= cost
+                    self._positions.append(
+                        BacktestPosition(
+                            symbol=symbol,
+                            shares=shares,
+                            entry_price=fill_price,
+                            entry_date=date_str,
+                            stop_loss=new_stop,
+                            take_profit=new_target,
+                            hold_type=sig.hold_type,
+                            strategy_name=sig.strategy_name,
+                            atr=float((sig.metadata or {}).get("atr", 0.0) or 0.0),
+                            conviction=float(getattr(sig, "conviction", 0.70) or 0.70),
+                        )
+                    )
+                    entered_today.add(symbol)
+                    self._equity_cache.clear()
+                    log.debug(
+                        "backtest_intraday_entry",
+                        symbol=symbol, strategy=sig.strategy_name,
+                        bar=str(boundary_ts), price=fill_price, shares=shares,
+                    )
+                    break  # one strategy per symbol per bar
 
     def _evaluate_entries(self, date_str: str, bars_dict: dict[str, pd.DataFrame]) -> None:
         """Run all strategies on all symbols and enter new positions for qualifying signals.
@@ -1012,9 +1293,14 @@ class BacktestEngine:
             if any(p.symbol == symbol for p in self._positions):
                 continue
 
-            # Ask each enabled strategy to evaluate this symbol
+            # Ask each enabled strategy to evaluate this symbol.
+            # Intraday-only strategies (vwap, orb) are handled separately
+            # in _evaluate_intraday_strategies — skip them here to avoid
+            # double-firing.
             for strategy in self.strategies:
                 if not strategy.enabled:
+                    continue
+                if getattr(strategy, "is_intraday_only", False):
                     continue
                 try:
                     sig = strategy.evaluate(symbol, bars_to_date)
@@ -1022,6 +1308,32 @@ class BacktestEngine:
                         signals.append(sig)
                 except Exception:
                     continue  # Skip failed evaluations (bad data, indicator errors)
+
+        if not signals:
+            return
+
+        # ---- Strategy weighter: throttle losers, amplify winners ----
+        # Mirrors the live aggregator path: recompute weights based on the
+        # trades closed so far, then multiply each signal's conviction by
+        # its strategy weight.  Weights start at 1.0 and only adjust after
+        # burn_in_trades closures per strategy, so early-window backtest
+        # behavior matches old (unweighted) results.
+        if self._weighter is not None:
+            try:
+                self._weighter.maybe_recalculate()
+            except Exception:
+                log.debug("weighter_recalc_in_backtest_failed", exc_info=True)
+            weighted = []
+            for sig in signals:
+                w = self._weighter.get_weight(sig.strategy_name)
+                if w != 1.0:
+                    sig.conviction = max(0.0, min(1.0, sig.conviction * w))
+                # Drop signals whose weighted conviction falls below the
+                # post-modifier floor — same gate live applies.
+                if sig.conviction < self.cfg.min_conviction_after_weight:
+                    continue
+                weighted.append(sig)
+            signals = weighted
 
         if not signals:
             return

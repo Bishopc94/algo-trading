@@ -2,16 +2,39 @@ alpaca:
   paper: true
 
 account:
-  starting_capital: 500.0
-  max_position_pct: 0.25            # Reduced from 0.30 — tighter for $500 account
-  max_risk_per_trade_pct: 0.02
-  daily_loss_limit_pct: 0.05
-  max_open_positions: 5
+  starting_capital: 5000.0           # 2026-05-01: bumped from 500 for the
+                                     # 1-month paper run before going live.
+  max_position_pct: 0.20             # Tighter at the larger size: $1000 max
+                                     # per position on $5000 (was 0.25 on $500
+                                     # = $125 max). Keeps single-name blast
+                                     # radius reasonable.
+  max_risk_per_trade_pct: 0.05       # 2% risk = $100 per trade @ $5000
+  daily_loss_limit_pct: 0.05         # 5% halt = $250 loss
+  max_open_positions: 8
+  min_deployable_cash: 50.0          # v2.3.1: skip new entries when settled
+                                     # buying power is below this.  Paper
+                                     # account is a CASH account (multiplier 1):
+                                     # same-day sale proceeds are unsettled
+                                     # (T+1) and can't be re-deployed — trying
+                                     # to anyway gets rejected by Alpaca.  This
+                                     # gate stops the bot spamming orders it
+                                     # can't fund.
 
 pdt:
+  # Regulatory framework. FINRA retired the PDT rule on 2026-06-04, replacing
+  # the 3-day-trades/5-days designation with an intraday-margin model.
+  #   legacy           — pre-2026-06-04: enforce the day-trade count limit below.
+  #   intraday_margin  — post-2026-06-04: no count limit; defer to Alpaca's
+  #                      pre-trade margin checks + buying_power sizing.
+  # Flipped 2026-06-05 — FINRA Rule 4210 amendment + Alpaca implementation
+  # went live 2026-06-04.  PDT designation retired; Alpaca enforces via
+  # pre-trade margin checks + Intraday Margin Deficit (IMD) calls.  The
+  # local PDT manager now no-ops and defers entirely to buying_power
+  # sizing + Alpaca's checks.
+  framework: intraday_margin
   max_day_trades: 3
-  day_trade_reserve: 1
-  min_conviction_for_day_trade: 0.75  # Reduced from 0.80 — let more day signals through
+  day_trade_reserve: 0
+  min_conviction_for_day_trade: 0.70
   # V2 Phase 8: SmartPDTPlanner applies a dynamic nudge on top of this
   # floor based on day-of-week (Mon stingy, Fri loose), slots remaining
   # (last slot raises the bar), and recent day-trade win rate.  It also
@@ -52,6 +75,7 @@ strategies:
     atr_tp_multiplier: 3.5
     hold_type: adaptive
     min_adr_pct: 1.0                # V2: Reduced from 2.0 — now a conviction factor, not hard gate
+    max_gap_pct: 0.15               # Skip if stock gapped >15% overnight (move already done)
 
   vwap:
     enabled: true
@@ -78,7 +102,12 @@ strategies:
     hold_type: swing
 
   bb_squeeze:
-    enabled: true
+    enabled: false                  # 2026-05-05: disabled.  Backtest showed
+                                    # 22% WR over 18 trades, -$497 P&L (80% of
+                                    # total losses on 4% of trades).  Re-enable
+                                    # only after the entry filters are reworked
+                                    # — squeeze breakouts are firing on the
+                                    # wrong side of the move at this size.
     squeeze_lookback: 5
     min_relative_volume: 1.0        # V2: Reduced from 1.5 — vol is now conviction factor
     atr_tp_multiplier: 3.5
@@ -239,7 +268,12 @@ risk:
 schedule:
   premarket_scan: "09:00"
   market_open: "09:30"
-  scan_interval_minutes: 15
+  scan_interval_minutes: 15          # v2.3.0: full-universe scan cadence
+                                     # (was 10).  Decoupled from signal
+                                     # evaluation — see evaluate_interval_minutes.
+  evaluate_interval_minutes: 5       # v2.3.0: per-candidate strategy
+                                     # evaluation cadence.  Catches signals
+                                     # within 5 min of when they print.
   options_expiry_check: "15:30"
   eod_close_day_trades: "15:50"
   eod_review: "16:05"
@@ -247,4 +281,16 @@ schedule:
   ml_training: "17:00"             # V2 Phase 5: retrain signal-quality classifier
 
 analysis:
-  apply_parameter_changes: false   # V2 Phase 6: set true to let optimizer write parameter_overrides
+  apply_parameter_changes: true   # V2 Phase 6: set true to let optimizer write parameter_overrides
+  decision_retention_days: 14     # v2.3.4: prune reject/near_miss decision rows
+                                  # older than this in the EOD analysis job.
+                                  # ~99% of the decisions table is reject/near_miss
+                                  # that nothing automated reads; this caps DB
+                                  # growth (~25-34k rows/day) while keeping a
+                                  # recent window for ad-hoc debugging. The
+                                  # meaningful audit rows (execute/rank/exit) are
+                                  # never pruned.
+  filter_report_days: 7           # v2.3.5: filter-effectiveness report window.
+                                  # Daily EOD job logs the tightest near-miss
+                                  # clusters + the signal funnel so a chronically
+                                  # tight threshold is visible. Read-only.

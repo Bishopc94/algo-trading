@@ -237,7 +237,7 @@ def run_backtest(
     # TimeFrame.Day means we're using daily bars (one OHLCV row per trading day).
     # For backtesting, daily resolution is standard -- intraday (minute/hour)
     # bars would be needed for high-frequency strategy testing.
-    from alpaca.data.timeframe import TimeFrame
+    from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 
     # datetime.strptime parses a date string into a datetime object.
     # .replace(tzinfo=ET) attaches the Eastern timezone (required by the API).
@@ -256,6 +256,29 @@ def run_backtest(
 
     loaded = {sym: df for sym, df in bars_dict.items() if not df.empty}
     print(f"  Loaded data for {len(loaded)}/{len(symbols)} symbols")
+
+    # ---------- Fetch 15-min intraday bars for vwap/orb ----------
+    # ORB and VWAP are intraday-bar strategies; with daily-only data they
+    # silently produce zero signals.  For long backtest windows the data
+    # volume gets large (~6.5k bars/symbol/year), so we fetch on a smaller
+    # universe — the symbols that actually loaded daily data — and pass
+    # the result through to the engine.  Failure here is non-fatal: if
+    # intraday data isn't available, vwap/orb just stay quiet as before.
+    intraday_bars: dict[str, any] = {}
+    intraday_tf = TimeFrame(15, TimeFrameUnit.Minute)
+    intraday_symbols = list(loaded.keys())
+    if intraday_symbols:
+        print(f"  Fetching 15-min intraday bars for {len(intraday_symbols)} symbols (vwap/orb)...")
+        for i in range(0, len(intraday_symbols), BATCH_SIZE):
+            batch = intraday_symbols[i : i + BATCH_SIZE]
+            try:
+                batch_intra = fetch_bars_multi(batch, intraday_tf, start_dt, end_dt)
+                intraday_bars.update(batch_intra)
+            except Exception as e:
+                print(f"  Warning: intraday fetch failed for batch {i // BATCH_SIZE + 1}: {e}")
+                break
+        intraday_loaded = sum(1 for df in intraday_bars.values() if df is not None and not df.empty)
+        print(f"  Intraday loaded for {intraday_loaded}/{len(intraday_symbols)} symbols")
 
     if not loaded:
         print("  No data available. Check your date range and symbols.")
@@ -328,6 +351,13 @@ def run_backtest(
         max_day_trades=cfg.pdt.max_day_trades,
         day_trade_reserve=cfg.pdt.day_trade_reserve,
         min_conviction_for_day_trade=cfg.pdt.min_conviction_for_day_trade,
+        # Pass the strategy_weighting block so the engine can run the same
+        # adaptive weighter that live uses.  Without this, losing strategies
+        # never get throttled and the backtest understates real performance.
+        strategy_weighting=getattr(cfg, "strategy_weighting", None),
+        min_conviction_after_weight=getattr(
+            cfg.sentiment, "min_conviction_after_mods", 0.40
+        ),
     )
 
     # Overlay options-specific config if options mode is enabled
@@ -367,7 +397,13 @@ def run_backtest(
     print(f"\n  Running backtest ({label})...\n")
 
     engine = BacktestEngine(strategies, bt_config, options_strategies=options_strategies)
-    results = engine.run(loaded, start_date=start, end_date=end, market_bars=market_bars)
+    results = engine.run(
+        loaded,
+        start_date=start,
+        end_date=end,
+        market_bars=market_bars,
+        intraday_bars=intraday_bars or None,
+    )
 
     # ---------- Output results ----------
     results.print_summary()

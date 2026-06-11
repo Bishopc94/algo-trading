@@ -48,13 +48,16 @@ from requests.exceptions import ConnectTimeout, ReadTimeout
 
 # Alpaca SDK imports for interacting with the brokerage.
 from alpaca.trading.client import TradingClient
-from alpaca.trading.enums import OrderClass, OrderSide, OrderStatus, TimeInForce
+from alpaca.trading.enums import (
+    OrderClass, OrderSide, OrderStatus, QueryOrderStatus, TimeInForce,
+)
 from alpaca.trading.requests import (
     GetOrdersRequest,
     LimitOrderRequest,
     MarketOrderRequest,
     ReplaceOrderRequest,
     StopLossRequest,
+    StopOrderRequest,
     TakeProfitRequest,
 )
 
@@ -78,6 +81,9 @@ class OrderManager:
         # We store a reference to the database, not the trading client.
         # The client is fetched on-demand via the _client property below.
         self._db = database
+        # Maps symbol -> error category for the most recent failed order.
+        # Checked by the caller to decide whether to blacklist the symbol.
+        self._last_order_error: dict[str, str] = {}
 
     @property
     def _client(self) -> TradingClient:
@@ -140,91 +146,109 @@ class OrderManager:
             target_price = round(signal.take_profit_price, 2)
             entry_price = signal.entry_price
 
-            # Adapt bracket legs to current market price.
+            # ---- Limit-entry path ----
+            # If the strategy supplied a `limit_price`, the entry should be
+            # a LIMIT at that level (waiting for a pullback to support),
+            # NOT a market order at current price.  The stop and target
+            # are re-anchored to the limit so the R:R ratio is preserved
+            # at the actual fill price.  We skip the price-adaptation
+            # block below entirely — adapting to current price would
+            # defeat the purpose of waiting for a dip.
+            limit_entry_price: float | None = None
+            if getattr(signal, "limit_price", None) and signal.limit_price > 0:
+                limit_entry_price = round(float(signal.limit_price), 2)
+                if signal.entry_price > 0:
+                    stop_pct = (signal.entry_price - signal.stop_loss_price) / signal.entry_price
+                    target_pct = (signal.take_profit_price - signal.entry_price) / signal.entry_price
+                    stop_price = round(limit_entry_price * (1 - stop_pct), 2)
+                    target_price = round(limit_entry_price * (1 + target_pct), 2)
+                entry_price = limit_entry_price
+
+            # Adapt bracket legs to current market price (MARKET ENTRIES ONLY).
             # Strategies compute entry/stop/target from daily bar close, which
             # can be hours stale by execution time.  Alpaca requires
             # stop < current_price < target.  Instead of rejecting when prices
             # diverge, we recalculate stop/target at the same risk/reward
-            # RATIO relative to the current price.
-            try:
-                from ai_trade.data.historical import fetch_snapshots
-                snaps = fetch_snapshots([signal.symbol])
-                snap = snaps.get(signal.symbol)
-                if snap and hasattr(snap, "latest_trade") and snap.latest_trade:
-                    current_price = float(snap.latest_trade.price)
-                elif snap and hasattr(snap, "daily_bar") and snap.daily_bar:
-                    current_price = float(snap.daily_bar.close)
-                else:
-                    current_price = entry_price
+            # RATIO relative to the current price.  Limit entries skip this
+            # because we WANT a specific entry level (the support), not the
+            # current ask.
+            if limit_entry_price is None:
+                try:
+                    from ai_trade.data.historical import fetch_snapshots
+                    snaps = fetch_snapshots([signal.symbol])
+                    snap = snaps.get(signal.symbol)
+                    if snap and hasattr(snap, "latest_trade") and snap.latest_trade:
+                        current_price = float(snap.latest_trade.price)
+                    elif snap and hasattr(snap, "daily_bar") and snap.daily_bar:
+                        current_price = float(snap.daily_bar.close)
+                    else:
+                        current_price = entry_price
 
-                if entry_price > 0 and current_price > 0 and current_price != entry_price:
-                    # Reject if price has diverged too far — the thesis is stale
-                    divergence = abs(current_price - entry_price) / entry_price
-                    if divergence > 0.50:
-                        log.warning(
-                            "bracket_rejected_extreme_divergence",
-                            symbol=signal.symbol,
-                            signal_entry=entry_price,
-                            current_price=current_price,
-                            divergence_pct=round(divergence * 100, 1),
-                        )
-                        return None
+                    if entry_price > 0 and current_price > 0 and current_price != entry_price:
+                        # Reject if price has diverged too far — the thesis is stale
+                        divergence = abs(current_price - entry_price) / entry_price
+                        if divergence > 0.50:
+                            log.warning(
+                                "bracket_rejected_extreme_divergence",
+                                symbol=signal.symbol,
+                                signal_entry=entry_price,
+                                current_price=current_price,
+                                divergence_pct=round(divergence * 100, 1),
+                            )
+                            return None
 
-                    # Calculate the risk% and reward% from the original signal
-                    stop_pct = (entry_price - signal.stop_loss_price) / entry_price
-                    target_pct = (signal.take_profit_price - entry_price) / entry_price
+                        # Calculate the risk% and reward% from the original signal
+                        stop_pct = (entry_price - signal.stop_loss_price) / entry_price
+                        target_pct = (signal.take_profit_price - entry_price) / entry_price
 
-                    # Recalculate bracket legs around current price
-                    new_stop = round(current_price * (1 - stop_pct), 2)
-                    new_target = round(current_price * (1 + target_pct), 2)
+                        # Recalculate bracket legs around current price
+                        new_stop = round(current_price * (1 - stop_pct), 2)
+                        new_target = round(current_price * (1 + target_pct), 2)
 
-                    # Final sanity check: stop must be below price, target above
-                    if new_stop >= current_price:
-                        new_stop = round(current_price * 0.97, 2)  # 3% fallback
-                    if new_target <= current_price:
-                        new_target = round(current_price * 1.06, 2)  # 6% fallback
+                        # Final sanity check: stop must be below price, target above
+                        if new_stop >= current_price:
+                            new_stop = round(current_price * 0.97, 2)  # 3% fallback
+                        if new_target <= current_price:
+                            new_target = round(current_price * 1.06, 2)  # 6% fallback
 
-                    # Recalculate position size to preserve dollar risk.
-                    # Original risk = shares * (signal_entry - signal_stop).
-                    # New risk per share = current_price - new_stop.
-                    # Scale shares so total dollar risk stays the same.
-                    original_risk_per_share = signal.entry_price - signal.stop_loss_price
-                    new_risk_per_share = current_price - new_stop
-                    original_shares = shares
-                    if original_risk_per_share > 0 and new_risk_per_share > 0:
-                        total_dollar_risk = shares * original_risk_per_share
-                        shares = max(1, int(total_dollar_risk / new_risk_per_share))
+                        # Recalculate position size to preserve dollar risk.
+                        original_risk_per_share = signal.entry_price - signal.stop_loss_price
+                        new_risk_per_share = current_price - new_stop
+                        original_shares = shares
+                        if original_risk_per_share > 0 and new_risk_per_share > 0:
+                            total_dollar_risk = shares * original_risk_per_share
+                            shares = max(1, int(total_dollar_risk / new_risk_per_share))
 
-                    if new_stop != stop_price or new_target != target_price:
-                        log.info(
-                            "bracket_adapted_to_current_price",
-                            symbol=signal.symbol,
-                            signal_entry=entry_price,
-                            current_price=current_price,
-                            original_stop=stop_price,
-                            new_stop=new_stop,
-                            original_target=target_price,
-                            new_target=new_target,
-                            stop_pct=round(stop_pct * 100, 1),
-                            target_pct=round(target_pct * 100, 1),
-                            original_shares=original_shares,
-                            adapted_shares=shares,
-                            original_cost=round(original_shares * entry_price, 2),
-                            adapted_cost=round(shares * current_price, 2),
-                        )
-                        print(con.price_adapted(
-                            symbol=signal.symbol,
-                            signal_entry=entry_price,
-                            current=current_price,
-                            old_stop=stop_price, new_stop=new_stop,
-                            old_target=target_price, new_target=new_target,
-                            old_shares=original_shares, new_shares=shares,
-                        ))
-                    stop_price = new_stop
-                    target_price = new_target
-                    entry_price = current_price
-            except Exception as e:
-                log.debug("bracket_price_adapt_failed", symbol=signal.symbol, error=str(e))
+                        if new_stop != stop_price or new_target != target_price:
+                            log.info(
+                                "bracket_adapted_to_current_price",
+                                symbol=signal.symbol,
+                                signal_entry=entry_price,
+                                current_price=current_price,
+                                original_stop=stop_price,
+                                new_stop=new_stop,
+                                original_target=target_price,
+                                new_target=new_target,
+                                stop_pct=round(stop_pct * 100, 1),
+                                target_pct=round(target_pct * 100, 1),
+                                original_shares=original_shares,
+                                adapted_shares=shares,
+                                original_cost=round(original_shares * entry_price, 2),
+                                adapted_cost=round(shares * current_price, 2),
+                            )
+                            print(con.price_adapted(
+                                symbol=signal.symbol,
+                                signal_entry=entry_price,
+                                current=current_price,
+                                old_stop=stop_price, new_stop=new_stop,
+                                old_target=target_price, new_target=new_target,
+                                old_shares=original_shares, new_shares=shares,
+                            ))
+                        stop_price = new_stop
+                        target_price = new_target
+                        entry_price = current_price
+                except Exception as e:
+                    log.debug("bracket_price_adapt_failed", symbol=signal.symbol, error=str(e))
 
             # Alpaca requires stop_price <= base_price - 0.01 and
             # take_profit >= base_price + 0.01.  We use a 0.05 buffer (not
@@ -243,17 +267,31 @@ class OrderManager:
                             target=target_price, entry=entry_price, new_target=min_target)
                 target_price = min_target
 
-            # Build the bracket order request.
-            # OrderClass.BRACKET tells Alpaca this is a 3-legged order.
-            request = MarketOrderRequest(
-                symbol=signal.symbol,
-                qty=shares,
-                side=OrderSide.BUY,
-                time_in_force=tif,
-                order_class=OrderClass.BRACKET,
-                stop_loss=StopLossRequest(stop_price=stop_price),
-                take_profit=TakeProfitRequest(limit_price=target_price),
-            )
+            # Build the bracket order request.  OrderClass.BRACKET tells
+            # Alpaca this is a 3-legged order: entry + stop + take-profit.
+            # The entry leg is a LIMIT when the strategy asked for a
+            # pullback-entry (signal.limit_price set), otherwise MARKET.
+            if limit_entry_price is not None:
+                request = LimitOrderRequest(
+                    symbol=signal.symbol,
+                    qty=shares,
+                    side=OrderSide.BUY,
+                    time_in_force=tif,
+                    order_class=OrderClass.BRACKET,
+                    limit_price=limit_entry_price,
+                    stop_loss=StopLossRequest(stop_price=stop_price),
+                    take_profit=TakeProfitRequest(limit_price=target_price),
+                )
+            else:
+                request = MarketOrderRequest(
+                    symbol=signal.symbol,
+                    qty=shares,
+                    side=OrderSide.BUY,
+                    time_in_force=tif,
+                    order_class=OrderClass.BRACKET,
+                    stop_loss=StopLossRequest(stop_price=stop_price),
+                    take_profit=TakeProfitRequest(limit_price=target_price),
+                )
 
             # Submit to Alpaca — this sends the order to the exchange.
             order = self._client.submit_order(order_data=request)
@@ -263,6 +301,8 @@ class OrderManager:
                 symbol=signal.symbol,
                 shares=shares,
                 order_id=str(order.id),
+                entry_type="limit" if limit_entry_price is not None else "market",
+                limit_price=limit_entry_price,
                 stop_loss=stop_price,
                 take_profit=target_price,
                 entry_price=entry_price,
@@ -305,32 +345,45 @@ class OrderManager:
             error_raw = str(e)
             symbol = signal.symbol
 
-            # Classify the error for clear operator feedback
+            # Classify the error. "account" errors are NOT symbol-specific —
+            # don't let callers blacklist the symbol for these.
             if "pattern day trading" in error_msg or "40310100" in error_msg:
                 log.error("bracket_order_pdt_blocked", symbol=symbol, shares=shares, error=error_raw)
                 print(con.error(f"ORDER BLOCKED {symbol} — PDT protection triggered. All day-trade slots used."))
+                self._last_order_error[symbol] = "account_pdt"
             elif "insufficient" in error_msg or "buying power" in error_msg or "40110000" in error_msg:
                 log.error("bracket_order_insufficient_funds", symbol=symbol, shares=shares, error=error_raw)
                 print(con.error(f"ORDER BLOCKED {symbol} — Insufficient buying power for {shares} shares."))
+                self._last_order_error[symbol] = "account_funds"
             elif "forbidden" in error_msg or "403" in error_msg:
                 log.error("bracket_order_forbidden", symbol=symbol, shares=shares, error=error_raw)
                 print(con.error(f"ORDER BLOCKED {symbol} — Account restriction (403). Check Alpaca dashboard."))
+                self._last_order_error[symbol] = "account_forbidden"
             elif "not found" in error_msg or "asset" in error_msg and "not" in error_msg:
                 log.error("bracket_order_invalid_symbol", symbol=symbol, error=error_raw)
                 print(con.error(f"ORDER FAILED {symbol} — Symbol not found or not tradeable."))
+                self._last_order_error[symbol] = "symbol_invalid"
             elif "halt" in error_msg or "suspended" in error_msg:
                 log.error("bracket_order_halted", symbol=symbol, error=error_raw)
                 print(con.error(f"ORDER BLOCKED {symbol} — Trading halted/suspended."))
+                self._last_order_error[symbol] = "symbol_halted"
             elif "rate" in error_msg or "429" in error_msg or "too many" in error_msg:
                 log.error("bracket_order_rate_limited", symbol=symbol, error=error_raw)
                 print(con.warning(f"ORDER DELAYED {symbol} — Rate limited by Alpaca. Try again next window."))
+                self._last_order_error[symbol] = "account_rate_limit"
             elif "timeout" in error_msg or "timed out" in error_msg or "connect" in error_msg:
                 log.error("bracket_order_network_error", symbol=symbol, error=error_raw)
                 print(con.error(f"ORDER FAILED {symbol} — Network error: {error_raw[:80]}"))
+                self._last_order_error[symbol] = "network"
             else:
                 log.exception("bracket_order_failed", symbol=symbol, shares=shares)
                 print(con.error(f"ORDER FAILED {symbol} — {error_raw[:120]}"))
+                self._last_order_error[symbol] = "unknown"
             return None
+
+    def pop_order_error(self, symbol: str) -> str | None:
+        """Return and clear the last error type for *symbol*, or None."""
+        return self._last_order_error.pop(symbol, None)
 
     # ── Position closing ─────────────────────────────────────
 
@@ -430,7 +483,7 @@ class OrderManager:
             print(con.warning(f"Retry close {symbol} failed — {str(retry_err)[:100]}"))
             return False
 
-    def close_all_day_trades(self, open_trades: list[dict]) -> None:
+    def close_all_day_trades(self, open_trades: list[dict]) -> list[dict]:
         """Close all open day-trade positions and update DB status.
 
         Called near market close (e.g. 3:45 PM ET) to ensure we don't
@@ -446,7 +499,13 @@ class OrderManager:
 
         Args:
             open_trades: List of trade dicts from the database.
+
+        Returns:
+            List of trade dicts that were successfully closed (with
+            ``exit_time`` populated).  The caller uses this to run the
+            PDT exit-time hook.
         """
+        closed: list[dict] = []
         for trade in open_trades:
             # Only close trades that are both marked as "day" hold_type
             # AND still in "open" status.
@@ -474,9 +533,10 @@ class OrderManager:
                         pnl = round((exit_price - entry_price) * shares, 2)
                         pnl_pct = round((exit_price - entry_price) / entry_price * 100, 2)
 
+                    exit_time_iso = datetime.now(timezone.utc).isoformat()
                     update_fields = {
                         "status": "closed",
-                        "exit_time": datetime.now(timezone.utc).isoformat(),
+                        "exit_time": exit_time_iso,
                     }
                     if exit_price:
                         update_fields["exit_price"] = exit_price
@@ -487,12 +547,16 @@ class OrderManager:
                     self._db.update_trade(trade["id"], **update_fields)
                     log.info("day_trade_closed", symbol=symbol, trade_id=trade["id"],
                              exit_price=exit_price, pnl=pnl)
+                    # Return the merged dict so the caller can run the
+                    # PDT exit-time hook with both entry_time and exit_time.
+                    closed.append({**trade, **update_fields})
                 else:
                     log.warning(
                         "day_trade_close_failed",
                         symbol=symbol,
                         trade_id=trade["id"],
                     )
+        return closed
 
     # ── Queries ──────────────────────────────────────────────
 
@@ -624,9 +688,55 @@ class OrderManager:
             db_symbols = {t["symbol"] for t in db_trades}
 
             # Step 3: Untracked positions (on Alpaca, not in DB).
-            for sym in position_symbols - db_symbols:
-                log.warning("untracked_position", symbol=sym)
+            # Alpaca is the source of truth — adopt these back into the DB so
+            # the bot resumes managing them (trailing stops, exits, risk
+            # accounting).  Adoption reads the position's existing protective
+            # orders; if there's no stop-loss leg, it attaches one so the
+            # position isn't left unprotected.  See _adopt_untracked_position.
+            #
+            # ALSO catch DB-tracked-but-unprotected positions: a trade can sit
+            # in the DB with stop_loss=0/NULL after an earlier adoption failure
+            # or a botched bracket.  When this happens the heat calc treats
+            # the WHOLE position value as at-risk and the bot stops opening
+            # new entries (ONDS-style lockup, found 2026-06-05).  Treat these
+            # the same way — query orders, re-protect, fix the DB row.
+            untracked = position_symbols - db_symbols
+            naked_tracked: list[dict] = []
+            for t in db_trades:
+                if (
+                    t["symbol"] in position_symbols
+                    and (not t.get("stop_loss") or float(t.get("stop_loss") or 0) <= 0)
+                ):
+                    naked_tracked.append(t)
+
+            open_orders_by_symbol: dict = {}
+            if untracked or naked_tracked:
+                try:
+                    all_open = self._client.get_orders(
+                        filter=GetOrdersRequest(status=QueryOrderStatus.OPEN, limit=500)
+                    )
+                    for o in all_open:
+                        open_orders_by_symbol.setdefault(o.symbol, []).append(o)
+                except Exception as e:
+                    log.warning("untracked_orders_fetch_failed", error=str(e))
+
+            for t in naked_tracked:
+                sym = t["symbol"]
+                try:
+                    self._reprotect_tracked_position(
+                        t, position_map[sym], open_orders_by_symbol.get(sym, [])
+                    )
+                except Exception:
+                    log.exception("reprotect_tracked_failed", symbol=sym)
+
+            for sym in untracked:
                 summary["untracked_positions"] += 1
+                try:
+                    self._adopt_untracked_position(
+                        position_map[sym], open_orders_by_symbol.get(sym, [])
+                    )
+                except Exception as e:
+                    log.exception("adopt_untracked_failed", symbol=sym)
 
             # Step 4: Stale trades (in DB, not on Alpaca) — closed by
             # stop-loss/take-profit fill.  Try to fetch the last trade
@@ -680,6 +790,12 @@ class OrderManager:
                         "take_profit": trade.get("take_profit"),
                         "high_since_entry": trade.get("high_since_entry"),
                         "low_since_entry": trade.get("low_since_entry"),
+                        # Needed by pdt.record_if_day_trade() to determine
+                        # whether the round-trip fell within a single ET day.
+                        "entry_time": trade.get("entry_time"),
+                        "exit_time": update_fields["exit_time"],
+                        "buy_order_id": trade.get("buy_order_id"),
+                        "sell_order_id": trade.get("sell_order_id"),
                     })
 
         except (ConnectTimeout, ReadTimeout, RequestsConnectionError) as exc:
@@ -688,6 +804,239 @@ class OrderManager:
             log.exception("sync_positions_failed")
 
         return summary
+
+    def _reprotect_tracked_position(
+        self, trade: dict, position, open_orders: list,
+    ) -> None:
+        """Re-attach a stop to a DB-tracked position that lost its protection.
+
+        Symmetric to ``_adopt_untracked_position`` for the opposite drift:
+        the DB row exists but ``stop_loss`` is 0/NULL — typically because an
+        earlier adoption couldn't place the stop (shares held by a lone TP)
+        and never recovered.  Heat then counts the FULL position value as
+        at-risk and the bot stops opening new entries (the ONDS-style lockup
+        found 2026-06-05).
+
+        Strategy:
+          1. If Alpaca shows a live stop leg, just sync the DB to it.
+          2. Otherwise cancel any lone sell legs, submit an OCO (stop +
+             take-profit).  Falls back to a plain stop if OCO is rejected.
+          3. Update the DB row so the heat calc reflects real risk.
+        """
+        sym = position.symbol
+        qty = abs(int(float(position.qty)))
+        if qty <= 0:
+            return
+        entry_price = float(trade.get("entry_price") or position.avg_entry_price)
+        try:
+            current_price = float(position.current_price)
+        except Exception:
+            current_price = entry_price
+
+        # Existing protective legs on Alpaca.
+        stop_leg = target_leg = None
+        for o in open_orders:
+            otype = str(getattr(o, "order_type", "")).lower()
+            if o.side == OrderSide.SELL and "stop" in otype and o.stop_price:
+                stop_leg = o
+            elif o.side == OrderSide.SELL and otype.endswith("limit") and o.limit_price:
+                target_leg = o
+
+        # Case 1: Alpaca already has a stop — just sync the DB.
+        if stop_leg is not None:
+            self._db.update_trade(
+                trade["id"], stop_loss=float(stop_leg.stop_price),
+                take_profit=float(target_leg.limit_price) if target_leg else trade.get("take_profit"),
+            )
+            log.warning(
+                "tracked_position_db_synced_to_alpaca",
+                symbol=sym, stop=float(stop_leg.stop_price),
+            )
+            return
+
+        # Case 2: no stop on Alpaca — protect now.
+        stop_pct = 0.03
+        candidate = round(entry_price * (1 - stop_pct), 2)
+        ceiling = round(current_price * 0.99, 2)  # must sit below market
+        new_stop = min(candidate, ceiling)
+        new_target = (
+            float(target_leg.limit_price) if target_leg
+            else float(trade.get("take_profit") or 0)
+            or round(entry_price * 1.10, 2)
+        )
+        if new_stop <= 0:
+            return
+
+        # Free any held shares so the OCO can reserve them.
+        for o in open_orders:
+            if o.side == OrderSide.SELL:
+                try:
+                    self._client.cancel_order_by_id(o.id)
+                except Exception as e:
+                    log.debug("reprotect_cancel_leg_failed", symbol=sym, error=str(e))
+        import time
+        time.sleep(1)
+
+        placed_stop = placed_target = None
+        try:
+            self._client.submit_order(order_data=LimitOrderRequest(
+                symbol=sym, qty=qty, side=OrderSide.SELL,
+                time_in_force=TimeInForce.GTC,
+                order_class=OrderClass.OCO,
+                take_profit=TakeProfitRequest(limit_price=new_target),
+                stop_loss=StopLossRequest(stop_price=new_stop),
+            ))
+            placed_stop, placed_target = new_stop, new_target
+            log.warning(
+                "tracked_position_reprotected", method="oco",
+                symbol=sym, qty=qty, new_stop=new_stop, new_target=new_target,
+            )
+        except Exception as e:
+            log.warning("reprotect_oco_failed_trying_plain_stop", symbol=sym, error=str(e))
+            try:
+                self._client.submit_order(order_data=StopOrderRequest(
+                    symbol=sym, qty=qty, side=OrderSide.SELL,
+                    time_in_force=TimeInForce.GTC, stop_price=new_stop,
+                ))
+                placed_stop = new_stop
+                log.warning(
+                    "tracked_position_reprotected", method="plain_stop",
+                    symbol=sym, new_stop=new_stop,
+                )
+            except Exception as e2:
+                log.error("reprotect_stop_submit_failed", symbol=sym, error=str(e2))
+
+        if placed_stop:
+            self._db.update_trade(
+                trade["id"], stop_loss=placed_stop,
+                take_profit=placed_target if placed_target else trade.get("take_profit"),
+            )
+
+    def _adopt_untracked_position(self, position, open_orders: list) -> None:
+        """Re-create a DB trade row for a position Alpaca holds but the DB lost.
+
+        Alpaca is the source of truth.  When a position drifts out of the DB
+        (broken bracket, missed fill, manual trade), we adopt it back:
+
+          1. Read the symbol's existing protective orders — a sell STOP leg
+             gives the stop-loss, a sell LIMIT leg gives the take-profit.
+          2. If there's NO stop-loss leg, attach a protective stop so the
+             position isn't left naked.  The standalone stop coexists with
+             any lone take-profit; whichever fills first leaves the other to
+             be rejected harmlessly (we only hold the shares once).
+          3. Insert an `open` trade row (strategy='adopted', hold_type='swing'
+             so it's never force-closed as a day trade) so the trailing-stop
+             and exit jobs manage it from now on.
+
+        long-only (the bot never shorts), so this assumes a long position.
+        """
+        sym = position.symbol
+        qty = abs(int(float(position.qty)))
+        if qty <= 0:
+            return
+        entry_price = float(position.avg_entry_price)
+        try:
+            current_price = float(position.current_price)
+        except Exception:
+            current_price = entry_price
+
+        # Classify existing protective legs.
+        stop_leg = None
+        target_leg = None
+        for o in open_orders:
+            if o.side != OrderSide.BUY and o.side != OrderSide.SELL:
+                continue
+            otype = str(getattr(o, "order_type", "")).lower()
+            if o.side == OrderSide.SELL and "stop" in otype and o.stop_price:
+                stop_leg = o
+            elif o.side == OrderSide.SELL and otype.endswith("limit") and o.limit_price:
+                target_leg = o
+
+        stop_loss = float(stop_leg.stop_price) if stop_leg else None
+        take_profit = float(target_leg.limit_price) if target_leg else None
+
+        # No stop protection → attach one.  The position's shares are usually
+        # already reserved by a lone take-profit leg (held_for_orders == qty),
+        # so a standalone stop is rejected for "insufficient qty".  The fix is
+        # to cancel the existing sell leg(s) to free the shares, then submit a
+        # proper OCO (one-cancels-other: stop + target reserve the shares once
+        # and auto-cancel each other).  Falls back to a plain stop if the OCO
+        # is rejected — downside protection matters more than the target.
+        if stop_loss is None:
+            stop_pct = getattr(getattr(self, "_risk_cfg", None), "stop_loss_pct", 0.03) or 0.03
+            candidate = round(entry_price * (1 - stop_pct), 2)
+            ceiling = round(current_price * 0.99, 2)  # sell-stop must sit below market
+            new_stop = min(candidate, ceiling)
+            new_target = take_profit or round(entry_price * 1.10, 2)
+
+            if new_stop > 0:
+                # Free the shares: cancel any existing sell legs.
+                for o in open_orders:
+                    if o.side == OrderSide.SELL:
+                        try:
+                            self._client.cancel_order_by_id(o.id)
+                        except Exception as e:
+                            log.debug("adopt_cancel_leg_failed", symbol=sym, error=str(e))
+                import time
+                time.sleep(1)  # let Alpaca release the held shares
+
+                placed = False
+                try:
+                    self._client.submit_order(order_data=LimitOrderRequest(
+                        symbol=sym, qty=qty, side=OrderSide.SELL,
+                        time_in_force=TimeInForce.GTC,
+                        order_class=OrderClass.OCO,
+                        take_profit=TakeProfitRequest(limit_price=new_target),
+                        stop_loss=StopLossRequest(stop_price=new_stop),
+                    ))
+                    stop_loss, take_profit, placed = new_stop, new_target, True
+                    log.warning(
+                        "adopted_position_reprotected", method="oco",
+                        symbol=sym, qty=qty, entry=entry_price,
+                        current=current_price, new_stop=new_stop, new_target=new_target,
+                    )
+                except Exception as e:
+                    log.warning("adopt_oco_failed_trying_plain_stop", symbol=sym, error=str(e))
+
+                if not placed:
+                    # Fallback: at least a plain stop (shares freed by cancel above).
+                    try:
+                        self._client.submit_order(order_data=StopOrderRequest(
+                            symbol=sym, qty=qty, side=OrderSide.SELL,
+                            time_in_force=TimeInForce.GTC, stop_price=new_stop,
+                        ))
+                        stop_loss, take_profit = new_stop, None
+                        log.warning(
+                            "adopted_position_reprotected", method="plain_stop",
+                            symbol=sym, qty=qty, new_stop=new_stop,
+                        )
+                    except Exception as e:
+                        log.error("adopt_stop_submit_failed", symbol=sym, error=str(e))
+                        stop_loss = None  # don't claim protection we failed to place
+
+        self._db.insert_trade(
+            symbol=sym,
+            strategy="adopted",
+            side="long",
+            shares=qty,
+            entry_price=entry_price,
+            entry_time=datetime.now(timezone.utc).isoformat(),
+            stop_loss=stop_loss if stop_loss else 0.0,
+            take_profit=take_profit if take_profit else round(entry_price * 1.10, 2),
+            hold_type="swing",
+            status="open",
+            buy_order_id="",  # original entry order unknown
+            high_since_entry=max(entry_price, current_price),
+            low_since_entry=min(entry_price, current_price),
+            stop_method="adopted",
+            target_method="adopted",
+        )
+        log.info(
+            "position_adopted",
+            symbol=sym, qty=qty, entry=entry_price,
+            stop_loss=stop_loss, take_profit=take_profit,
+            had_stop=stop_leg is not None, had_target=target_leg is not None,
+        )
 
     def find_stop_leg_id(self, buy_order_id: str) -> str | None:
         """Locate the stop-loss child order id for a bracket parent order.

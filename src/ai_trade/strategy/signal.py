@@ -166,12 +166,17 @@ class SignalAggregator:
                     if self._weighter is not None:
                         w = self._weighter.get_weight(sig.strategy_name)
                         sig.conviction = max(0.0, min(1.0, sig.conviction * w))
+                    # Log the signal FIRST so we can capture its row id
+                    # and link the ml_predictions row back to it.  The
+                    # `conviction` stored here is pre-ML-blend — that's
+                    # intentional: downstream analysis can compare the
+                    # signal's conviction to the ML probability via the
+                    # ml_predictions.signal_id foreign key.
+                    signal_id = self._log_signal(sig)
                     # Apply ML signal-quality prediction (pass-through in
                     # cold start — predictor returns None when no model).
-                    self._apply_ml_prediction(sig)
+                    self._apply_ml_prediction(sig, signal_id=signal_id)
                     all_signals.append(sig)
-                    # Log every generated signal to the database for analysis
-                    self._log_signal(sig)
 
         if not all_signals:
             logger.info("no_signals_generated", candidates_evaluated=len(candidates), strategies_count=len(self.strategies))
@@ -448,12 +453,19 @@ class SignalAggregator:
             for r in self._near_misses
         ]
 
-    def _apply_ml_prediction(self, sig: Signal) -> None:
+    def _apply_ml_prediction(self, sig: Signal, signal_id: int | None = None) -> None:
         """Blend ML probability into the signal conviction (pass-through cold start).
 
         The predictor returns None when no model is loaded, in which
         case the rule conviction is left untouched and we log nothing
         — no audit spam during bootstrap.
+
+        Also persists the prediction to the ``ml_predictions`` table so
+        live accuracy can be measured after outcomes are reconciled by
+        the EOD / trade-close sync job.  Previously this insert was
+        orphaned (Bug B in ROADMAP_TO_LIVE.md): the table stayed empty
+        despite the model being active, and there was no way to compute
+        the ML's live accuracy by conviction bucket.
         """
         if self._ml is None:
             return
@@ -472,6 +484,27 @@ class SignalAggregator:
         if sig.metadata is None:
             sig.metadata = {}
         sig.metadata["ml_trace"] = trace
+        # Stash signal_id so the trade-close sync job (which fills
+        # actual_outcome) can correlate back to the live trade row.
+        if signal_id is not None:
+            sig.metadata["signal_id"] = signal_id
+
+        # Persist the prediction for later accuracy analysis.  predicted_outcome
+        # is a coarse bucket ("win"/"loss") based on the P(win) threshold; the
+        # precise probability lives in predicted_confidence.  actual_outcome is
+        # backfilled on trade close by the reconciliation job.
+        try:
+            db = getattr(self.risk_manager, "_database", None)
+            if db is not None:
+                predicted_outcome = "win" if ml_prob >= 0.5 else "loss"
+                db.insert_ml_prediction(
+                    signal_id=signal_id,
+                    predicted_outcome=predicted_outcome,
+                    predicted_confidence=round(float(ml_prob), 4),
+                    model_version=trace.get("model_version"),
+                )
+        except Exception:
+            logger.debug("ml_prediction_persist_failed", symbol=sig.symbol)
 
         if self._dl is not None:
             try:
@@ -509,17 +542,22 @@ class SignalAggregator:
             if r.is_near_miss:
                 self._near_misses.append(r)
 
-    def _log_signal(self, sig: Signal) -> None:
+    def _log_signal(self, sig: Signal) -> int | None:
         """Best-effort log of a generated signal to the database.
 
         This creates a record in the ``signals`` table for post-hoc
         analysis (e.g. "how many signals did each strategy generate?",
         "what was the average conviction of rejected signals?").
+
+        Returns the inserted row id so the caller can link a subsequent
+        ``ml_predictions`` row back to this signal.  Returns ``None`` on
+        any failure — logging is best-effort and must not block the
+        trade pipeline.
         """
         try:
             db = getattr(self.risk_manager, "_database", None)
             if db is not None:
-                db.log_signal(
+                return db.log_signal(
                     symbol=sig.symbol,
                     strategy=sig.strategy_name,
                     conviction=sig.conviction,
@@ -528,3 +566,4 @@ class SignalAggregator:
                 )
         except Exception:
             logger.debug("signal_log_failed", symbol=sig.symbol)
+        return None

@@ -276,6 +276,49 @@ def _trail_params_for_conviction(conviction: float) -> tuple[float | None, float
     return 1.0, 2.0
 
 
+# Profit-tier ratchet table: once max-favorable-excursion crosses the
+# trigger, lock in the corresponding profit floor.  Percentage-based so it
+# works identically across price tiers — the ATR-based chandelier doesn't,
+# because on cheap stocks ATR is a large fraction of price and the
+# chandelier never engages above entry (the AHMA case: MFE +17.6% gave
+# back to a -1.2% stop because 2x ATR ≈ 25% > 17.6%).
+#
+# Ordered HIGH → LOW so the first match wins (the deepest applicable tier).
+_PROFIT_RATCHET_TIERS: tuple[tuple[float, float, str], ...] = (
+    (0.25, 0.15, "ratchet_25pct"),  # MFE >= 25% → lock entry + 15%
+    (0.15, 0.08, "ratchet_15pct"),  # MFE >= 15% → lock entry +  8%
+    (0.10, 0.05, "ratchet_10pct"),  # MFE >= 10% → lock entry +  5%
+    (0.05, 0.02, "ratchet_5pct"),   # MFE >=  5% → lock entry +  2%
+    (0.03, 0.01, "ratchet_3pct"),   # MFE >=  3% → lock entry +  1%
+)
+
+
+def _profit_tier_ratchet(
+    entry_price: float,
+    high_since_entry: float,
+) -> tuple[float, str] | None:
+    """Map max favorable excursion (MFE) to a profit-locking stop.
+
+    Sits alongside breakeven and chandelier in compute_trailing_stop_long.
+    Operates on `high_since_entry`, so it ratchets up as the trade hits
+    new highs but never relaxes on a pullback (the same property that
+    makes chandelier safe).
+
+    Returns (new_stop, mode_name) or None if no tier is reached.
+    """
+    if entry_price <= 0 or high_since_entry <= entry_price:
+        return None
+    mfe_pct = (high_since_entry - entry_price) / entry_price
+    # Small tolerance so MFE values computed as e.g. 0.149999... from a
+    # 1.15× multiply still match the 0.15 tier exactly.  Floating point
+    # representation can shave a sub-microscopic amount off otherwise.
+    eps = 1e-9
+    for trigger, lock_pct, mode in _PROFIT_RATCHET_TIERS:
+        if mfe_pct >= trigger - eps:
+            return entry_price * (1 + lock_pct), mode
+    return None
+
+
 def compute_trailing_stop_long(
     entry_price: float,
     current_price: float,
@@ -296,7 +339,7 @@ def compute_trailing_stop_long(
 
     Returns (new_stop, mode) or (None, "") if no update is warranted.
     The proposal is only returned if it strictly *tightens* the stop
-    (never loosens). Two modes:
+    (never loosens). Three modes:
 
     - **breakeven**: once price has moved ``breakeven_trigger_atr * ATR``
       above entry, move stop to ``entry * (1 + breakeven_buffer_pct)``.
@@ -305,8 +348,15 @@ def compute_trailing_stop_long(
       ``high_since_entry - chandelier_atr_mult * ATR``. Only tightens
       when price has printed a new high recently; a pullback leaves
       the prior stop in place.
+    - **profit ratchet**: percentage-based MFE tiers (see
+      ``_PROFIT_RATCHET_TIERS``).  Closes the gap left by chandelier
+      on cheap stocks where ATR is a large percentage of price.
 
-    Chandelier wins if it produces a tighter stop than breakeven.
+    All three modes are proposed independently; the tightest valid
+    proposal wins.  Because each is independent, a high-conviction
+    chandelier can outvote the ratchet when ATR is small (chandelier
+    tighter), while on cheap stocks the ratchet outvotes chandelier
+    (chandelier never engages above entry).
     """
     if atr <= 0 or entry_price <= 0:
         return None, ""
@@ -334,6 +384,12 @@ def compute_trailing_stop_long(
         if chand > entry_price:
             proposals.append((chand, "chandelier"))
 
+    # Profit-tier ratchet — independent of ATR.
+    if high_since_entry is not None:
+        ratchet = _profit_tier_ratchet(entry_price, high_since_entry)
+        if ratchet is not None:
+            proposals.append(ratchet)
+
     if not proposals:
         return None, ""
 
@@ -353,7 +409,16 @@ StopQuality = Literal[
     "too_tight", "too_loose", "just_right", "trail_too_tight", "not_hit",
 ]
 
-_TRAIL_MODES = {"breakeven", "chandelier", "time_breakeven"}
+_TRAIL_MODES = {
+    "breakeven",
+    "chandelier",
+    "time_breakeven",
+    "ratchet_3pct",
+    "ratchet_5pct",
+    "ratchet_10pct",
+    "ratchet_15pct",
+    "ratchet_25pct",
+}
 
 
 def score_stop_quality(

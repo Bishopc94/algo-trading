@@ -141,15 +141,23 @@ class SignalQualityPredictor:
     def blend_weight(self) -> float:
         """How much weight the ML prediction gets vs the rule conviction.
 
-        Ramps linearly from 0 (no model) to a cap of 0.5 once the
-        model has trained on 100+ trades.  The V2 brief explicitly
-        requires this ramp so the bot doesn't flip to pure ML
-        overnight — rules bootstrap the model, and the model grows
-        more influential as its training set grows.
+        Ramps linearly from 0 (no model) to a cap of 0.25 once the
+        model has trained on 50+ trades.  The V2 brief originally
+        specified a 0.5 cap over 200 trades; that was lowered to 0.25
+        after the model was observed to systematically under-predict
+        winners on out-of-distribution inputs (micro-cap ORB/VWAP
+        signals the training set underrepresented).  Keeping the cap
+        at 0.25 gives the rule conviction 75% weight until live-trade
+        validation shows the ML is well-calibrated on the current
+        signal mix.
+
+        Raise this cap back toward 0.5 after Phase 5 of the roadmap
+        (promotion pipeline + OOD detection) confirms the model's
+        live accuracy matches its training accuracy.
         """
         if not self.is_ready():
             return 0.0
-        return min(0.5, self._training_trades / 200.0)
+        return min(0.25, self._training_trades / 200.0)
 
     def predict(
         self,

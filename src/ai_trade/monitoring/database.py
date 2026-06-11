@@ -44,6 +44,7 @@ from __future__ import annotations
 import re
 import sqlite3
 import time
+from datetime import datetime, timedelta, timezone
 
 # PYTHON PATTERN — @contextmanager:
 # The `contextmanager` decorator lets you write a generator function that
@@ -747,6 +748,139 @@ class Database:
                 )
         self._retry_on_lock(_do_batch)
 
+    def filter_effectiveness_report(self, days: int = 7) -> dict:
+        """Aggregate near-misses + rejects from the last N days for review.
+
+        The decisions table is dominated by reject/near_miss rows that
+        nothing automated reads.  The *useful* slice is the close calls:
+        a strategy that keeps near-missing on the same filter at a small
+        miss_pct may have a threshold that's costing real trades.  This
+        rollup surfaces those patterns so the operator can decide whether
+        to loosen anything — no auto-tuning.
+
+        Returns:
+            {
+              "days": N,
+              "per_strategy": [
+                {"strategy": ..., "filter": ..., "rejects": N,
+                 "near_misses": M, "avg_miss_pct": X, "tightest_pct": Y,
+                 "tightest_examples": [{symbol, miss_pct, when}, ...]},
+                ...
+              ],
+              "funnel": {
+                "rule_signals": N, "ml_predictions": M, "ranked": R,
+                "executed": E, "order_failed": F,
+              },
+            }
+        """
+        cutoff = (
+            datetime.now(timezone.utc) - timedelta(days=days)
+        ).isoformat()
+        per_strategy: list[dict] = []
+        with self._conn() as conn:
+            # Reject/near-miss aggregation by (strategy, filter).
+            rows = conn.execute(
+                """
+                SELECT
+                    strategy,
+                    json_extract(factors, '$.filter') AS filter,
+                    SUM(CASE WHEN action='reject' THEN 1 ELSE 0 END) AS rejects,
+                    SUM(CASE WHEN action='near_miss' THEN 1 ELSE 0 END) AS near_misses,
+                    ROUND(AVG(CAST(json_extract(factors, '$.miss_pct') AS REAL)), 2) AS avg_miss_pct,
+                    ROUND(MIN(CAST(json_extract(factors, '$.miss_pct') AS REAL)), 2) AS tightest_pct
+                FROM decisions
+                WHERE timestamp >= ?
+                  AND action IN ('reject', 'near_miss')
+                  AND json_extract(factors, '$.filter') IS NOT NULL
+                GROUP BY strategy, filter
+                HAVING (rejects + near_misses) >= 5
+                ORDER BY near_misses DESC, rejects DESC
+                """,
+                (cutoff,),
+            ).fetchall()
+            for r in rows:
+                row = dict(r)
+                # Tightest near-miss examples for this (strategy, filter).
+                examples = conn.execute(
+                    """
+                    SELECT symbol, timestamp,
+                           CAST(json_extract(factors, '$.miss_pct') AS REAL) AS miss_pct
+                    FROM decisions
+                    WHERE timestamp >= ? AND strategy = ?
+                      AND json_extract(factors, '$.filter') = ?
+                      AND action = 'near_miss'
+                    ORDER BY miss_pct ASC
+                    LIMIT 3
+                    """,
+                    (cutoff, row["strategy"], row["filter"]),
+                ).fetchall()
+                row["tightest_examples"] = [
+                    {
+                        "symbol": e["symbol"],
+                        "miss_pct": e["miss_pct"],
+                        "when": e["timestamp"][:16],
+                    }
+                    for e in examples
+                ]
+                per_strategy.append(row)
+
+            # Execution funnel.
+            def _count(sql: str) -> int:
+                return conn.execute(sql, (cutoff,)).fetchone()[0]
+
+            funnel = {
+                "ml_predictions": _count(
+                    "SELECT COUNT(*) FROM decisions WHERE timestamp >= ? AND action='ml_predict'"
+                ),
+                "ranked": _count(
+                    "SELECT COUNT(*) FROM decisions WHERE timestamp >= ? AND decision_type='rank'"
+                ),
+                "executed": _count(
+                    "SELECT COUNT(*) FROM decisions WHERE timestamp >= ? AND decision_type='execute' AND action='execute'"
+                ),
+                "order_failed": _count(
+                    "SELECT COUNT(*) FROM decisions WHERE timestamp >= ? AND reasoning LIKE 'order_failed%'"
+                ),
+            }
+
+        return {"days": days, "per_strategy": per_strategy, "funnel": funnel}
+
+    def prune_old_decisions(self, reject_retention_days: int = 14) -> int:
+        """Delete old high-volume evaluate-phase rows to cap DB growth.
+
+        The decisions table is ~99% `reject` / `near_miss` rows (tens of
+        thousands per day at the 5-min eval cadence).  Nothing automated
+        reads them — they exist only for recent ad-hoc debugging ("why was
+        X rejected today?").  The meaningful, low-volume audit rows
+        (execute / rank / exit / review / ml_predict / approve) are kept
+        forever; only reject/near_miss older than the retention window are
+        pruned.  Returns the number of rows deleted.
+        """
+        cutoff = (
+            datetime.now(timezone.utc) - timedelta(days=reject_retention_days)
+        ).isoformat()
+
+        def _do():
+            with self._conn() as conn:
+                cur = conn.execute(
+                    """
+                    DELETE FROM decisions
+                    WHERE action IN ('reject', 'near_miss')
+                      AND timestamp < ?
+                    """,
+                    (cutoff,),
+                )
+                return cur.rowcount
+        deleted = self._retry_on_lock(_do) or 0
+        # Reclaim file space after a large delete.
+        if deleted > 10000:
+            try:
+                with self._conn() as conn:
+                    conn.execute("VACUUM")
+            except Exception:
+                pass
+        return deleted
+
     def update_decision_outcome(self, decision_id: int, **kwargs) -> None:
         """Update outcome fields on a decision after trade closes."""
         self._update("decisions", decision_id, **kwargs)
@@ -804,6 +938,37 @@ class Database:
     def insert_ml_features(self, **kwargs) -> int:
         """Save ML feature snapshot for a trade/decision."""
         return self._insert("ml_features", **kwargs)
+
+    def backfill_ml_prediction_outcome(
+        self, symbol: str, strategy: str, actual_outcome: str
+    ) -> bool:
+        """Set ``actual_outcome`` on the most recent unresolved prediction
+        for *symbol* + *strategy*.  Called from the trade-close hook so
+        the nightly trainer can compare predicted vs. realized outcomes.
+
+        Returns True if a row was updated.
+        """
+        def _do():
+            with self._conn() as conn:
+                row = conn.execute(
+                    """
+                    SELECT mp.id FROM ml_predictions mp
+                    JOIN signals s ON s.id = mp.signal_id
+                    WHERE s.symbol = ? AND s.strategy = ?
+                      AND mp.actual_outcome IS NULL
+                    ORDER BY mp.timestamp DESC
+                    LIMIT 1
+                    """,
+                    (symbol, strategy),
+                ).fetchone()
+                if not row:
+                    return False
+                conn.execute(
+                    "UPDATE ml_predictions SET actual_outcome = ? WHERE id = ?",
+                    (actual_outcome, row["id"]),
+                )
+                return True
+        return bool(self._retry_on_lock(_do))
 
     # ── Persistent state (V2 Phase 4) ───────────────────────
 
