@@ -53,6 +53,76 @@ _MODELS_DIR = Path(__file__).resolve().parents[3] / "models"
 
 MODEL_NAME = "signal_quality"
 
+# Promotion quality gate.  These thresholds keep a half-trained or
+# overfit model from auto-replacing a good one — the 2026-06 incident
+# was v5 promoting at 12.5% val_acc on 38 trades while v3 at 60.9% on
+# 433 trades silently went inactive.  A new model must clear ALL of:
+#   - val_acc >= MIN_VAL_ACCURACY (better than coin flip)
+#   - training_trades >= MIN_TRAINING_TRADES (statistically meaningful)
+#   - val_acc >= prior_active_acc * (1 - REGRESSION_TOLERANCE) (no big regression)
+# Failing the gate leaves the prior active model in place — the new
+# model is still saved to disk + recorded with is_active=0 so we can
+# diff training runs after the fact.
+MIN_VAL_ACCURACY = 0.55
+MIN_TRAINING_TRADES = 50
+REGRESSION_TOLERANCE = 0.10
+
+
+def _get_prior_active(database: Database, model_name: str) -> dict[str, Any] | None:
+    """Read the currently-active model's accuracy + training_trades.
+
+    Returns None if no prior active model exists (first training run).
+    """
+    with database._conn() as conn:  # noqa: SLF001
+        row = conn.execute(
+            """
+            SELECT version, backtest_accuracy, training_trades
+            FROM ml_models
+            WHERE model_name = ? AND is_active = 1
+            ORDER BY version DESC
+            LIMIT 1
+            """,
+            (model_name,),
+        ).fetchone()
+    if row is None:
+        return None
+    return {
+        "version": row["version"],
+        "backtest_accuracy": row["backtest_accuracy"],
+        "training_trades": row["training_trades"],
+    }
+
+
+def _evaluate_promotion_gate(
+    val_acc: float,
+    training_trades: int,
+    prior_active: dict[str, Any] | None,
+) -> tuple[bool, list[str]]:
+    """Apply the promotion quality gate.
+
+    Returns (passed, reasons).  ``reasons`` lists every failed check so
+    they all show up in the warning email instead of needing a retrain
+    to see the next failure.
+    """
+    reasons: list[str] = []
+    if val_acc < MIN_VAL_ACCURACY:
+        reasons.append(
+            f"val_accuracy {val_acc:.3f} below floor {MIN_VAL_ACCURACY:.2f}"
+        )
+    if training_trades < MIN_TRAINING_TRADES:
+        reasons.append(
+            f"training_trades {training_trades} below floor {MIN_TRAINING_TRADES}"
+        )
+    if prior_active is not None and prior_active.get("backtest_accuracy"):
+        prior_acc = float(prior_active["backtest_accuracy"])
+        floor = prior_acc * (1.0 - REGRESSION_TOLERANCE)
+        if val_acc < floor:
+            reasons.append(
+                f"val_accuracy {val_acc:.3f} regresses vs prior v"
+                f"{prior_active['version']} ({prior_acc:.3f}, floor {floor:.3f})"
+            )
+    return (len(reasons) == 0, reasons)
+
 
 def _load_labelled_dataset(database: Database) -> list[dict]:
     """Join ml_features with trades to build (features, outcome) rows.
@@ -218,7 +288,42 @@ def train_signal_quality_model(
     }
     joblib.dump(payload, model_path)
 
-    _deactivate_prior_versions(database, MODEL_NAME)
+    # Quality gate — read the prior active model BEFORE deactivating so
+    # we can compare against it.  If the new model fails any check, leave
+    # the prior active model untouched and record this run as is_active=0.
+    prior_active = _get_prior_active(database, MODEL_NAME)
+    promote, gate_reasons = _evaluate_promotion_gate(
+        val_acc=val_acc,
+        training_trades=int(len(X)),
+        prior_active=prior_active,
+    )
+
+    if promote:
+        _deactivate_prior_versions(database, MODEL_NAME)
+        is_active_flag = 1
+    else:
+        is_active_flag = 0
+        log.warning(
+            "ml_promotion_blocked",
+            version=version,
+            val_accuracy=round(val_acc, 4),
+            training_trades=int(len(X)),
+            prior_active_version=(prior_active or {}).get("version"),
+            prior_active_accuracy=(prior_active or {}).get("backtest_accuracy"),
+            reasons=gate_reasons,
+        )
+        try:
+            from ai_trade.monitoring.notifier import notify_ml_promotion_blocked
+            notify_ml_promotion_blocked(
+                version=version,
+                val_accuracy=val_acc,
+                training_trades=int(len(X)),
+                prior_active=prior_active,
+                reasons=gate_reasons,
+            )
+        except Exception:
+            log.debug("ml_promotion_blocked_email_failed")
+
     try:
         database.insert_ml_model(
             model_name=MODEL_NAME,
@@ -226,26 +331,29 @@ def train_signal_quality_model(
             trained_at=payload["trained_at"],
             training_trades=len(X),
             backtest_accuracy=val_acc,
-            is_active=1,
+            is_active=is_active_flag,
             model_path=str(model_path),
         )
     except Exception:
         log.exception("ml_model_registry_insert_failed")
 
     log.info(
-        "ml_trainer_success",
+        "ml_trainer_success" if promote else "ml_trainer_quarantined",
         version=version,
         trades_used=len(X),
         train_accuracy=round(train_acc, 4),
         val_accuracy=round(val_acc, 4),
         model_path=str(model_path),
+        promoted=promote,
     )
 
     return {
-        "status": "ok",
+        "status": "ok" if promote else "quarantined",
         "version": version,
         "trades_used": int(len(X)),
         "train_accuracy": train_acc,
         "val_accuracy": val_acc,
         "model_path": str(model_path),
+        "promoted": promote,
+        "gate_reasons": gate_reasons,
     }

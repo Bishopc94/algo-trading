@@ -55,11 +55,13 @@ from ai_trade.data.historical import fetch_bars_multi
 from ai_trade.data.indicators import add_all
 from ai_trade.monitoring.database import Database
 from ai_trade.state_persistence import (
+    STATE_LAST_HEARTBEAT,
     apply_parameter_overrides,
     detect_offline_gap,
     get_current_regime,
     log_boot_summary,
     record_current_regime,
+    record_heartbeat,
     record_shutdown,
     record_startup,
 )
@@ -347,6 +349,34 @@ class TradingBot:
             gap=self._offline_gap,
         )
         record_startup(self.db)
+
+        # Downtime alert: if the last heartbeat is older than the threshold,
+        # we were down — silent crashes don't write a clean shutdown row,
+        # so a stale heartbeat is the reliable signal.  Notify the operator
+        # so they know to investigate (and to know which trades were left
+        # to brackets-on-Alpaca during the gap, like RGNT on 2026-06-10).
+        try:
+            from ai_trade.monitoring.notifier import notify_bot_downtime
+            from datetime import datetime, timezone
+            threshold_hrs = getattr(
+                getattr(self.cfg, "monitoring", None), "downtime_alert_hours", 2,
+            )
+            raw = self.db.get_state(STATE_LAST_HEARTBEAT)
+            if raw:
+                last_hb = datetime.fromisoformat(raw)
+                if last_hb.tzinfo is None:
+                    last_hb = last_hb.replace(tzinfo=timezone.utc)
+                gap_hrs = (datetime.now(timezone.utc) - last_hb).total_seconds() / 3600
+                if gap_hrs >= threshold_hrs:
+                    log.warning(
+                        "bot_downtime_detected",
+                        gap_hours=round(gap_hrs, 2),
+                        last_heartbeat=raw,
+                        threshold_hours=threshold_hrs,
+                    )
+                    notify_bot_downtime(gap_hours=gap_hrs, last_heartbeat_utc=raw)
+        except Exception:
+            log.exception("downtime_alert_failed")
 
         # Reconcile any positions from a previous run (e.g. if the bot
         # was restarted mid-day, positions may still be open on Alpaca).
@@ -1148,11 +1178,21 @@ class TradingBot:
             )
 
             # Print human-readable summary to console
+            framework = getattr(self.cfg.pdt, "framework", "legacy")
+            starting_eq_raw = self.db.get_state("risk.starting_equity")
+            try:
+                starting_eq = float(starting_eq_raw) if starting_eq_raw else None
+            except Exception:
+                starting_eq = None
             summary = self.perf.daily_summary(
                 equity=float(account.equity),
                 cash=float(account.cash),
                 open_positions=len(positions),
                 day_trades_used=self.pdt.get_day_trades_used(),
+                buying_power=float(getattr(account, "buying_power", 0) or 0),
+                pdt_framework=framework,
+                max_day_trades=getattr(self.cfg.pdt, "max_day_trades", 3),
+                starting_equity=starting_eq,
             )
             print(summary)
         except Exception as e:
@@ -1263,7 +1303,12 @@ class TradingBot:
         This is a safety net: if a bracket order's stop-loss or take-profit
         fills on Alpaca's side, the local database needs to be updated.
         Without this sync, the DB would show stale "open" trades.
+
+        Also stamps a heartbeat in bot_state so we can detect downtime
+        gaps on the next startup (silent crashes never write a clean
+        shutdown row; the heartbeat tells us when the bot was last alive).
         """
+        record_heartbeat(self.db)
         try:
             summary = self.orders.sync_positions()
             closed = summary.get("closed_trades", []) if summary else []
@@ -1675,6 +1720,13 @@ class TradingBot:
 
         symbol = t.get("symbol", "")
         strategy = t.get("strategy", "")
+
+        # Start the per-symbol re-entry cooldown.  No-op when the config
+        # knob is 0 (see SignalAggregator.record_exit).
+        try:
+            self.aggregator.record_exit(symbol)
+        except Exception:
+            log.debug("symbol_cooldown_record_failed", symbol=symbol)
         pnl = t.get("pnl")
         pnl_pct = t.get("pnl_pct")
         exit_price = t.get("exit_price")
@@ -1716,6 +1768,18 @@ class TradingBot:
 
         try:
             if exit_price is not None and entry_price is not None and pnl is not None:
+                # Compute hold duration in hours from entry_time / exit_time
+                hold_hours = None
+                try:
+                    from datetime import datetime
+                    et_raw = t.get("entry_time"); xt_raw = t.get("exit_time")
+                    if et_raw and xt_raw:
+                        et = datetime.fromisoformat(et_raw)
+                        xt = datetime.fromisoformat(xt_raw)
+                        hold_hours = (xt - et).total_seconds() / 3600
+                except Exception:
+                    pass
+                low_since = t.get("low_since_entry")
                 notify_trade_exit(
                     symbol=symbol,
                     strategy=strategy,
@@ -1729,7 +1793,9 @@ class TradingBot:
                     conviction=float(t.get("conviction")) if t.get("conviction") is not None else None,
                     stop_quality=stop_quality if stop_quality != "not_hit" else None,
                     high_since_entry=float(high_since) if high_since else None,
+                    low_since_entry=float(low_since) if low_since else None,
                     take_profit=float(target) if target else None,
+                    hold_hours=hold_hours,
                 )
         except Exception as e:
             log.debug("exit_email_failed", symbol=symbol, error=str(e))
@@ -2197,27 +2263,31 @@ class TradingBot:
 
             near_misses = self.aggregator.get_near_misses() if self.aggregator else []
 
-            # Portfolio heat = total risk / equity
+            # Portfolio heat — same definition the entry gate uses.
             heat_pct = 0.0
             try:
                 open_trades = self.db.get_open_trades()
-                total_risk = sum(
-                    abs(t.get("entry_price", 0) - t.get("stop_loss_price", 0)) * t.get("shares", 0)
-                    for t in open_trades
-                )
-                heat_pct = (total_risk / equity * 100) if equity > 0 else 0.0
+                heat_pct = self.risk.compute_portfolio_heat(open_trades, equity) * 100
             except Exception:
                 pass
 
             vix = getattr(ctx, "vix", 0.0) if ctx else 0.0
             regime = ctx.regime.value if ctx else "unknown"
             pdt_used = 3 - self.pdt.day_trades_remaining()
+            framework = getattr(self.cfg.pdt, "framework", "legacy")
+            buying_power = None
+            try:
+                from ai_trade.clients import get_account
+                acct = get_account()
+                buying_power = float(getattr(acct, "buying_power", 0) or 0)
+            except Exception:
+                pass
 
             summary = con.cycle_summary(
                 regime=regime,
                 vix=vix,
                 pdt_used=pdt_used,
-                pdt_max=3,
+                pdt_max=getattr(self.cfg.pdt, "max_day_trades", 3),
                 candidates=len(self._candidates),
                 momentum=self._scan_counts.get("momentum", 0),
                 mean_rev=self._scan_counts.get("mean_reversion", 0),
@@ -2228,6 +2298,8 @@ class TradingBot:
                 cash=cash,
                 open_positions=open_positions,
                 heat_pct=heat_pct,
+                pdt_framework=framework,
+                buying_power=buying_power,
             )
             print(summary)
         except Exception as e:
@@ -2800,6 +2872,34 @@ class TradingBot:
                     )
 
                 if signal is not None:
+                    # Provenance (operating principle #5): a produced signal
+                    # gets its own decision row. Without it the funnel only
+                    # records rejects/near-misses, so a signal generated here
+                    # but dropped downstream (risk cap, budget, position cap,
+                    # submit failure, dry-run) leaves no trace — making "never
+                    # signalled" indistinguishable from "signalled, not filled".
+                    # Logged under type(strategy).__name__ so it groups with
+                    # this strategy's reject/near_miss rows in the evaluate stage.
+                    self.decisions.log_evaluate(
+                        symbol=symbol,
+                        strategy=strat_name,
+                        action="signal",
+                        conviction=signal.conviction,
+                        reasoning=(
+                            f"signal: {len(signal.legs)} legs, "
+                            f"max_loss=${signal.max_loss:.2f}, "
+                            f"max_profit=${signal.max_profit:.2f}"
+                        ),
+                        factors={
+                            "legs": len(signal.legs),
+                            "max_loss": signal.max_loss,
+                            "max_profit": signal.max_profit,
+                            "expiration": signal.expiration,
+                            "strikes": signal.strikes,
+                            "net_delta": signal.net_delta,
+                            "net_theta": signal.net_theta,
+                        },
+                    )
                     signals.append(signal)
 
         return signals

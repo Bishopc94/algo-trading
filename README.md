@@ -661,6 +661,86 @@ Dev dependencies (`pip install -e ".[dev]"`): `pytest`, `pytest-asyncio`.
 
 ## Changelog
 
+### v2.4.4 — Options signal provenance
+
+A funnel audit (why no options have ever traded) surfaced a provenance gap: in the options evaluation path, a strategy's *rejections* and *near-misses* were logged to `decisions`, but a strategy that actually **produced** a signal wrote no row until it later filled. Since most options signals never fill (they're dropped by the per-position risk cap, the capital budget, the position-count cap, a submit failure, or dry-run), the funnel could not tell "never signalled" apart from "signalled but not filled" — which is exactly the ambiguity that made the options-not-trading diagnosis harder than it should have been. This violates operating principle #5 (every signal writes a row).
+
+**Options signal decision row (`main.py` `_collect_options_signals`)**
+- When a strategy returns a non-None `OptionsSignal`, the bot now logs a `decisions` row via `log_evaluate(action="signal")` — same `decision_type="evaluate"` stage as the reject/near-miss rows, keyed under `type(strategy).__name__` so signal/reject/near_miss for one strategy group together in a single funnel query.
+- The row carries conviction plus the signal structure (legs, `max_loss`, `max_profit`, expiration, strikes, `net_delta`, `net_theta`), so a signal that's generated but dropped downstream is fully inspectable.
+- Logging-only; no change to which trades are produced or submitted. Smoke-tested: a producing strategy emits exactly one `action=signal` row with the structure attached, while a rejecting strategy still logs only its near-miss and no signal row.
+
+### v2.4.3 — Global swing-strategy entry-price floor
+
+Continues the §3.2 work from the handoff. The v2.4.0/v2.4.1 `min_entry_price` floors were per-strategy (`macd_divergence`, `ema_crossover`) — easy to forget when adding a new swing strategy, and the closed-trade P&L showed the damage concentrated in the $2–10 bucket (high win-rate, but the losses gap down on overnight holds). The fix targets the *class* — any signal carried overnight — rather than naming individual strategies.
+
+**Global swing floor (`risk.swing_min_entry_price: 5.00`)**
+- New gate in `SignalAggregator`: a signal whose `hold_type == SWING` and `entry_price < swing_min_entry_price` is rejected, regardless of which strategy produced it. Day/adaptive signals are exempt — the sub-$2 `momentum`/`vwap`/`orb` scalps close intraday and the bucket data says they're profitable there.
+- Composes with the existing per-strategy `min_entry_price` (the higher floor wins). The reject decision is logged with `filter=min_entry_price` and a `gate` field (`swing` vs `strategy`) so the funnel report shows which floor caught each candidate.
+- Nuance worth flagging: `momentum` and `bb_squeeze` emit `SWING` only at conviction < 0.9 (DAY above). The global gate therefore catches their *low-conviction overnight* variants — which carry the same gap risk as RGNT — while leaving their high-conviction day scalps untouched. This is more precise than a per-strategy floor would have been.
+- `pullback` and `mean_reversion` (both always-SWING) are now covered without needing their own floors; `ema_crossover`/`macd_divergence` keep theirs (redundant at the same $5, harmless).
+- Smoke test confirms: sub-$5 swing rejected (`gate=swing`), sub-$5 day allowed, $6 swing allowed.
+
+### v2.4.2 — ML rollback (manual + startup auto-heal), heat-math direction guard
+
+Risk-hardening follow-ups from the 2026-06-20 handoff. The v2.4.1 gate stopped *future* bad ML promotions but couldn't undo the one already in place: `signal_quality_v6` was hand-promoted to `is_active=1` at 12.5% val accuracy / 38 trades while v3 (60.9% / 433) sat inactive, so every ranked signal was being degraded. This release rolls v6 back, makes the gate symmetric, and surfaces direction-blind portfolio-heat readings.
+
+**1. Manual rollback (one-off DB update)**
+- Flipped `is_active` so `signal_quality_v3` is active again (v4/v5/v6 demoted to 0). Smoke test `SignalQualityPredictor(Database()).version, .training_trades` now reports `3 / 433`.
+
+**2. Startup auto-rollback (`ml/predictor.py`)**
+- `_load_active_model` now re-checks the active row against the trainer's absolute gate constants (`MIN_VAL_ACCURACY`, `MIN_TRAINING_TRADES`, imported from `ml/trainer.py` so the two never drift). The regression check is trainer-only — there is no "new vs prior" at load time.
+- On failure it walks `ml_models` newest-first for the most recent passing version, flips the `is_active` flags in one transaction, and loads that model instead. If nothing passes, it falls back to cold-start (rule-based conviction) rather than serving a broken model.
+- A `notify_ml_rollback` email reports the demoted version, the restored version, and every failed check. The trainer now blocks bad models going active; the predictor heals one that already is.
+- Verified end-to-end on a DB copy: v6-active replays to v6 demoted / v3 restored with both gate reasons fired.
+
+**3. Heat-math direction guard (`risk/risk_manager.py`)**
+- `check_portfolio_heat` now reads the entry-to-stop distance directionally off the trade's `side` (long: `entry - stop`, short: `stop - entry`). A negative reading means the stop is on the profit side of entry.
+- Such rows are logged as `trade_risk_sign_mismatch` (symbol, side, entry, stop, shares) and still counted at their positive magnitude — a negative value can never silently reduce total heat and wave a trade past the cap.
+- Investigation of the handoff's flagged `JRSH` row (open, `stop 4.17 > entry 3.86` on a long) found it was **not** corruption or a mislabeled short: it's a winning momentum long whose trailing stop ratcheted above entry after price hit 4.445. The `stop_loss` column holds the current trailed stop, so `stop > entry` is expected on a profitable position. The heat sum already used `abs()`; the missing piece was visibility, now added.
+- Also fixed a separate console/email heat-display bug: the readout in `main.py` summed `entry - stop_loss_price`, but `get_open_trades()` rows carry `stop_loss` (no `stop_loss_price`), so the missing key defaulted to `0` and the display reported `entry × shares` as risk. On the current book the displayed heat was 25.48% vs a true 3.99%.
+- Consolidated the two heat implementations: the loop now lives in one place, `RiskManager.compute_portfolio_heat` (returns risk as a fraction of equity), and both the entry gate (`check_portfolio_heat`) and the console display call it. The display path was the source of the `stop_loss_price` bug — routing it through the shared method removes the duplication that let the two drift. The entry gate was never affected by the display bug.
+
+### v2.4.1 — ML promotion quality gate, ema_crossover price floor, per-symbol re-entry cooldown
+
+Three loss-pattern fixes spawned by the 2026-06-17 review: v5 ML model auto-promoted at 12.5% val accuracy and started degrading every signal, `ema_crossover` fired 6 entries on LNKS (~$1.85) in 51 minutes for -$176, and nothing throttled compound losses on a single name after a recent exit.
+
+**1. ML promotion quality gate (`ml/trainer.py`)**
+- Before flipping a new model to `is_active=1`, the trainer now checks: `val_accuracy >= 0.55`, `training_trades >= 50`, and `val_accuracy >= prior_active * 0.9` (≤10% regression).
+- Any failed check leaves the prior active model in place. The new model is still written to disk and recorded with `is_active=0` so failed runs are inspectable.
+- A `notify_ml_promotion_blocked` email lists the version, val accuracy, training count, prior-active comparison, and every failed check.
+- Replaying the v5 incident through the gate: blocked with all three reasons fired (`val_accuracy 0.125 below floor 0.55`, `training_trades 38 below floor 50`, `regresses vs prior v3`).
+
+**2. `ema_crossover.min_entry_price: 5.00`**
+- Mirrors the floor v2.4.0 added on `macd_divergence`. LNKS was the same micro-cap-on-a-swing pattern (-$176 in 51 min) — the entry signal is real but the float is too thin for any stop to protect through an open.
+
+**3. Per-symbol re-entry cooldown (`SignalAggregator`)**
+- New config `risk.symbol_cooldown_minutes` (default 30). After `_log_stock_trade_exit` runs, `SignalAggregator.record_exit(symbol)` stamps an in-memory timestamp; `collect_and_rank` skips that symbol — across every strategy — until the window elapses.
+- Decision-logged as `reject` with `filter=symbol_cooldown` so the funnel reports show how many candidates the cooldown caught. 0 disables the gate. State is in-memory only; resets at process restart.
+
+### v2.4.0 — Entry-price reconciliation, bot heartbeat alert, per-strategy price floor, post-PDT displays, richer exit emails
+
+Triggered by the RGNT 2026-06-10 loss (-$648, -37.8%) — a forensic review uncovered the bot was down 4 days, the DB stored the signal price ($2.96) instead of the actual Alpaca fill ($3.02) which broke realized P&L math, and a sub-$3 micro-cap on a swing strategy is structurally exposed to overnight-gap risk no stop can protect against.
+
+**1. Entry-price reconciliation in `sync_positions`**
+- New step 3b: for every DB-tracked position, compare the DB `entry_price` to Alpaca's `avg_entry_price`. When the gap is ≥ 0.5%, sync to Alpaca's actual fill. The bot inserts at signal time (the daily-bar close); brackets fill at the next-bar open with slippage — the gap was 2% on RGNT. Realized P&L and the trailing-stop planner now operate on truth, not the stale signal.
+
+**2. Bot heartbeat alert (catches the silent-crash class)**
+- `record_heartbeat()` stamps `bot.last_heartbeat_utc` every 60s in `job_sync_positions`.
+- On startup the bot checks the persisted heartbeat — if the gap exceeds `monitoring.downtime_alert_hours` (default 2h), it logs `bot_downtime_detected` and emails `notify_bot_downtime` with the gap duration, last-heartbeat timestamp, and a reminder that server-side brackets on Alpaca were the only protection during the gap.
+- Catches silent crashes that never write a clean shutdown row (the RGNT-window failure mode).
+
+**3. Per-strategy min entry-price floor**
+- New config: `strategies.<name>.min_entry_price` (default 0 = no floor). The aggregator checks before applying the weighter — signals with `entry_price < floor` get a `reject` decision with `filter=min_entry_price` and are dropped silently from the funnel.
+- Default applied: `macd_divergence: 5.00` — sub-$5 micro-caps on a swing strategy are too gap-prone (RGNT was $2.96).
+
+**4. Post-PDT displays (the day-trade counter no longer applies)**
+- `cycle_summary` and `daily_summary` now take `pdt_framework` and `buying_power`. Under `intraday_margin` (post-2026-06-04) the "PDT: N/3 used" line is replaced with "BP: $X buying power" — the real binding constraint now.
+- `daily_summary` enriched: day-equity delta (`+$X.XX / +X.XX%`), Best/Worst trade, current win/loss streak.
+
+**5. Richer trade-exit emails**
+- `notify_trade_exit` now reports MFE/MAE as percentages, hold duration in hours/days, and a "MFE capture %" line when there was meaningful upside (≥ 3%) to capture. Surfaces give-back patterns at a glance — would have shown the AHMA-style cases without manual analysis.
+
 ### v2.3.5 — Heat-lockup fix, tracked-position re-protect, PDT framework flip, filter report
 
 Three issues + one feature, found by a "why hasn't the algo traded in days?" investigation:

@@ -194,20 +194,50 @@ def scan_result(total: int, momentum: int, mean_rev: int, vwap: int,
 
 def daily_summary(today: str, equity: float, cash: float,
                   open_positions: int, day_trades_used: int,
-                  metrics: dict) -> str:
-    """Format end-of-day summary box."""
-    w = 50
+                  metrics: dict,
+                  buying_power: float | None = None,
+                  pdt_framework: str = "legacy",
+                  max_day_trades: int = 3,
+                  starting_equity: float | None = None,
+                  ) -> str:
+    """Format end-of-day summary box.
+
+    `pdt_framework`: "legacy" shows PDT slot usage; "intraday_margin"
+        (post-2026-06-04 FINRA rule retirement) shows buying-power
+        headroom instead, since the day-trade count limit no longer
+        applies and Alpaca governs via intraday margin checks.
+    """
+    w = 56
     sep = _THIN_HORIZ * w
 
     pnl = metrics["total_pnl"]
     pnl_str = f"+${pnl:,.2f}" if pnl >= 0 else f"-${abs(pnl):,.2f}"
 
+    # Day equity arrow (compact directional read)
+    arrow = ""
+    if starting_equity and starting_equity > 0:
+        delta = equity - starting_equity
+        delta_pct = delta / starting_equity * 100
+        sign = "+" if delta >= 0 else ""
+        arrow = f"  ({sign}${delta:,.2f} / {sign}{delta_pct:.2f}%)"
+
+    # Framework-specific account line
+    if pdt_framework == "intraday_margin":
+        bp_str = (
+            f"${buying_power:,.2f} buying power"
+            if buying_power is not None else "intraday margin"
+        )
+        gov_line = f"  Open:    {open_positions} positions    Gov:   {bp_str}"
+    else:
+        gov_line = f"  Open:    {open_positions} positions    PDT:   {day_trades_used}/{max_day_trades} used"
+
     lines = [
         f"\n{sep}",
         f"  Daily Summary {_THIN_HORIZ} {today}",
         f"{sep}",
-        f"  Equity:  ${equity:,.2f}     Cash:  ${cash:,.2f}",
-        f"  Open:    {open_positions} positions    PDT:   {day_trades_used}/3 used",
+        f"  Equity:  ${equity:,.2f}{arrow}",
+        f"  Cash:    ${cash:,.2f}",
+        gov_line,
         f"{sep}",
         f"  Trades closed:  {metrics['total_trades']}",
         f"  Win rate:       {metrics['win_rate']:.0%}",
@@ -216,8 +246,15 @@ def daily_summary(today: str, equity: float, cash: float,
         f"  Profit factor:  {metrics['profit_factor']}",
         f"  Sharpe ratio:   {metrics['sharpe_ratio']}",
         f"  Max drawdown:   {metrics['max_drawdown_pct']:.1f}%",
-        f"{sep}",
     ]
+    # Optional richer block (added 2026-06-11)
+    if metrics.get("max_win") is not None and metrics.get("max_loss") is not None:
+        lines.append(f"  Best / Worst:   +${metrics['max_win']:,.2f}  /  -${abs(metrics['max_loss']):,.2f}")
+    if "win_streak" in metrics and "loss_streak" in metrics:
+        lines.append(
+            f"  Streaks:        win {metrics['win_streak']}  |  loss {metrics['loss_streak']}"
+        )
+    lines.append(sep)
     return "\n".join(lines)
 
 
@@ -226,18 +263,26 @@ def cycle_summary(
     candidates: int, momentum: int, mean_rev: int, vwap: int,
     signals: list[dict], near_misses: list[dict],
     equity: float, cash: float, open_positions: int, heat_pct: float,
+    pdt_framework: str = "legacy",
+    buying_power: float | None = None,
 ) -> str:
     """V2: Rich per-cycle summary matching the V2 agent brief spec.
 
     Args:
         signals: list of {symbol, strategy, conviction, entry, stop, target, hold_type, action}
         near_misses: list of {symbol, strategy, reason, miss_pct}
+        pdt_framework: "legacy" prints PDT slot usage; "intraday_margin"
+            (post-2026-06-04) replaces it with buying-power headroom.
     """
     ts = _ts()
     w = _SECTION_WIDTH + 4
     sep = _HORIZ * w
 
-    lines = [f"\n{sep}", f"  Scan {ts}  |  Regime: {regime.upper()}  |  VIX {vix:.1f}  |  PDT: {pdt_used}/{pdt_max}"]
+    gov = (
+        f"BP: ${buying_power:,.0f}" if pdt_framework == "intraday_margin" and buying_power is not None
+        else f"PDT: {pdt_used}/{pdt_max}"
+    )
+    lines = [f"\n{sep}", f"  Scan {ts}  |  Regime: {regime.upper()}  |  VIX {vix:.1f}  |  {gov}"]
     lines.append(f"  Scanned: {candidates} candidates (momentum={momentum}, mean_rev={mean_rev}, vwap={vwap})")
 
     if signals:

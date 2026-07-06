@@ -191,6 +191,88 @@ class RiskManager:
             return False, f"drawdown circuit breaker: {tier.reason}"
         return True, "ok"
 
+    def compute_portfolio_heat(
+        self,
+        open_trades: list[dict],
+        current_equity: float,
+    ) -> float:
+        """Total open-trade risk as a fraction of equity (``0.06`` == 6%).
+
+        Single source of truth for portfolio heat — both the entry gate
+        (``check_portfolio_heat``) and the console/email display call this
+        so the two readings can never drift. Returns ``0.0`` when equity is
+        non-positive.
+
+        TRADING CONCEPT — Portfolio Heat:
+            "Heat" is the total dollar amount at risk across all open
+            positions, expressed as a fraction of total equity.
+
+            For each open trade:
+                trade_risk = |entry_price - stop_loss| × shares
+
+            Portfolio heat = sum(all trade_risk) / current_equity
+
+            The distance is read directionally off the trade's ``side``
+            (long: entry - stop, short: stop - entry).  A negative reading
+            means the stop is on the profit side of entry — a trailing
+            stop that locked in gains, or a short mishandled as a long.
+            It is logged as ``trade_risk_sign_mismatch`` and still counted
+            at its positive magnitude so it can never reduce total heat.
+
+            For example, if you have 3 trades each risking $200 on a
+            $10,000 account, your heat is $600 / $10,000 = 0.06.
+
+        Args:
+            open_trades:    List of trade dictionaries from the database,
+                            each containing "entry_price", "stop_loss",
+                            and "shares" keys.
+            current_equity: Current total account value.
+        """
+        if current_equity <= 0:
+            return 0.0
+
+        total_risk = 0.0
+        for trade in open_trades:
+            # Use .get() with fallback to 0 for safety — some trades might
+            # have missing/null fields if they were inserted with incomplete data.
+            entry = trade.get("entry_price", 0) or 0
+            stop = trade.get("stop_loss", 0) or 0
+            shares = trade.get("shares", 0) or 0
+            side = (trade.get("side") or "long").lower()
+
+            # Directional risk-per-share: for a long the protective stop sits
+            # BELOW entry (entry - stop > 0); for a short it sits ABOVE
+            # (stop - entry > 0). A negative value means the stop is on the
+            # profit side of the entry.
+            directional = (stop - entry) if side == "short" else (entry - stop)
+
+            # Risk always enters the heat sum as a positive magnitude — a
+            # negative directional reading must never silently reduce total
+            # heat (that would wave a trade through the cap). See §3.3.
+            total_risk += abs(directional) * shares
+
+            if directional < 0:
+                # Two benign-to-malign causes, distinguishable from the values:
+                #   - a winning long whose trailing stop has ratcheted above
+                #     entry to lock in profit (JRSH 2026-06-15: long, entry
+                #     3.86, trailed stop 4.17 after price hit 4.44) — common,
+                #     not corruption; the position simply has no downside left
+                #   - a short mislabeled/handled as long, where the stop above
+                #     entry is real risk the unsigned formula would hide
+                # Either way we surface it rather than trusting the sign.
+                logger.warning(
+                    "trade_risk_sign_mismatch",
+                    symbol=trade.get("symbol"),
+                    side=side,
+                    entry_price=entry,
+                    stop_loss=stop,
+                    shares=shares,
+                    directional_risk_per_share=round(directional, 4),
+                    counted_as=round(abs(directional) * shares, 2),
+                )
+
+        return total_risk / current_equity
+
     def check_portfolio_heat(
         self,
         open_trades: list[dict],
@@ -199,27 +281,10 @@ class RiskManager:
         """Return ``(False, reason)`` if total risk of open trades exceeds
         the portfolio heat limit.
 
-        TRADING CONCEPT — Portfolio Heat:
-            "Heat" is the total dollar amount at risk across all open
-            positions, expressed as a percentage of total equity.
-
-            For each open trade:
-                trade_risk = |entry_price - stop_loss| × shares
-
-            Portfolio heat = sum(all trade_risk) / current_equity
-
-            For example, if you have 3 trades each risking $200 on a
-            $10,000 account, your heat is $600 / $10,000 = 6%.
-
-            A typical limit is 6-10%.  If heat exceeds the limit, no new
-            trades are allowed until existing trades are closed or their
-            stops are tightened.
-
-        Args:
-            open_trades:    List of trade dictionaries from the database,
-                            each containing "entry_price", "stop_loss",
-                            and "shares" keys.
-            current_equity: Current total account value.
+        Heat itself is computed by ``compute_portfolio_heat`` (the shared
+        definition); this method only applies the cap. A typical limit is
+        6-10%. If heat exceeds it, no new trades are allowed until existing
+        trades are closed or their stops are tightened.
         """
         max_heat: float = getattr(self.config, "max_portfolio_heat_pct", 0.06)
 
@@ -227,20 +292,7 @@ class RiskManager:
         if current_equity <= 0:
             return False, "equity is zero"
 
-        # Sum up the risk for every open trade.
-        total_risk = 0.0
-        for trade in open_trades:
-            # Use .get() with fallback to 0 for safety — some trades might
-            # have missing/null fields if they were inserted with incomplete data.
-            entry = trade.get("entry_price", 0) or 0
-            stop = trade.get("stop_loss", 0) or 0
-            shares = trade.get("shares", 0) or 0
-
-            # Risk = distance from entry to stop × number of shares.
-            trade_risk = abs(entry - stop) * shares
-            total_risk += trade_risk
-
-        heat_pct = total_risk / current_equity
+        heat_pct = self.compute_portfolio_heat(open_trades, current_equity)
         if heat_pct > max_heat:
             msg = (
                 f"portfolio heat {heat_pct:.2%} exceeds "

@@ -738,6 +738,39 @@ class OrderManager:
                 except Exception as e:
                     log.exception("adopt_untracked_failed", symbol=sym)
 
+            # Step 3b: Reconcile DB entry_price to Alpaca's actual fill
+            # price.  The bot inserts the trade row at submission time using
+            # the signal's entry_price (the daily-bar close), but the
+            # bracket actually fills at the next-bar OPEN with slippage —
+            # the two diverged on RGNT by 2% ($2.96 vs $3.02) and broke
+            # the realized-P&L math.  When the gap is > 0.5%, sync to
+            # Alpaca's avg_entry_price (source of truth).
+            for trade in db_trades:
+                sym = trade["symbol"]
+                if sym not in position_symbols:
+                    continue
+                pos = position_map[sym]
+                try:
+                    actual_avg = float(pos.avg_entry_price)
+                    db_entry = float(trade.get("entry_price") or 0)
+                except (TypeError, ValueError):
+                    continue
+                if actual_avg <= 0 or db_entry <= 0:
+                    continue
+                gap_pct = abs(actual_avg - db_entry) / db_entry
+                if gap_pct >= 0.005:
+                    try:
+                        self._db.update_trade(trade["id"], entry_price=actual_avg)
+                        log.info(
+                            "entry_price_reconciled",
+                            symbol=sym, trade_id=trade["id"],
+                            db_entry=db_entry, actual_fill=actual_avg,
+                            gap_pct=round(gap_pct * 100, 2),
+                        )
+                    except Exception as e:
+                        log.debug("entry_price_reconcile_failed",
+                                  symbol=sym, error=str(e))
+
             # Step 4: Stale trades (in DB, not on Alpaca) — closed by
             # stop-loss/take-profit fill.  Try to fetch the last trade
             # price to compute P&L.

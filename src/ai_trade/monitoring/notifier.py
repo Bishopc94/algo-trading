@@ -414,13 +414,27 @@ def notify_trade_exit(
     stop_quality: str | None,
     high_since_entry: float | None,
     take_profit: float | None,
+    low_since_entry: float | None = None,
+    hold_hours: float | None = None,
 ) -> None:
     """Send an alert when a trade closes."""
     won = pnl >= 0
     tag = "WIN" if won else "LOSS"
     subject = (
-        f"[{tag}] {symbol} {_fmt_pct(pnl_pct)} ({exit_reason})"
+        f"[{tag}] {symbol} {_fmt_pct(pnl_pct)}  pnl={_fmt_price(pnl)}  ({exit_reason})"
     )
+
+    # Compute MFE/MAE — surfaces "give-back" / "near miss" patterns.
+    mfe_pct = mae_pct = None
+    capture_pct = None
+    if entry_price and entry_price > 0:
+        if high_since_entry:
+            mfe_pct = (high_since_entry - entry_price) / entry_price * 100
+            if mfe_pct > 0:
+                capture_pct = pnl_pct / mfe_pct * 100
+        if low_since_entry:
+            mae_pct = (entry_price - low_since_entry) / entry_price * 100
+
     rows = [
         ("Time", _now_et()),
         ("Symbol", symbol),
@@ -428,16 +442,27 @@ def notify_trade_exit(
         ("Hold type", hold_type),
         ("Exit reason", exit_reason),
     ]
+    if hold_hours is not None:
+        if hold_hours >= 24:
+            rows.append(("Held", f"{hold_hours/24:.1f} days"))
+        else:
+            rows.append(("Held", f"{hold_hours:.1f} hours"))
     if conviction is not None:
         rows.append(("Conviction", f"{conviction:.2f}  ({conviction:.0%})"))
     rows.extend([
         ("Shares", f"{shares}"),
         ("Entry", _fmt_price(entry_price)),
         ("Exit", _fmt_price(exit_price)),
-        ("Peak", _fmt_price(high_since_entry)),
+        ("Peak (MFE)", f"{_fmt_price(high_since_entry)}" +
+                       (f"  ({_fmt_pct(mfe_pct)})" if mfe_pct is not None else "")),
+        ("Trough (MAE)", f"{_fmt_price(low_since_entry)}" +
+                         (f"  ({_fmt_pct(-mae_pct)})" if mae_pct is not None else "")),
         ("Target", _fmt_price(take_profit)),
         ("P&L", f"{_fmt_price(pnl)}  ({_fmt_pct(pnl_pct)})"),
     ])
+    if capture_pct is not None and mfe_pct is not None and mfe_pct >= 3.0:
+        # Useful only when there WAS meaningful upside to capture
+        rows.append(("MFE capture", f"{capture_pct:.0f}% of peak"))
     if stop_quality:
         rows.append(("Stop quality", stop_quality))
 
@@ -465,4 +490,149 @@ def notify_trade_exit(
     text_body = _render_text(
         f"TRADE CLOSED -- {symbol} ({tag})", rows, footer=footer,
     )
+    _send_async(subject, html_body, text_body)
+
+
+def notify_bot_downtime(gap_hours: float, last_heartbeat_utc: str) -> None:
+    """Email the operator that the bot was down (silent crash or stop).
+
+    Triggered at startup when the persisted heartbeat is older than the
+    configured threshold.  Surfaces three things the operator cares about
+    after a gap: how long the bot was offline, when it was last alive,
+    and a reminder that server-side brackets on Alpaca were the only
+    protection during the gap (so any positions held overnight rode
+    their original stop/target — see RGNT 2026-06-10).
+    """
+    if gap_hours >= 24:
+        gap_human = f"{gap_hours/24:.1f} days"
+    else:
+        gap_human = f"{gap_hours:.1f} hours"
+    subject = f"[BOT DOWN] Bot was offline for {gap_human}"
+    rows = [
+        ("Restart time", _now_et()),
+        ("Gap", gap_human),
+        ("Last heartbeat (UTC)", last_heartbeat_utc),
+    ]
+    footer = (
+        "Trailing-stop adjustments and exit logic did NOT run during the "
+        "gap. Open positions were protected only by their server-side "
+        "brackets on Alpaca, so any stops or targets that hit during the "
+        "gap filled at the available market price (potentially with "
+        "slippage on a gap-down). Review trades that closed in the window "
+        "to see if any need attention."
+    )
+    accent = _COLORS["red"]
+    html_body = _render_html(
+        title="Bot was offline",
+        subtitle=f"Downtime alert -- {gap_human}",
+        accent=accent,
+        rows=rows,
+        footer=footer,
+    )
+    text_body = _render_text("BOT DOWNTIME ALERT", rows, footer=footer)
+    _send_async(subject, html_body, text_body)
+
+
+def notify_ml_promotion_blocked(
+    version: int,
+    val_accuracy: float,
+    training_trades: int,
+    prior_active: dict | None,
+    reasons: list[str],
+) -> None:
+    """Email the operator that the latest model failed the promotion gate.
+
+    The new version is still saved on disk and registered as inactive so
+    we can inspect it after the fact, but the prior active model keeps
+    serving inference.  The 2026-06 incident — v5 at 12.5% acc auto-
+    promoted over v3 at 60.9% — is exactly the scenario this prevents.
+    """
+    rows = [
+        ("New version", f"v{version}"),
+        ("Val accuracy", f"{val_accuracy:.3f}"),
+        ("Training trades", str(training_trades)),
+    ]
+    if prior_active:
+        prior_acc = prior_active.get("backtest_accuracy")
+        rows.append((
+            "Prior active",
+            f"v{prior_active.get('version')} -- acc "
+            f"{(float(prior_acc) if prior_acc is not None else 0.0):.3f}, "
+            f"trades {prior_active.get('training_trades')}",
+        ))
+    rows.append(("Failed checks", "; ".join(reasons) if reasons else "n/a"))
+    subject = f"[ML] Promotion blocked -- v{version} failed quality gate"
+    footer = (
+        "The new model was saved on disk and recorded with is_active=0 "
+        "for later inspection. Live inference continues against the prior "
+        "active model. Investigate the training pipeline (label quality, "
+        "feature drift, sample size) before forcing promotion."
+    )
+    accent = _COLORS["red"]
+    html_body = _render_html(
+        title="ML promotion blocked",
+        subtitle=f"v{version} failed the quality gate",
+        accent=accent,
+        rows=rows,
+        footer=footer,
+    )
+    text_body = _render_text("ML PROMOTION BLOCKED", rows, footer=footer)
+    _send_async(subject, html_body, text_body)
+
+
+def notify_ml_rollback(
+    failed_version: int,
+    failed_val_accuracy: float | None,
+    failed_training_trades: int,
+    restored_version: int | None,
+    restored_val_accuracy: float | None,
+    restored_training_trades: int | None,
+    reasons: list[str],
+) -> None:
+    """Email the operator that a broken active model was auto-rolled-back.
+
+    Counterpart to the trainer's promotion gate: the trainer blocks a bad
+    model from going active, this fires when the predictor finds an
+    already-active model that fails the same gate at startup and demotes
+    it in favour of the most recent passing version.  The 2026-06 incident
+    — v6 at 12.5% acc hand-promoted over v3 at 60.9% — is the scenario
+    this self-heals on the next restart.
+    """
+    rows = [
+        ("Demoted version", f"v{failed_version}"),
+        (
+            "Demoted val accuracy",
+            f"{failed_val_accuracy:.3f}" if failed_val_accuracy is not None else "n/a",
+        ),
+        ("Demoted training trades", str(failed_training_trades)),
+    ]
+    if restored_version is not None:
+        rows.append((
+            "Restored active",
+            f"v{restored_version} -- acc "
+            f"{(restored_val_accuracy if restored_val_accuracy is not None else 0.0):.3f}, "
+            f"trades {restored_training_trades}",
+        ))
+    else:
+        rows.append(("Restored active", "none -- cold-start (no passing model)"))
+    rows.append(("Failed checks", "; ".join(reasons) if reasons else "n/a"))
+    subject = (
+        f"[ML] Auto-rollback -- v{failed_version} demoted"
+        + (f", v{restored_version} restored" if restored_version is not None else "")
+    )
+    footer = (
+        "The active model failed the quality gate at startup and was "
+        "demoted to is_active=0. The most recent passing version was "
+        "marked active in its place; if none passed, inference falls back "
+        "to rule-based conviction (cold-start). No retrain was triggered."
+    )
+    accent = _COLORS["red"]
+    html_body = _render_html(
+        title="ML auto-rollback",
+        subtitle=f"v{failed_version} demoted at startup",
+        accent=accent,
+        rows=rows,
+        footer=footer,
+    )
+    text_body = _render_text("ML AUTO-ROLLBACK", rows, footer=footer)
     _send_async(subject, html_body, text_body)

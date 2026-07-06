@@ -44,6 +44,7 @@ log = get_logger(__name__)
 
 STATE_LAST_SHUTDOWN = "bot.last_shutdown_utc"
 STATE_LAST_STARTUP = "bot.last_startup_utc"
+STATE_LAST_HEARTBEAT = "bot.last_heartbeat_utc"
 
 
 def _coerce(raw: str) -> Any:
@@ -167,6 +168,18 @@ def record_shutdown(database: Database) -> None:
         database.set_state(STATE_LAST_SHUTDOWN, datetime.utcnow().isoformat())
     except Exception:
         log.exception("record_shutdown_failed")
+
+
+def record_heartbeat(database: Database) -> None:
+    """Stamp a heartbeat in bot_state.  Called every cycle so we can detect
+    silent stalls (process running but stuck) and also cleanly bound how
+    long the bot was actually working between explicit shutdown/startup
+    transitions.  Cheap — a single bot_state write.
+    """
+    try:
+        database.set_state(STATE_LAST_HEARTBEAT, datetime.utcnow().isoformat())
+    except Exception:
+        log.exception("record_heartbeat_failed")
 
 
 def detect_offline_gap(database: Database) -> dict | None:

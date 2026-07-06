@@ -93,6 +93,13 @@ strategies:
     atr_stop_multiplier: 1.5
     atr_tp_multiplier: 3.0
     hold_type: swing
+    min_entry_price: 5.00           # v2.4.1: skip sub-$5 micro-caps.  LNKS
+                                    # 2026-06-17 fired 6 ema_crossover entries
+                                    # on a ~$1.85 ticker in 51 minutes for
+                                    # -$176. Same micro-cap-on-a-swing pattern
+                                    # as RGNT/macd_divergence — the crossover
+                                    # signal is real but the float is too thin
+                                    # for any stop to protect against an open.
 
   macd_divergence:
     enabled: true
@@ -100,6 +107,12 @@ strategies:
     atr_stop_multiplier: 1.8
     atr_tp_multiplier: 3.5
     hold_type: swing
+    min_entry_price: 5.00           # v2.4.0: skip sub-$5 micro-caps.  RGNT
+                                    # 2026-06-10 wiped a 6-trade winning streak
+                                    # with one overnight gap-down (-$648).
+                                    # Swing strategy + sub-$3 micro-cap is the
+                                    # wrong mix — too gap-prone for any stop
+                                    # to protect.
 
   bb_squeeze:
     enabled: false                  # 2026-05-05: disabled.  Backtest showed
@@ -249,6 +262,29 @@ risk:
   kelly_fraction: 0.25
   max_portfolio_heat_pct: 0.08      # V2: Increased from 0.06 — allow more concurrent risk
   min_conviction_for_swing: 0.50    # V2: Reduced from 0.55 — let more swing signals through
+  symbol_cooldown_minutes: 30       # v2.4.1: after exiting a symbol, ignore
+                                    # new signals on it for N minutes. Stops
+                                    # the bot compounding losses on a single
+                                    # name — LNKS 2026-06-17 fired 6 entries
+                                    # on the same ticker in 51 minutes (~-$176)
+                                    # because every fresh ema_crossover bar
+                                    # re-triggered evaluation. Cooldown is
+                                    # in-memory; resets at process restart.
+  swing_min_entry_price: 5.00       # v2.4.3: global floor on ANY swing-held
+                                    # signal regardless of which strategy
+                                    # produced it. A sub-$5 micro-cap carried
+                                    # overnight is exposed to gap-down risk no
+                                    # stop can protect (RGNT 2026-06-10 macd
+                                    # swing, -$648). Composes with per-strategy
+                                    # min_entry_price (the higher floor wins).
+                                    # Day/adaptive signals are exempt — sub-$2
+                                    # momentum/vwap/orb scalps close intraday
+                                    # and the P&L data says they work. Note:
+                                    # momentum + bb_squeeze emit SWING only at
+                                    # conviction < 0.9, so their low-conviction
+                                    # overnight variants are caught here while
+                                    # their high-conviction day scalps are not.
+                                    # 0 disables the gate.
 
   # V2 Phase 7: dynamic risk tolerance.  The DynamicRiskController composes
   # conviction, streak, regime, and drawdown into runtime sizing multipliers.
@@ -294,3 +330,12 @@ analysis:
                                   # Daily EOD job logs the tightest near-miss
                                   # clusters + the signal funnel so a chronically
                                   # tight threshold is visible. Read-only.
+
+monitoring:
+  downtime_alert_hours: 2.0       # v2.4.0: email at startup if the last
+                                  # heartbeat is older than this. Heartbeat
+                                  # is stamped every 60s by job_sync_positions
+                                  # so a stale heartbeat == bot was actually
+                                  # down (silent crash + clean shutdown both
+                                  # caught). The RGNT 2026-06-10 loss happened
+                                  # in a 4-day uncovered downtime window.

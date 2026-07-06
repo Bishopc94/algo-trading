@@ -233,26 +233,27 @@ class PerformanceTracker:
             "total_pnl": round(total_pnl, 2),
         }
 
-    def daily_summary(self, equity: float, cash: float, open_positions: int, day_trades_used: int) -> str:
+    def daily_summary(
+        self, equity: float, cash: float, open_positions: int,
+        day_trades_used: int,
+        buying_power: float | None = None,
+        pdt_framework: str = "legacy",
+        max_day_trades: int = 3,
+        starting_equity: float | None = None,
+    ) -> str:
         """Generate end-of-day summary string.
 
         Combines current account state with historical performance metrics
         into a formatted report that's logged and optionally displayed.
-
-        Args:
-            equity:          Current total account value.
-            cash:            Current available cash.
-            open_positions:  Number of currently open positions.
-            day_trades_used: Day trades used in the rolling 5-day window.
-
-        Returns:
-            A multi-line formatted string suitable for logging or display.
         """
         metrics = self.calculate_metrics()
+        # Enrich with win/loss streak so the operator can see the run shape.
+        try:
+            metrics.update(self._current_streaks())
+        except Exception:
+            pass
         today = datetime.now().strftime("%Y-%m-%d")
 
-        # Log the summary metrics as structured key-value pairs for
-        # machine-parseable analysis.
         log.info("daily_summary", equity=equity, cash=cash, **metrics)
 
         return con.daily_summary(
@@ -260,4 +261,29 @@ class PerformanceTracker:
             open_positions=open_positions,
             day_trades_used=day_trades_used,
             metrics=metrics,
+            buying_power=buying_power,
+            pdt_framework=pdt_framework,
+            max_day_trades=max_day_trades,
+            starting_equity=starting_equity,
         )
+
+    def _current_streaks(self) -> dict:
+        """Compute the current win/loss streak from the most recent trades."""
+        trades = self._db.get_all_trades()
+        closed = [
+            t for t in trades
+            if t["status"] == "closed" and t["pnl"] is not None
+        ]
+        if not closed:
+            return {"win_streak": 0, "loss_streak": 0}
+        # newest first
+        closed.sort(key=lambda t: t.get("exit_time") or "", reverse=True)
+        win_streak = loss_streak = 0
+        for t in closed:
+            if t["pnl"] > 0:
+                if loss_streak: break
+                win_streak += 1
+            elif t["pnl"] <= 0:
+                if win_streak: break
+                loss_streak += 1
+        return {"win_streak": win_streak, "loss_streak": loss_streak}

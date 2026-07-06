@@ -10,4 +10,4 @@ Format: MAJOR.MINOR.PATCH
   - PATCH: bug fixes, hardening, config tweaks
 """
 
-__version__ = "2.3.5"
+__version__ = "2.4.4"

@@ -29,6 +29,7 @@ Python-specific notes:
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING
 
 import pandas as pd
@@ -78,12 +79,36 @@ class SignalAggregator:
         self._smart_pdt = smart_pdt
         self._near_misses: list[Rejection] = []
         self.market_context = None
+        # Per-symbol cooldown: maps symbol -> datetime (UTC) until which
+        # new signals on this symbol are ignored.  Set by record_exit() on
+        # trade close; checked at the top of collect_and_rank().  In-memory
+        # only — resets at process restart.  See settings.yaml
+        # risk.symbol_cooldown_minutes for the duration.
+        self._symbol_cooldown_until: dict[str, datetime] = {}
 
     def set_market_context(self, ctx) -> None:
         """Thread the current MarketContext to every strategy for exit planning."""
         self.market_context = ctx
         for strategy in self.strategies:
             strategy.market_context = ctx
+
+    def record_exit(self, symbol: str) -> None:
+        """Start the per-symbol cooldown after a trade on this symbol exits.
+
+        Reads ``risk.symbol_cooldown_minutes`` from the risk manager's
+        config.  A value of 0 (or missing key) disables the cooldown — the
+        method is then a no-op and existing behavior is preserved.
+        """
+        if not symbol:
+            return
+        minutes = float(getattr(
+            self.risk_manager.config, "symbol_cooldown_minutes", 0
+        ) or 0)
+        if minutes <= 0:
+            return
+        self._symbol_cooldown_until[symbol] = (
+            datetime.now(timezone.utc) + timedelta(minutes=minutes)
+        )
 
     # ------------------------------------------------------------------
 
@@ -131,11 +156,49 @@ class SignalAggregator:
         all_signals: list[Signal] = []
         self._near_misses: list[Rejection] = []
 
+        # Garbage-collect cooldowns whose window has already elapsed so
+        # the dict stays bounded across long sessions.
+        now_utc = datetime.now(timezone.utc)
+        expired = [
+            s for s, until in self._symbol_cooldown_until.items() if until <= now_utc
+        ]
+        for s in expired:
+            del self._symbol_cooldown_until[s]
+
         # ── Step 1: Evaluate every strategy × every candidate ──
         for symbol in candidates:
             # Skip symbols we already hold — prevents duplicate positions
             if symbol in held:
                 logger.debug("skip_held_symbol", symbol=symbol)
+                continue
+            # Per-symbol re-entry cooldown.  Blocks compound losses on a
+            # single name after a recent exit (LNKS 2026-06-17 fired 6
+            # entries in 51 min before this gate existed).
+            cooldown_until = self._symbol_cooldown_until.get(symbol)
+            if cooldown_until is not None and now_utc < cooldown_until:
+                remaining_min = (cooldown_until - now_utc).total_seconds() / 60
+                logger.debug(
+                    "skip_symbol_cooldown",
+                    symbol=symbol,
+                    remaining_min=round(remaining_min, 1),
+                )
+                if self._dl is not None:
+                    try:
+                        self._dl.log_evaluate(
+                            symbol=symbol,
+                            strategy="aggregator",
+                            action="reject",
+                            reasoning=(
+                                f"symbol cooldown active: "
+                                f"{remaining_min:.1f}m remaining"
+                            ),
+                            factors={
+                                "filter": "symbol_cooldown",
+                                "remaining_min": round(remaining_min, 1),
+                            },
+                        )
+                    except Exception:
+                        pass
                 continue
             daily = daily_bars_dict.get(symbol)
             intraday = intraday_bars_dict.get(symbol)
@@ -162,6 +225,51 @@ class SignalAggregator:
                     self._log_rejections(rejections)
 
                 if sig is not None:
+                    # Min entry-price gate.  A sub-$5 micro-cap carried
+                    # overnight can wipe out a winning streak in one gap —
+                    # the RGNT 2026-06-10 case: 6 small macd_divergence wins
+                    # then one held-overnight gap-down for -$648.  Two floors
+                    # compose, and the higher one wins:
+                    #   - per-strategy `min_entry_price` (any hold type) — the
+                    #     strategy declares its own floor; default 0 = none.
+                    #   - global `risk.swing_min_entry_price` applied to EVERY
+                    #     swing-held signal regardless of strategy, so a newly
+                    #     added swing strategy is covered without remembering
+                    #     to set a per-strategy floor.  Day/adaptive signals
+                    #     are exempt — sub-$2 momentum/vwap/orb scalps close
+                    #     intraday and the P&L data says they work there.
+                    strat_floor = getattr(
+                        getattr(strategy, "config", None), "min_entry_price", 0.0
+                    ) or 0.0
+                    swing_floor = 0.0
+                    if sig.hold_type == HoldType.SWING:
+                        swing_floor = getattr(
+                            self.risk_manager.config, "swing_min_entry_price", 0.0
+                        ) or 0.0
+                    floor = max(strat_floor, swing_floor)
+                    if floor > 0 and sig.entry_price < floor:
+                        gate = "swing" if swing_floor >= strat_floor and swing_floor > 0 else "strategy"
+                        if self._dl is not None:
+                            try:
+                                self._dl.log_evaluate(
+                                    symbol=sig.symbol,
+                                    strategy=sig.strategy_name,
+                                    action="reject",
+                                    reasoning=(
+                                        f"entry_price ${sig.entry_price:.2f} "
+                                        f"below {gate} floor ${floor:.2f}"
+                                    ),
+                                    factors={
+                                        "filter": "min_entry_price",
+                                        "gate": gate,
+                                        "actual": sig.entry_price,
+                                        "threshold": floor,
+                                        "direction": "above",
+                                    },
+                                )
+                            except Exception:
+                                pass
+                        continue
                     # Apply adaptive strategy weight to conviction
                     if self._weighter is not None:
                         w = self._weighter.get_weight(sig.strategy_name)
